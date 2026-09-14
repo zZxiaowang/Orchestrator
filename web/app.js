@@ -208,7 +208,9 @@ function scheduleRender() {
 }
 
 function streamKeyFor(event) {
-  return event.data.phase === "architect" ? "architect" : `step:${event.data.step_id}`;
+  if (event.data.phase === "architect") return "architect";
+  if (event.data.phase === "chat") return "chat";
+  return `step:${event.data.step_id}`;
 }
 
 /* ── 启动 ── */
@@ -599,6 +601,15 @@ function handleEvent(event) {
       if (["done", "failed", "cancelled"].includes(event.data.status)) refreshRuns();
       break;
     }
+    case "verify": {
+      // 客观验收结果：本步过没过，界面必须能立刻看到
+      if (state.run) {
+        const step = (state.run.steps || []).find((item) => item.id === event.data.step_id);
+        if (step) step.verification = event.data.results || [];
+      }
+      scheduleRender();
+      break;
+    }
     case "error": {
       if (state.run) state.run.error = event.data.error;
       scheduleRender();
@@ -606,6 +617,23 @@ function handleEvent(event) {
     }
     case "done": {
       refreshRun();
+      break;
+    }
+    case "metrics_updated": {
+      // 指标账本只增不减：按 phase + step_id 就地替换，避免整页重拉打断流式输出
+      if (state.run && event.data.metrics) {
+        const list = Array.isArray(state.run.metrics) ? state.run.metrics.slice() : [];
+        const incoming = event.data.metrics;
+        const index = list.findIndex(
+          (item) =>
+            item.phase === incoming.phase &&
+            (item.step_id ?? null) === (incoming.step_id ?? null),
+        );
+        if (index >= 0) list[index] = incoming;
+        else list.push(incoming);
+        state.run.metrics = list;
+        scheduleRender();
+      }
       break;
     }
     case "artifact": {
@@ -700,6 +728,37 @@ function renderTimeline() {
       h("div", { class: "card-body", text: run.task })
     )
   );
+
+  // 问答路由：分流判定「这条不是需求」时，只有一条回答，没有纲领也没有步骤
+  if (run.kind === "chat") {
+    const answer = (run.messages || []).find((message) => message.phase === "chat");
+    const streaming = state.buffers.chat || "";
+    nodes.push(
+      h(
+        "div",
+        { class: "card msg-assistant" },
+        h(
+          "div",
+          { class: "card-head" },
+          h("div", { class: "avatar", text: "答" }),
+          h("strong", { text: "直接回答" }),
+          h("span", { class: "muted", text: "判定为问答 · 未进入编排" }),
+          copyButton(() => state.buffers.chat || answer?.content || "")
+        ),
+        h(
+          "div",
+          { class: "card-body" },
+          h("pre", {
+            class: "stream",
+            dataset: { stream: "chat" },
+            text: streaming || (answer ? answer.content : "正在组织回答…"),
+          })
+        )
+      )
+    );
+    dom.timeline.replaceChildren(...nodes);
+    return;
+  }
 
   const architectRaw = (run.messages || []).find((message) => message.phase === "architect");
   const architectBuffer = state.buffers.architect || "";
@@ -1027,6 +1086,37 @@ function renderStepCard(step) {
     body.append(h("h3", { class: "section-label", text: "说明" }));
     body.append(h("ul", { class: "list" }, ...step.notes.map((item) => h("li", { text: item }))));
   }
+  // 客观验收：这是"模型说完成"和"确实完成"的区别，必须摊开给用户看
+  if (step.verification?.length) {
+    const passed = step.verification.filter((item) => item.ok).length;
+    const total = step.verification.length;
+    body.append(
+      h("h3", {
+        class: "section-label",
+        text: `客观验收 ${passed}/${total} ${passed === total ? "全部通过" : "有未通过项"}`,
+      })
+    );
+    body.append(
+      h(
+        "ul",
+        { class: "verify-list" },
+        ...step.verification.map((item) =>
+          h(
+            "li",
+            { class: item.ok ? "verify-ok" : "verify-fail" },
+            `${item.ok ? "✓" : "✗"} ${item.label || item.path}${item.detail ? ` — ${item.detail}` : ""}`
+          )
+        )
+      )
+    );
+  } else if (status === "done") {
+    body.append(
+      h("p", {
+        class: "muted",
+        text: "本步没有可自动判定的验收项（未验证，不要当成已验证）。",
+      })
+    );
+  }
   if (step.fetched_files?.length) {
     body.append(
       h("p", {
@@ -1054,6 +1144,9 @@ function renderStepCard(step) {
           (STEP_STATUS_TEXT[status] || status) +
           (step.context_chars
             ? ` · 上下文 ${(step.context_chars / 1000).toFixed(1)}k 字符`
+            : "") +
+          (step.verification?.length
+            ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
             : ""),
       }),
       copyButton(
@@ -1121,6 +1214,15 @@ function renderInspector() {
 
 function renderPlanInspector(run) {
   const nodes = [];
+  if (run.kind === "chat") {
+    const answer = (run.messages || []).find((message) => message.phase === "chat");
+    nodes.push(h("p", { class: "muted", text: "这条是问答，没有纲领。" }));
+    nodes.push(
+      h("pre", { class: "stream", text: answer ? answer.content : "（还没有回答内容）" })
+    );
+    dom.inspectorBody.replaceChildren(...nodes);
+    return;
+  }
   if (!run.plan) {
     nodes.push(h("p", { class: "muted", text: "纲领尚未生成。" }));
   } else {

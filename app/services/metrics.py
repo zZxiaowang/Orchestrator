@@ -257,3 +257,106 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
         "status_counts": status_counts,
         "steps": steps,
     }
+
+
+# ── 与 Run.metrics（list[PhaseMetrics]）的对接 ──────────────────────────
+
+#: usage_source 的「悲观程度」：合并多次调用时保留最不确定的那个口径
+_SOURCE_RANK = {"provider": 0, "estimated": 1, "unknown": 2}
+
+
+def usage_verdict(stats: Any) -> tuple[str, str]:
+    """从调用账本推出 ``(usage_source, usage_reason)``。
+
+    * 全部调用都没拿到 usage → ``unknown``，并区分「流式没带」与「压根没返回」；
+    * 部分拿到 → ``provider`` + ``provider_partial_usage``（不假装总量是准的）；
+    * 全部拿到 → ``provider``。
+    """
+
+    calls = int(getattr(stats, "calls", 0) or 0)
+    if calls <= 0:
+        return "unknown", "unknown"
+    known = int(getattr(stats, "usage_calls", 0) or 0)
+    if known <= 0:
+        return "unknown", ("provider_stream_no_usage" if stats.streamed else "provider_no_usage")
+    if known < calls:
+        return "provider", "provider_partial_usage"
+    return "provider", ""
+
+
+def batch_retries(stats: Any) -> int:
+    """一批调用的重试次数 = 传输层重试 + 调用方主动重试。
+
+    传输层重试由 ``attempts - calls`` 推出（每一次逻辑调用至少一次 HTTP 请求）；
+    ``stats.retries`` 记的是"输出不是合法 JSON，强制重试一次"这类主动重试。
+    分流的独立调用既不是传输重试也不是主动重试，因此不会在健康运行里显示"重试 1 次"。
+    """
+
+    calls = max(0, int(getattr(stats, "calls", 0) or 0))
+    attempts = max(0, int(getattr(stats, "attempts", 0) or 0))
+    transport = max(0, attempts - calls)
+    explicit = max(0, int(getattr(stats, "retries", 0) or 0))
+    return transport + explicit
+
+
+def apply_call(
+    entry: Any,
+    stats: Any,
+    *,
+    context_chars: int | None = None,
+    route: Mapping[str, Any] | None = None,
+) -> Any:
+    """把一次（或一组）模型调用的遥测合并进 ``PhaseMetrics`` 条目。
+
+    入参 ``entry`` 是 ``Run.metrics_for(phase, step_id)`` 返回的可写条目；
+    同一阶段/步骤多次调用会**累加**，不会产生重复条目。
+    """
+
+    if stats is not None:
+        # 先记下"这批之前有没有数据"：全新条目的 usage_source 默认是 unknown，
+        # 那是"还没数据"的意思，不该被当成"已经确定未知"而拒绝被真实口径覆盖。
+        had_calls = int(entry.calls or 0) > 0
+        entry.calls = int(entry.calls or 0) + max(0, int(getattr(stats, "calls", 0) or 0))
+        entry.retries = int(entry.retries or 0) + batch_retries(stats)
+        entry.duration_ms = int(entry.duration_ms or 0) + max(
+            0, int(getattr(stats, "duration_ms", 0) or 0)
+        )
+        usage = getattr(stats, "usage", None) or {}
+        for key in USAGE_KEYS:
+            value = usage.get(key) if isinstance(usage, Mapping) else None
+            if value is None:
+                continue
+            setattr(entry, key, int(getattr(entry, key) or 0) + int(value))
+        source, reason = usage_verdict(stats)
+        if had_calls:
+            _merge_verdict(entry, source, reason)
+        else:
+            entry.usage_source = source
+            entry.usage_reason = reason
+    if context_chars is not None:
+        entry.context_chars = max(0, int(context_chars))
+    if route:
+        entry.route = dict(route)
+    return entry
+
+
+def _merge_verdict(entry: Any, source: str, reason: str) -> None:
+    current = _SOURCE_RANK.get(str(getattr(entry, "usage_source", "unknown")), 2)
+    incoming = _SOURCE_RANK.get(source, 2)
+    if incoming > current:
+        entry.usage_source = source
+        entry.usage_reason = reason
+        return
+    if incoming == current and reason and not str(getattr(entry, "usage_reason", "")):
+        entry.usage_reason = reason
+
+
+def route_of(endpoint: Any) -> dict[str, str]:
+    """把端点描述收敛成可落盘的路由摘要（Key 永不出现在这里）。"""
+
+    return {
+        "alias": str(getattr(endpoint, "label", "") or getattr(endpoint, "role", "")),
+        "model": str(getattr(endpoint, "model", "")),
+        "protocol": str(getattr(endpoint, "wire_api", "")),
+        "base_url": str(getattr(endpoint, "base_url", "")),
+    }

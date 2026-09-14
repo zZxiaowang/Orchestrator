@@ -10,17 +10,20 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 from app.core.config import Endpoint, Settings, get_settings
 from app.core.errors import AppError, ConfigurationError, NotFoundError, WorkspaceError
-from app.core.relay import RelayClient
+from app.core.relay import CallStats, RelayClient
 from app.schemas.run import (
+    PHASE_ARCHITECT,
+    PHASE_EXECUTOR,
     ChangedFile,
     Run,
     RunMessage,
@@ -29,12 +32,25 @@ from app.schemas.run import (
     StepStatus,
 )
 from app.schemas.step import StepOutput
-from app.services.architect import build_architect_messages, run_architect
+from app.services.architect import build_architect_messages, run_architect, run_chat
 from app.services.context import StepContextBuilder, clip, clip_head_tail
 from app.services.events import EventBus
 from app.services.executor import EXECUTOR_SYSTEM, build_step_messages, run_step
+from app.services.intent import detect_intent
+from app.services.metrics import apply_call, route_of
 from app.services.storage import RunStore, new_run_id
+from app.services.verify import effective_checks, failure_text, run_checks, summarize
 from app.services.workspace import Workspace
+
+
+def message_chars(messages: Sequence[dict[str, Any]]) -> int:
+    """本次调用实际发送的上下文字符数（指标账本用）。"""
+
+    total = 0
+    for item in messages:
+        content = item.get("content")
+        total += len(content) if isinstance(content, str) else len(str(content or ""))
+    return total
 
 
 class Orchestrator:
@@ -128,6 +144,22 @@ class Orchestrator:
                 message="架构段（GPT）正在产出纲领…",
             )
 
+            client = self._client(endpoint, settings)
+            stats = CallStats()
+
+            # 先分流：问答（"你是哪个模型"）不该走"纲领 → 确认 → 执行"这条重流程。
+            # 判错方向的代价不对称：把真需求当问答会丢掉工作，把问答当需求只是多跑一次。
+            intent = await detect_intent(
+                client,
+                run.task,
+                model=endpoint.model,
+                brief=run.brief,
+                stats=stats,
+            )
+            if intent.is_chat:
+                await self._answer_chat(run, client, endpoint, intent, stats)
+                return
+
             context = self._build_context(run, settings)
             messages = build_architect_messages(
                 run.task,
@@ -142,15 +174,25 @@ class Orchestrator:
                     run_id, "status", status=run.status.value, message="按反馈修订纲领…"
                 )
 
-            client = self._client(endpoint, settings)
-            plan, raw = await run_architect(
-                client,
-                messages,
-                model=endpoint.model,
-                on_token=lambda text: self.bus.publish(
-                    run_id, "token", phase="architect", model=endpoint.model, text=text
-                ),
-            )
+            try:
+                plan, raw = await run_architect(
+                    client,
+                    messages,
+                    model=endpoint.model,
+                    stats=stats,
+                    on_token=lambda text: self.bus.publish(
+                        run_id, "token", phase="architect", model=endpoint.model, text=text
+                    ),
+                )
+            finally:
+                # 成功与失败都要记账：否则失败运行在统计里是"零成本"，用户无从判断值不值得重试
+                self._record_metrics(
+                    run,
+                    stats,
+                    endpoint,
+                    phase=PHASE_ARCHITECT,
+                    context_chars=message_chars(messages),
+                )
 
             plan = plan.model_copy(
                 update={
@@ -170,6 +212,7 @@ class Orchestrator:
                     goal=step.goal,
                     deliverables=list(step.deliverables),
                     acceptance=list(step.acceptance),
+                    checks=list(step.checks),
                 )
                 for step in plan.steps
             ]
@@ -201,6 +244,59 @@ class Orchestrator:
             self._fail(run, AppError(f"架构段异常：{exc}", code="architect_error"))
 
     # ── 执行段 ──
+
+    async def _answer_chat(
+        self,
+        run: Run,
+        client: RelayClient,
+        endpoint: Endpoint,
+        intent,
+        stats: CallStats,
+    ) -> None:
+        """问答分支：直接回答，不建纲领、不建步骤、不碰工作区。"""
+
+        self.bus.publish(
+            run.id,
+            "status",
+            status=run.status.value,
+            message=f"判断为问答（{intent.reason or '无需产出文件'}），直接回答，不进入编排。",
+        )
+        try:
+            answer = await run_chat(
+                client,
+                run.task,
+                model=endpoint.model,
+                brief=run.brief,
+                stats=stats,
+                on_token=lambda text: self.bus.publish(
+                    run.id, "token", phase="chat", model=endpoint.model, text=text
+                ),
+            )
+        finally:
+            self._record_metrics(
+                run,
+                stats,
+                endpoint,
+                phase=PHASE_ARCHITECT,
+                context_chars=len(run.task) + len(run.brief),
+            )
+
+        run.kind = "chat"
+        run.plan = None
+        run.plan_raw = ""
+        run.steps = []
+        run.status = RunStatus.DONE
+        run.error = None
+        run.messages.append(
+            RunMessage(role="assistant", phase="chat", model=endpoint.model, content=answer)
+        )
+        self.store.save(run)
+        self.bus.publish(
+            run.id,
+            "done",
+            status=run.status.value,
+            summary={**self._run_summary(run), "kind": "chat", "reason": intent.reason},
+        )
 
     def start_execution(self, run_id: str) -> None:
         self._cancelled.discard(run_id)
@@ -316,7 +412,10 @@ class Orchestrator:
         )
         messages = build_step_messages(packet)
 
-        output, raw = await self._call_executor(run, step, client, endpoint, messages)
+        # 本步的所有模型调用共用一个账本：索取文件的每一轮、JSON 强制重试、
+        # 传输层重试都会累加到同一条 PhaseMetrics 上，而不是各记一条。
+        stats = CallStats()
+        output, raw = await self._call_executor(run, step, client, endpoint, messages, stats=stats)
 
         # 执行段发现上下文不足时，可以按需索取文件：补给它后再跑同一轮，
         # 这样它不必为了"看一眼"而把整个仓库读进上下文。
@@ -347,11 +446,22 @@ class Orchestrator:
                     "若已足够，请直接给出 files/commands。",
                 },
             ]
-            output, raw = await self._call_executor(run, step, client, endpoint, messages)
+            output, raw = await self._call_executor(
+                run, step, client, endpoint, messages, stats=stats
+            )
             rounds += 1
 
         step.context_chars = packet.chars
         step.fetched_files = list(dict.fromkeys(fetched))
+        entry = self._record_metrics(
+            run,
+            stats,
+            endpoint,
+            phase=PHASE_EXECUTOR,
+            step_id=step.id,
+            context_chars=packet.chars,
+        )
+        step.retries = int(entry.retries if entry is not None else 0)
 
         step.summary = output.summary
         step.handoff = output.handoff or output.summary
@@ -382,6 +492,22 @@ class Orchestrator:
         failures = [f for f in step.files if f.error]
         still_asking = bool(output.need_files) and not output.files
         no_output = not output.files and not (output.summary.strip() or output.notes)
+
+        # 客观验收：纲领声明的检查 + 从交付物派生的「文件存在」检查。
+        # 这是"模型说完成"与"确实完成"之间的唯一分界线。
+        checks = effective_checks(step.checks, step.deliverables)
+        results = run_checks(workspace, checks) if checks else []
+        step.verification = results
+        verdict = summarize(results)
+        if results:
+            self.bus.publish(
+                run.id,
+                "verify",
+                step_id=step.id,
+                results=[item.model_dump(mode="json") for item in results],
+                summary=verdict,
+            )
+
         if output.blocked:
             step.status = StepStatus.BLOCKED
             step.error = output.block_reason or "执行段报告被阻塞。"
@@ -399,6 +525,10 @@ class Orchestrator:
         elif no_output:
             step.status = StepStatus.BLOCKED
             step.error = "执行段没有返回任何文件改动或说明，无法确认这一步已完成。"
+        elif verdict["failed"]:
+            # 产出了东西、但没通过客观验收：不能算完成，但这是"补信息重跑一次"的情形
+            step.status = StepStatus.BLOCKED
+            step.error = f"客观验收未通过：{failure_text(results)}"
         else:
             step.status = StepStatus.DONE
 
@@ -660,11 +790,14 @@ class Orchestrator:
         client: RelayClient,
         endpoint: Endpoint,
         messages: list[dict[str, str]],
+        *,
+        stats: CallStats | None = None,
     ) -> tuple[StepOutput, str]:
         return await run_step(
             client,
             messages,
             model=endpoint.model,
+            stats=stats,
             on_token=lambda text: self.bus.publish(
                 run.id,
                 "token",
@@ -674,6 +807,31 @@ class Orchestrator:
                 text=text,
             ),
         )
+
+    def _record_metrics(
+        self,
+        run: Run,
+        stats: CallStats,
+        endpoint: Endpoint,
+        *,
+        phase: str,
+        step_id: int | None = None,
+        context_chars: int | None = None,
+    ):
+        """把一次调用的账本写进 ``run.metrics``（同一阶段/步骤累加，不重复建条目）。"""
+
+        try:
+            entry = run.metrics_for(phase, step_id)
+            apply_call(entry, stats, context_chars=context_chars, route=route_of(endpoint))
+        except Exception:  # noqa: BLE001 - 指标绝不能让主流程失败
+            return None
+        self.bus.publish(
+            run.id,
+            "metrics_updated",
+            metrics=entry.model_dump(mode="json"),
+            summary=run.metrics_summary(),
+        )
+        return entry
 
     @staticmethod
     def _resolve_requested_files(
@@ -772,6 +930,19 @@ class Orchestrator:
             if step.commands:
                 lines.append("- 建议命令：")
                 lines.extend(f"  - `{item.get('cmd', '')}`" for item in step.commands)
+            if step.verification:
+                verdict = summarize(step.verification)
+                lines.append(
+                    f"- 客观验收：{verdict['passed']}/{verdict['total']} 通过"
+                    f"{'（未通过）' if verdict['failed'] else ''}"
+                )
+                lines.extend(
+                    f"  - {'✓' if item.ok else '✗'} {item.label or item.path}"
+                    f"{'：' + item.detail if item.detail else ''}"
+                    for item in step.verification
+                )
+            elif step.status == StepStatus.DONE:
+                lines.append("- 客观验收：本步没有可自动判定的检查项（未验证）")
             lines.append("")
         if run.error:
             lines.append(f"## 失败原因\n{run.error.get('message', '')}")

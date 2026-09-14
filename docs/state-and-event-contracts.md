@@ -65,8 +65,24 @@
 - `data`：随 `type` 变化的对象。既有事件类型的既有字段不得删除或改类型，只允许追加字段；消费端必须容忍字段缺失。
 - 历史：每个运行最多保留 `HISTORY_LIMIT = 1500` 条，超出丢弃最旧。
 - 心跳：无事件时每 `HEARTBEAT_SECONDS = 15.0` 秒发一次 `ping`；`ping` 不写历史、不占 `seq`，仅当前订阅者可见。
-- 已实现事件类型：`status`、`error`、`artifact`、`ping`。
-  后续新增（指标、命令生命周期、队列）必须沿用同一信封，并使用新的 `type` 名，不复用旧名。
+- 已实现事件类型（以源码发布点为准，2026-09-14 审计）：
+
+  | type | 发布点 | 说明 |
+  | --- | --- | --- |
+  | `status` | `Orchestrator` 各状态切换 | 运行状态变化，携带 `status` 与可选 `message` |
+  | `token` | 架构段 / 执行段 / 问答流式输出 | `phase` 为 `architect` / `executor` / `chat`；执行段带 `step_id` |
+  | `plan` | 架构段产出纲领后 | 携带 `plan`、`steps`、`raw` |
+  | `step_start` / `step_done` | 执行段每一步 | `step_done` 携带完整 `step` 快照（含 `verification`） |
+  | `fetch` | 执行段用 `need_files` 索取文件 | 携带 `files` 与 `reason` |
+  | `file` | 每个文件改动落地后 | 携带单条 `file` 变更 |
+  | `verify` | 客观验收跑完后 | 携带 `results`（逐条通过/未通过）与 `summary` |
+  | `metrics_updated` | 指标条目写入后 | 携带该条 `metrics` 与运行级 `summary` |
+  | `artifact` | `plan.md` / `report.md` 写盘后 | 携带 `name` 与 `content` |
+  | `done` | 运行结束（含问答分支） | 携带 `status` 与运行摘要 |
+  | `error` | 运行失败 | 携带错误信封 |
+  | `ping` | 心跳 | 不写历史、不占 `seq` |
+
+  后续新增（命令生命周期、队列）必须沿用同一信封，并使用新的 `type` 名，不复用旧名。
 
 订阅起点：客户端用已收到的最大 `seq` 作为 `since` 做增量订阅；服务端的当前序号可由 `EventBus.current_seq(run_id)` 得到。
 
@@ -91,6 +107,55 @@
 `RunStep` 另新增 `retries: int = 0`（本步执行段的重试次数）。
 `Run.metrics_summary()` 提供运行级汇总，token 全部未知时返回 `null` 而非 0，
 并在 `unknown_usage` 里列出缺 usage 的阶段/步骤。
+
+**接线状态（2026-09-14 更新）**：主链路已按本契约写入并在
+`GET /api/v1/runs/{run_id}/metrics` 暴露（返回 `run_id` / `status` / `metrics` / `summary`）。
+写入点：`Orchestrator._record_metrics()`，调用遥测来自 `app/core/relay.py` 的 `CallStats`
+（流式通过 `stream_options.include_usage` 取 usage，取不到就是未知）。
+
+**重试口径**：`retries = 传输层重试 + 主动重试`。
+传输层重试由 `attempts - calls` 推出（含 5xx 退避、参数降级重发）；
+主动重试指「输出不是合法 JSON，强制重试一次」这类重发。
+**分流的独立调用不算重试**——否则每次健康运行都会显示「重试 1 次」。
+
+**待收敛**：`app/services/metrics_sink.py` 仍是旧的 `{architect, steps}` 字典形态，
+已无主链路依赖。以本节的 `list[PhaseMetrics]` 为唯一权威契约，该模块应删除或改写。
+
+## 5.2 运行类型与步骤客观验收（2026-09-14 新增）
+
+### 运行类型 `Run.kind`
+
+| 取值 | 含义 | 行为差异 |
+| --- | --- | --- |
+| `task`（默认） | 需要产出/改动东西的请求 | 走 `planning → awaiting_approval → executing → done` 全流程 |
+| `chat` | 判定为问答/闲聊 | 架构段直接回答；不生成 `plan`、不建 `steps`、不创建/写入工作区，运行直接 `done` |
+
+分流规则见 `app/services/intent.py`：明显问候/身份询问走启发式（零模型调用），
+其余交给架构段模型判一次；**分类失败一律按 `task` 处理**（宁可多跑一次编排，
+也不能把真需求当闲聊丢掉）。回答以 `phase == "chat"` 的消息落在 `run.messages` 里。
+
+### 步骤客观验收
+
+`PlanStep.checks` / `RunStep.checks` 是纲领声明的客观检查项，`RunStep.verification`
+是本步执行后的逐条结果（`CheckResult`）。允许的类型只有六种，全部无副作用、不执行代码：
+
+| type | 判定 |
+| --- | --- |
+| `file_exists` / `dir_exists` | 路径存在 |
+| `glob` | 通配至少匹配一个文件 |
+| `file_contains` | 文件包含指定原文片段（`text`） |
+| `py_compile` | 该 `.py` 文件能通过 `compile()`（只编译，不执行） |
+| `json_valid` | 文件是合法 JSON |
+
+执行路径：`app/services/verify.py`。实际跑的检查 = 纲领声明的 + 从 `deliverables`
+里形如路径的产出**派生**的 `file_exists`（去重，单步上限 8 条）。
+**命令类验收（pytest 等）不在本轮范围**，因为它需要白名单与逐条用户确认（P1）。
+
+不变量：
+1. 有检查项且存在未通过时，该步**不得**为 `done`——按 `blocked` 处理（补信息后可只重跑该步）；
+2. 没有检查项时，`verification` 为空，界面必须显示「未验证」，不得当成已验证；
+3. 检查抛异常按「未通过」记录，不得让整步崩溃；
+4. 检查路径一律走 `Workspace.resolve`，与文件落地共用同一套越界防护。
 
 ## 6. 敏感字段与审计约束
 

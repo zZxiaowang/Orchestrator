@@ -46,6 +46,11 @@ class FakeRelay:
         self.need_files_once = False
         self.block_first_executor = False
         self.always_need_files = False
+        #: 意图分流的结果（"task" / "chat"）；真实模型判断，测试里固定
+        self.intent_kind = "task"
+        self.intent_calls = 0
+        #: 注入到纲领第一步的客观检查项（用于验收测试）
+        self.plan_checks: list[dict[str, Any]] | None = None
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -75,6 +80,44 @@ class FakeRelay:
         self.requests.append({"path": path, "body": body, "headers": dict(request.headers)})
         system = body["messages"][0]["content"]
 
+        # 意图分流是独立的一类调用：不算执行段调用，也不占用执行段的"第一次"语义，
+        # 否则 need_files / blocked 这类只作用于首个执行段调用的开关会被分流吃掉。
+        if "请求分流器" in system:
+            self.intent_calls += 1
+            return httpx.Response(
+                200,
+                json={
+                    "model": body.get("model", "fake"),
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": json.dumps(
+                                    {"kind": self.intent_kind, "reason": "测试分流"},
+                                    ensure_ascii=False,
+                                ),
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+                },
+            )
+
+        if "本地桌面工具（架构-执行双模型编排器）的助手" in system:
+            # 问答分支：直接给一段回答，不产出文件
+            text = f"这是对「{body['messages'][-1]['content'][:20]}」的直接回答。"
+            if body.get("stream"):
+                self.stream_calls += 1
+                return _sse_response(text)
+            return httpx.Response(
+                200,
+                json={
+                    "model": body.get("model", "fake"),
+                    "choices": [{"message": {"role": "assistant", "content": text}}],
+                    "usage": {"total_tokens": 21},
+                },
+            )
+
         content = self._architect_text() if "资深架构师" in system else self._executor_text(body)
 
         if body.get("stream"):
@@ -93,7 +136,10 @@ class FakeRelay:
         )
 
     def _architect_text(self) -> str:
-        payload = json.dumps(plan_payload(), ensure_ascii=False)
+        plan = plan_payload()
+        if self.plan_checks is not None:
+            plan["steps"][0]["checks"] = self.plan_checks
+        payload = json.dumps(plan, ensure_ascii=False)
         return f"```json\n{payload}\n```" if self.fence_plan else payload
 
     def _executor_text(self, body: dict[str, Any]) -> str:
@@ -148,6 +194,20 @@ def _sse_response(content: str) -> httpx.Response:
     for chunk in chunks:
         payload = json.dumps({"choices": [{"delta": {"content": chunk}}]}, ensure_ascii=False)
         lines.append(f"data: {payload}\n\n")
+    # 真实的 OpenAI 兼容网关在 stream_options.include_usage 时，
+    # 会在最后一个数据块里带上 usage（choices 为空）；这里保持同样的形状，
+    # 否则指标测试就测不到"流式也能记账"这条路径。
+    lines.append(
+        "data: "
+        + json.dumps(
+            {
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            },
+            ensure_ascii=False,
+        )
+        + "\n\n"
+    )
     lines.append("data: [DONE]\n\n")
     return httpx.Response(
         200,

@@ -5,9 +5,97 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+#: 允许的客观检查类型（全部不执行任意命令，见 app/services/verify.py）
+CHECK_TYPES: tuple[str, ...] = (
+    "file_exists",
+    "dir_exists",
+    "glob",
+    "file_contains",
+    "py_compile",
+    "json_valid",
+)
+
+_CHECK_ALIASES = {
+    "exists": "file_exists",
+    "file": "file_exists",
+    "file_exist": "file_exists",
+    "exists_file": "file_exists",
+    "dir": "dir_exists",
+    "directory_exists": "dir_exists",
+    "contains": "file_contains",
+    "file_include": "file_contains",
+    "python": "py_compile",
+    "py": "py_compile",
+    "compile": "py_compile",
+    "json": "json_valid",
+    "valid_json": "json_valid",
+    "glob_match": "glob",
+}
+
+
+class StepCheck(BaseModel):
+    """纲领为某一步声明的**客观验收项**。
+
+    只允许 ``CHECK_TYPES`` 里的类型：它们都能在没有副作用、不执行代码的前提下判定，
+    所以可以在每步执行完立刻自动跑。命令类验收（pytest 等）需要用户审批，不在本轮范围。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal[
+        "file_exists",
+        "dir_exists",
+        "glob",
+        "file_contains",
+        "py_compile",
+        "json_valid",
+    ] = "file_exists"
+    path: str = ""
+    #: ``file_contains`` 需要的原文片段
+    text: str = ""
+    #: 人类可读说明；为空时由检查类型自动生成
+    label: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"type": "file_exists", "path": value}
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        raw_type = str(data.get("type") or data.get("kind") or "file_exists").strip().lower()
+        raw_type = _CHECK_ALIASES.get(raw_type, raw_type)
+        data["type"] = raw_type if raw_type in CHECK_TYPES else "file_exists"
+        data["path"] = str(
+            data.get("path") or data.get("file") or data.get("pattern") or data.get("target") or ""
+        ).strip()
+        data["text"] = str(
+            data.get("text")
+            or data.get("value")
+            or data.get("contains")
+            or data.get("needle")
+            or ""
+        )
+        data["label"] = str(data.get("label") or data.get("description") or data.get("why") or "")
+        return data
+
+
+class CheckResult(BaseModel):
+    """一次客观检查的执行结果（会随运行记录落盘，供界面与报告展示）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: str = ""
+    path: str = ""
+    text: str = ""
+    label: str = ""
+    ok: bool = False
+    detail: str = ""
 
 
 class PlanComponent(BaseModel):
@@ -30,6 +118,8 @@ class PlanStep(BaseModel):
     goal: str = ""
     deliverables: list[str] = Field(default_factory=list)
     acceptance: list[str] = Field(default_factory=list)
+    #: 客观验收项：执行完会逐条自动检查，不通过就不算完成
+    checks: list[StepCheck] = Field(default_factory=list)
     depends_on: list[int] = Field(default_factory=list)
 
     @model_validator(mode="before")
@@ -45,6 +135,12 @@ class PlanStep(BaseModel):
             data["acceptance"] = _as_str_list(
                 data.get("acceptance") or data.get("acceptance_criteria")
             )
+            raw_checks = data.get("checks") or data.get("verifications") or []
+            if isinstance(raw_checks, dict):
+                raw_checks = [raw_checks]
+            data["checks"] = [
+                item if isinstance(item, dict) else item for item in raw_checks if item
+            ]
             data["depends_on"] = _as_int_list(data.get("depends_on"))
             return data
         return value

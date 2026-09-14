@@ -1585,6 +1585,26 @@ textarea:focus {
   font-size: 12px;
 }
 
+/* 客观验收：通过/未通过要一眼看出区别，不能只靠文字描述 */
+.verify-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.verify-ok {
+  color: var(--ok, #1a7f37);
+}
+
+.verify-fail {
+  color: var(--danger, #c0392b);
+}
+
+.msg-assistant .stream {
+  white-space: pre-wrap;
+}
+
 @media (max-width: 1180px) {
   .dashboard {
     max-height: 30vh;

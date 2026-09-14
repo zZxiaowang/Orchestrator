@@ -503,6 +503,25 @@ async def retry_step(
     return {"run": run.model_dump(mode="json"), "action": "retry_step"}
 
 
+@router.get("/runs/{run_id}/metrics")
+async def run_metrics(run_id: str, request: Request) -> dict[str, Any]:
+    """运行级指标：架构段一条 + 执行段每步一条（``Run.metrics`` 的 PhaseMetrics 契约）。
+
+    统计看板与外部工具都以这个接口为准；运行记录不可用时返回 404，不伪造空统计。
+    """
+
+    orchestrator = _orchestrator(request)
+    if not orchestrator.store.exists(run_id):
+        raise NotFoundError(f"未找到该运行：{run_id}", details={"run_id": run_id})
+    run = orchestrator.store.load(run_id)
+    return {
+        "run_id": run.id,
+        "status": run.status.value,
+        "metrics": [item.model_dump(mode="json") for item in run.metrics],
+        "summary": run.metrics_summary(),
+    }
+
+
 @router.get("/runs/{run_id}/events")
 async def run_events(run_id: str, request: Request, since: int | None = None) -> StreamingResponse:
     orchestrator = _orchestrator(request)

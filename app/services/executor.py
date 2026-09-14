@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from app.core.jsonx import extract_json_object
-from app.core.relay import RelayClient
+from app.core.relay import CallStats, RelayClient
 from app.schemas.step import StepOutput
 
 EXECUTOR_SYSTEM = """你是一名执行工程师，负责把已经定稿的**纲领**落地成具体产出。
@@ -38,6 +38,9 @@ JSON 结构：
 }
 
 写法要求：
+- **产出会被客观验收**：系统执行完本步会逐条检查这些客观条件（文件是否存在、
+  是否包含指定内容、Python 能否编译、JSON 是否合法）。检查不通过，这一步就不算完成，
+  所以别只写一句"已完成"——该建的文件要真的建出来，该写的内容要真的写进去。
 - **上下文不足时先索取，不要猜**：如果缺少必读文件的内容，只输出
   `{"need_files": ["路径"], "need_reason": "原因"}`，系统会把文件内容补给你后再继续。
 - `need_files` 要精准（1-3 个文件为宜），不要一次索取整个仓库。
@@ -67,9 +70,10 @@ async def run_step(
     *,
     model: str,
     on_token: Callable[[str], None] | None = None,
+    stats: CallStats | None = None,
 ) -> tuple[StepOutput, str]:
     buffer: list[str] = []
-    async for chunk in client.astream_with_fallback(messages, model=model):
+    async for chunk in client.astream_with_fallback(messages, model=model, stats=stats):
         buffer.append(chunk)
         if on_token:
             on_token(chunk)
@@ -86,7 +90,9 @@ async def run_step(
                 "content": "上面的输出不是合法 JSON。请只输出那一个 JSON 对象。",
             }
         )
-        result = await client.acomplete(retry, model=model, json_mode=True)
+        if stats is not None:
+            stats.retry()
+        result = await client.acomplete(retry, model=model, json_mode=True, stats=stats)
         raw = result.text
         output = parse_step_output(raw)
     if output is None:

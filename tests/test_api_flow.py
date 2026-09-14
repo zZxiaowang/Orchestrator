@@ -591,3 +591,84 @@ def test_retry_step_can_redo_one_step_then_resume(tmp_path: Path):
         run = wait_for_status(client, run_id, TERMINAL)
         assert run["status"] == "done"
         assert all(step["status"] == "done" for step in run["steps"])
+
+
+def test_chat_request_skips_orchestration(tmp_path: Path):
+    """「你是哪个模型」这类问答不该生成纲领、不该碰工作区。"""
+
+    relay = FakeRelay()
+    relay.intent_kind = "chat"
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "你是哪个模型"}).json()["run"]["id"]
+        run = wait_for_status(client, run_id, {"done"})
+
+        assert run["kind"] == "chat"
+        assert run["plan"] is None
+        assert run["steps"] == []
+        answers = [item for item in run["messages"] if item["phase"] == "chat"]
+        assert answers and answers[0]["content"].strip()
+
+        # 启发式直接判定，连分流那次模型调用都省了；架构段/执行段一次都没跑
+        assert relay.intent_calls == 0
+        assert relay.executor_calls == 0
+        assert not any(
+            "资深架构师" in item["body"]["messages"][0]["content"] for item in relay.requests
+        )
+
+        # 没有纲领/报告产物，也没有动过工作区
+        assert client.get(f"/api/v1/runs/{run_id}/docs").json()["docs"] == []
+        workspace = tmp_path / "runs" / run_id / "workspace"
+        assert not workspace.exists() or list(workspace.rglob("*")) == []
+
+
+def test_step_is_blocked_when_objective_checks_fail(tmp_path: Path):
+    """产出了文件但没通过客观验收：不允许标成完成。"""
+
+    relay = FakeRelay()
+    relay.plan_checks = [
+        {"type": "file_contains", "path": "steps/step-1.md", "text": "这段内容根本不存在"},
+        {"type": "py_compile", "path": "steps/step-1.md"},
+    ]
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "为示例项目建立骨架"}).json()["run"][
+            "id"
+        ]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "blocked", run
+        step = run["steps"][0]
+        assert step["status"] == "blocked"
+        assert "客观验收未通过" in step["error"]
+
+        results = step["verification"]
+        assert results, "应当留下验收明细"
+        failed = [item for item in results if not item["ok"]]
+        assert {item["type"] for item in failed} == {"file_contains", "py_compile"}
+        # 交付物存在这条是通过的：说明检查真的跑了，而不是一律拒绝
+        assert any(item["ok"] and item["type"] == "file_exists" for item in results)
+
+        docs = {
+            doc["name"]: doc["content"]
+            for doc in client.get(f"/api/v1/runs/{run_id}/docs").json()["docs"]
+        }
+        assert "客观验收" in docs["report.md"]
+
+
+def test_verification_passes_are_recorded_not_just_failures(tmp_path: Path):
+    """通过也要留痕：否则界面上无法区分「验收通过」和「压根没验」。"""
+
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "为示例项目建立骨架"}).json()["run"][
+            "id"
+        ]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        for step in run["steps"]:
+            assert step["verification"], step
+            assert all(item["ok"] for item in step["verification"])

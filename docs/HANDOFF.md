@@ -45,6 +45,9 @@
 | 25 | 所有功能都要做成界面按钮 | ✅ 面板共 29 个按钮（含代理/分支/暂存/丢弃/选中提交/历史 diff/自动提交） |
 | 26 | 重新打包（图形界面找不到 Git） | ✅ 修复打包版仓库路径（`project_root()`），重打并自检通过 |
 | 27 | Git 每次点击要等很久 | ✅ 状态查询 7 次 git 调用压到 3 次 + 代理状态缓存（实测面板刷新 228ms） |
+| 28 | 「你是哪个模型」被当成需求走编排 | ✅ 新增意图分流：明显问答/闲聊不生成纲领、不碰工作区（`app/services/intent.py`） |
+| 29 | 统计看板永远是空的 | ✅ 指标接线：中继层记 attempts/耗时/usage，主链路写入 `run.metrics`，新增 `GET /api/v1/runs/{id}/metrics` |
+| 30 | 「完成」只靠模型自己说 | ✅ 步骤级**客观验收**：文件存在 / 含指定内容 / Python 可编译 / JSON 合法 / 通配匹配，不通过就不算完成（`app/services/verify.py`） |
 
 ## 三、数据与文件位置（重要）
 
@@ -119,16 +122,22 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **166 项**通过；ruff check/format 全绿；界面自检 46 项（44 通过，2 项为统计看板待接线） |
+| 质量门 | pytest **212 项**通过；ruff check/format 全绿；界面自检 **46 项全通过**（统计看板 2 项已随指标接线转为通过） |
 | 桌面自检 | 渲染 PASS、点击链路 PASS、Git 面板 29 按钮 PASS |
 | 推送 | 已配置 `http.https://github.com/.proxy = http://127.0.0.1:10809`（**只对 github.com 生效**） |
 
 ## 五、待办（下一步可做）
 
-1. **统计看板接线**：`app/services/metrics_sink.py` 与 `Run.metrics` 契约不一致（`list[PhaseMetrics]` vs `{architect,steps}` 字典），未接线 → 面板显示不出耗时/token/重试。
-2. 编排器「下一阶段迭代」的 **P1 / P2**（步骤 7–14）：受控命令执行、大仓库检索、多轮续聊、并发队列、分发常驻。
-3. 账号密码安全问题：**改密码**，推送用 PAT。
-4. 可选：exe 图标、Inno Setup/NSIS 安装包；Git 面板「暂存/丢弃」的批量选择体验优化。
+1. **契约收敛收尾**：`app/services/metrics_sink.py` 是旧的 `{architect, steps}` 字典形态，
+   与权威契约 `Run.metrics: list[PhaseMetrics]`（已接线生效）并存。它的单测仍在跑，
+   但已经没有任何主链路依赖——建议整体删除或改为 PhaseMetrics 形态，避免下一个人又接错线。
+2. **主备路由接线（P0-3）**：`app/core/fallback.py` 的 `FailoverRunner` 已实现但主链路未用，
+   `Orchestrator._client()` 仍是裸 `RelayClient`。
+3. **计划质量门（P0-4）**：纲领生成后检查步骤粒度 / 依赖 / 验收标准是否可判定，
+   对空工作区下的「盘点现有代码」类步骤给出明确告警。
+4. 编排器「下一阶段迭代」的 **P1 / P2**：受控命令执行（含白名单与逐条审批）、大仓库检索、多轮续聊、并发队列、分发常驻。
+5. 账号密码安全问题：**改密码**，推送用 PAT。
+6. 可选：exe 图标、Inno Setup/NSIS 安装包；Git 面板「暂存/丢弃」的批量选择体验优化。
 
 ## 六、新窗口开场提示词（可直接粘贴）
 

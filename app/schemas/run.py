@@ -10,7 +10,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.schemas.plan import ArchitecturePlan
+from app.schemas.plan import ArchitecturePlan, CheckResult, StepCheck
 
 
 def _now() -> datetime:
@@ -141,6 +141,10 @@ class RunStep(BaseModel):
     goal: str = ""
     deliverables: list[str] = Field(default_factory=list)
     acceptance: list[str] = Field(default_factory=list)
+    #: 纲领声明的客观验收项（执行前由架构段给出，执行后逐条自动检查）
+    checks: list[StepCheck] = Field(default_factory=list)
+    #: 本次执行的客观验收结果（空 = 没有可自动判定的检查项）
+    verification: list[CheckResult] = Field(default_factory=list)
     status: StepStatus = StepStatus.PENDING
     summary: str = ""
     #: 交给下一步的接力说明（保持精炼，避免上下文随步骤线性膨胀）
@@ -181,6 +185,8 @@ class Run(BaseModel):
     archived: bool = False
     #: 前期沟通简报（比 task 长，架构段与执行段都会作为稳定背景读入）
     brief: str = ""
+    #: 运行类型：``task`` = 走"纲领 → 确认 → 执行"；``chat`` = 判定为问答，直接回答
+    kind: str = "task"
     status: RunStatus = RunStatus.PLANNING
     workspace_dir: str = ""
     target_dir: str = ""

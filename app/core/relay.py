@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,7 +32,68 @@ _PARAM_FALLBACKS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("temperature", ("temperature",)),
     ("max_tokens", ("max_tokens", "max_completion_tokens")),
     ("response_format", ("response_format",)),
+    ("stream_options", ("stream_options",)),
 )
+
+#: usage 三元组：与 PhaseMetrics 契约保持同名，缺失一律 None，不用 0 冒充
+USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def _ms(started: float) -> int:
+    """自 ``time.perf_counter()`` 起点至今的毫秒数（单调时钟，不参与事件排序）。"""
+
+    return max(0, int(round((time.perf_counter() - started) * 1000)))
+
+
+@dataclass
+class CallStats:
+    """一次「逻辑模型调用」的遥测账本，只供指标采集使用。
+
+    与 ``RelayResult`` 的区别：``RelayResult`` 描述**一次响应**，
+    ``CallStats`` 累计**一段阶段/步骤内的多次请求**——包含 JSON 强制重试、
+    流式降级为非流式、以及网关侧的 5xx/参数降级重发。
+
+    * ``calls``：逻辑调用次数（每次 ``acomplete`` / ``astream_with_fallback`` 记 1）；
+    * ``attempts``：真实发出的 HTTP 请求次数（含重试）；
+    * ``usage_totals``：提供方**明确返回**的用量累加；未返回的项不进账，展示为未知。
+    """
+
+    calls: int = 0
+    attempts: int = 0
+    duration_ms: int = 0
+    #: 显式重试次数：传输层重试由 attempts-calls 推出，这里只记调用方**主动重试**
+    #: （例如"输出不是合法 JSON，强制重试一次"）。分流的独立调用不算重试。
+    retries: int = 0
+    protocol: str = "chat_completions"
+    #: 是否真正发起过流式请求（用于区分「流式没带 usage」和「压根没要 usage」）
+    streamed: bool = False
+    #: 流式被网关拒绝后是否降级为一次性请求
+    fell_back_to_sync: bool = False
+    #: 提供方明确返回过 usage 的调用次数
+    usage_calls: int = 0
+    usage_totals: dict[str, int] = field(default_factory=dict)
+
+    def retry(self, count: int = 1) -> None:
+        """记一次主动重试（与传输层重试区分开）。"""
+
+        self.retries += max(0, int(count))
+
+    def record_usage(self, raw: Any) -> None:
+        """记录一次调用的 usage：全部缺失时只累计「未知」，不写 0。"""
+
+        normalized = normalize_usage(raw)
+        known = {key: value for key, value in normalized.items() if value is not None}
+        if not known:
+            return
+        self.usage_calls += 1
+        for key, value in known.items():
+            self.usage_totals[key] = self.usage_totals.get(key, 0) + int(value)
+
+    @property
+    def usage(self) -> dict[str, int | None]:
+        """累计用量（与 PhaseMetrics 同名）；从未拿到过就是 None。"""
+
+        return {key: self.usage_totals.get(key) for key in USAGE_KEYS}
 
 
 @dataclass
@@ -155,17 +217,35 @@ class RelayClient:
         model: str,
         json_mode: bool = False,
         temperature: float | None = None,
+        stats: CallStats | None = None,
     ) -> RelayResult:
         body: dict[str, Any] = self._build_body(
             messages, model=model, stream=False, json_mode=json_mode, temperature=temperature
         )
-        data, path = await self._post_with_fallbacks(body)
+        started = time.perf_counter()
+        try:
+            data, path, attempts = await self._post_with_fallbacks(body, stats=stats)
+        except BaseException:
+            # 失败也要记账：否则「失败但确实消耗了额度」的调用会显示成零成本
+            if stats is not None:
+                stats.calls += 1
+                stats.duration_ms += _ms(started)
+                stats.protocol = self.wire_api
+            raise
+        if stats is not None:
+            stats.calls += 1
+            stats.duration_ms += _ms(started)
+            stats.protocol = self.wire_api
+            stats.record_usage(data.get("usage"))
         return RelayResult(
             text=self._extract_text(data),
             model=data.get("model") or model,
             usage=data.get("usage") or {},
             raw=data,
             endpoint_path=path,
+            attempts=attempts,
+            duration_ms=_ms(started),
+            protocol=self.wire_api,
         )
 
     async def astream(
@@ -174,11 +254,12 @@ class RelayClient:
         *,
         model: str,
         temperature: float | None = None,
+        stats: CallStats | None = None,
     ) -> AsyncIterator[str]:
         body = self._build_body(
             messages, model=model, stream=True, json_mode=False, temperature=temperature
         )
-        async for chunk in self._post_stream(body):
+        async for chunk in self._post_stream(body, stats=stats):
             yield chunk
 
     async def astream_with_fallback(
@@ -187,23 +268,37 @@ class RelayClient:
         *,
         model: str,
         temperature: float | None = None,
+        stats: CallStats | None = None,
     ) -> AsyncIterator[str]:
         """优先流式；若网关明确拒绝流式（如不支持 ``stream: true``），退回一次性请求。
 
         很多中转对 ``stream`` 支持不一致，直接失败会让整个流程走不下去；
         这里在**尚未产出任何内容**时降级重试，已有输出则照常抛出，避免重复内容。
+
+        ``stats`` 传入时，本次逻辑调用的次数 / HTTP 次数 / 耗时 / usage 都会记进账本。
         """
         emitted = False
+        started = time.perf_counter()
+        if stats is not None:
+            stats.calls += 1
+            stats.protocol = self.wire_api
         try:
-            async for chunk in self.astream(messages, model=model, temperature=temperature):
+            async for chunk in self.astream(
+                messages, model=model, temperature=temperature, stats=stats
+            ):
                 emitted = True
                 yield chunk
             return
         except RelayError as exc:
             if emitted or exc.status_code is None:
                 raise
+        finally:
+            if stats is not None:
+                stats.duration_ms += _ms(started)
 
-        result = await self.acomplete(messages, model=model, temperature=temperature)
+        if stats is not None:
+            stats.fell_back_to_sync = True
+        result = await self.acomplete(messages, model=model, temperature=temperature, stats=stats)
         for chunk in iter_chunks(result.text, 120):
             yield chunk
 
@@ -298,6 +393,10 @@ class RelayClient:
         body = {"model": model, "messages": list(messages), "stream": stream}
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if stream:
+            # 多数网关默认不在流式响应里给 usage；显式索取，拿不到就按「未知」记账。
+            # 若网关不认这个参数（400），_post_stream 会去掉它重试。
+            body["stream_options"] = {"include_usage": True}
         if temperature is not None:
             body["temperature"] = temperature
         return body
@@ -324,16 +423,23 @@ class RelayClient:
 
     # ── 发送 ──
 
-    async def _post_with_fallbacks(self, body: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    async def _post_with_fallbacks(
+        self, body: dict[str, Any], *, stats: CallStats | None = None
+    ) -> tuple[dict[str, Any], str, int]:
         self._require_configured()
         last_error: RelayError | None = None
         current = dict(body)
         dropped: set[str] = set()
+        attempts = 0
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             retry_immediately = False
             for base in self._candidate_bases():
                 path = self._path_for(base)
+                attempts += 1
+                if stats is not None:
+                    # 记在请求发出之前：即便这次超时/断连，它也确实发生过了
+                    stats.attempts += 1
                 try:
                     async with self._client() as client:
                         resp = await client.post(path, json=current, headers=self._headers())
@@ -347,7 +453,7 @@ class RelayClient:
                 if resp.status_code == 200:
                     self._resolved_base = base
                     try:
-                        return resp.json(), path
+                        return resp.json(), path, attempts
                     except ValueError as exc:  # pragma: no cover - 网关返回非 JSON
                         raise RelayError(
                             "中转返回了非 JSON 响应。",
@@ -390,19 +496,27 @@ class RelayClient:
 
         raise last_error or RelayError("中转调用失败，且没有可用端点。")
 
-    async def _post_stream(self, body: dict[str, Any]) -> AsyncIterator[str]:
+    async def _post_stream(
+        self, body: dict[str, Any], *, stats: CallStats | None = None
+    ) -> AsyncIterator[str]:
         self._require_configured()
         last_error: RelayError | None = None
+        current = dict(body)
+        dropped: set[str] = set()
+        if stats is not None:
+            stats.streamed = True
         # 流式请求同样要重试：网关/上游偶发 502、503 很常见。
         # 只要尚未吐出任何内容，就按与非流式一致的退避策略重试。
         for attempt in range(1, MAX_ATTEMPTS + 1):
             retry = False
             for base in self._candidate_bases():
                 path = self._path_for(base)
+                if stats is not None:
+                    stats.attempts += 1
                 try:
                     async with (
                         self._client() as client,
-                        client.stream("POST", path, json=body, headers=self._headers()) as resp,
+                        client.stream("POST", path, json=current, headers=self._headers()) as resp,
                     ):
                         if resp.status_code in (404, 405):
                             last_error = RelayError(
@@ -413,6 +527,18 @@ class RelayClient:
                             continue
                         if resp.status_code != 200:
                             detail = _excerpt(await resp.aread())
+                            if resp.status_code == 400 and self._drop_unsupported_param(
+                                detail, current, dropped
+                            ):
+                                # 网关不认某个流式参数（如 stream_options）：去掉后重试，
+                                # 而不是把「网关差异」变成用户的运行失败。
+                                last_error = RelayError(
+                                    f"中转拒绝了流式请求参数（HTTP 400）：{detail}",
+                                    status_code=400,
+                                    hint="已自动去掉不被支持的参数并重试。",
+                                )
+                                retry = True
+                                break
                             last_error = RelayError(
                                 f"中转返回 HTTP {resp.status_code}：{detail}",
                                 status_code=resp.status_code,
@@ -423,7 +549,7 @@ class RelayClient:
                                 break
                             raise last_error
                         self._resolved_base = base
-                        async for chunk in self._parse_sse(resp):
+                        async for chunk in self._parse_sse(resp, stats=stats):
                             yield chunk
                         return
                 except httpx.HTTPError as exc:
@@ -439,8 +565,12 @@ class RelayClient:
                 await asyncio.sleep(1.5 * attempt)
         raise last_error or RelayError("流式请求失败，且没有可用端点。")
 
-    async def _parse_sse(self, resp: httpx.Response) -> AsyncIterator[str]:
+    async def _parse_sse(
+        self, resp: httpx.Response, *, stats: CallStats | None = None
+    ) -> AsyncIterator[str]:
         emitted = False
+        # 有些网关会先发一条 usage 全 0 的空块，再发最终块；只认最后一条，避免重复计账
+        last_usage: Any = None
         async for line in resp.aiter_lines():
             if not line or not line.startswith("data:"):
                 continue
@@ -452,6 +582,10 @@ class RelayClient:
             except json.JSONDecodeError:
                 continue
 
+            usage = self._usage_of(data)
+            if usage is not None:
+                last_usage = usage
+
             if self.wire_api == "responses":
                 chunk = self._extract_responses_delta(data, emitted)
             else:
@@ -459,6 +593,20 @@ class RelayClient:
             if chunk:
                 emitted = True
                 yield chunk
+
+        if stats is not None and last_usage is not None:
+            stats.record_usage(last_usage)
+
+    def _usage_of(self, data: dict[str, Any]) -> dict[str, Any] | None:
+        """从流式事件里取 usage：chat 在顶层，responses 在 ``response.completed`` 里。"""
+
+        direct = data.get("usage")
+        if isinstance(direct, dict):
+            return direct
+        response = data.get("response")
+        if isinstance(response, dict) and isinstance(response.get("usage"), dict):
+            return response["usage"]
+        return None
 
     def _extract_responses_delta(self, data: dict[str, Any], emitted: bool) -> str:
         """Responses 协议：以增量事件为准；只有全程没有增量时才用 completed 的全文。

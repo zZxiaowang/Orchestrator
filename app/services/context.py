@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from app.core.errors import AppError
 from app.schemas.plan import ArchitecturePlan
 from app.schemas.run import RunStep, StepStatus
+from app.services.verify import effective_checks
 
 OMIT_MARK = "…（此处省略 {count} 项，如确需查看请用 need_files 索取路径）"
 FILE_TAIL_MARK = (
@@ -228,12 +229,18 @@ class StepContextBuilder:
     # ── 内部 ──
 
     def _current_step(self, step: RunStep) -> str:
+        checks = effective_checks(step.checks, step.deliverables)
+        check_line = ""
+        if checks:
+            items = "；".join((item.label or f"{item.type}: {item.path}") for item in checks)
+            check_line = f"\n客观验收（不通过就不算完成）：{items}"
         return (
             f"## 当前步骤（第 {step.id} 步）\n"
             f"标题：{step.title}\n"
             f"目标：{step.goal}\n"
             f"交付物：{', '.join(step.deliverables) or '（未指定）'}\n"
             f"验收标准：{'；'.join(step.acceptance) or '（未指定）'}"
+            f"{check_line}"
         )
 
     def _completed_log(self, steps: Sequence[RunStep]) -> str:
