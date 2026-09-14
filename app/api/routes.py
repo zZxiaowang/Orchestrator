@@ -118,6 +118,15 @@ class SettingsPatch(BaseModel):
     command_timeout_seconds: float | None = None
     step_command_rounds: int | None = None
     request_timeout_seconds: float | None = None
+    # 主备降级：主用失败（502/503/超时）时自动切到备用配置
+    architect_backup_base_url: str | None = None
+    architect_backup_api_key: str | None = None
+    architect_backup_model: str | None = None
+    architect_backup_label: str | None = None
+    editor_backup_base_url: str | None = None
+    editor_backup_api_key: str | None = None
+    editor_backup_model: str | None = None
+    editor_backup_label: str | None = None
 
 
 class ProviderPayload(BaseModel):
@@ -203,6 +212,21 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "command_timeout_seconds": settings.command_timeout_seconds,
         "step_command_rounds": settings.step_command_rounds,
         "request_timeout_seconds": settings.request_timeout_seconds,
+        # 备用配置：Key 只回掩码，界面据此显示"已配置/留空不修改"
+        "architect_backup": {
+            "base_url": settings.architect_backup_base_url,
+            "api_key_masked": _mask_key(settings.architect_backup_api_key),
+            "api_key_set": bool(settings.architect_backup_api_key),
+            "model": settings.architect_backup_model,
+            "label": settings.architect_backup_label,
+        },
+        "editor_backup": {
+            "base_url": settings.editor_backup_base_url,
+            "api_key_masked": _mask_key(settings.editor_backup_api_key),
+            "api_key_set": bool(settings.editor_backup_api_key),
+            "model": settings.editor_backup_model,
+            "label": settings.editor_backup_label,
+        },
         "architect": architect.describe(),
         "editor": editor.describe(),
         "missing": missing,

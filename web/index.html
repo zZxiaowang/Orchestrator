@@ -222,6 +222,49 @@
             <button class="btn ghost" id="settings-test">测试当前配置</button>
             <span class="test-result" id="settings-test-result"></span>
           </div>
+
+          <details class="git-section" id="backup-block">
+            <summary>备用配置（主用失败时自动切换，例如中转 502 / 超时）</summary>
+            <p class="hint">
+              留空 = 不启用。填写后：主用出现 502/503/504/429 或连接失败时，会自动改用这里的
+              地址与 Key 继续本次运行，并在界面上提示"已切换到备用"。
+            </p>
+            <div class="field-grid">
+              <label class="field span-2">
+                <span>架构段备用 base_url</span>
+                <input id="f-architect-backup-base" placeholder="https://backup.example.com/v1" />
+              </label>
+              <label class="field span-2">
+                <span>架构段备用 API Key</span>
+                <input id="f-architect-backup-key" type="password" placeholder="留空表示不修改" />
+              </label>
+              <label class="field">
+                <span>架构段备用模型（留空沿用主用）</span>
+                <input id="f-architect-backup-model" placeholder="gpt-5.6-sol" />
+              </label>
+              <label class="field">
+                <span>备用别名（显示用）</span>
+                <input id="f-architect-backup-label" placeholder="例如：备用中转" />
+              </label>
+              <label class="field span-2">
+                <span>执行段备用 base_url</span>
+                <input id="f-editor-backup-base" placeholder="https://api.deepseek.com/v1" />
+              </label>
+              <label class="field span-2">
+                <span>执行段备用 API Key</span>
+                <input id="f-editor-backup-key" type="password" placeholder="留空表示不修改" />
+              </label>
+              <label class="field">
+                <span>执行段备用模型（留空沿用主用）</span>
+                <input id="f-editor-backup-model" placeholder="deepseek-v4-flash" />
+              </label>
+              <label class="field">
+                <span>备用别名（显示用）</span>
+                <input id="f-editor-backup-label" placeholder="例如：官方直连" />
+              </label>
+            </div>
+            <div class="modal-status" id="backup-status"></div>
+          </details>
           </section>
 
           <section class="settings-section" data-section="command" hidden>

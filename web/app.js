@@ -1823,6 +1823,25 @@ function openSettings(section = "model") {
     settings.command_allowlist || []
   ).join("\n");
   document.getElementById("f-command-rounds").value = settings.step_command_rounds ?? 2;
+  const backups = [
+    ["architect", settings.architect_backup || {}],
+    ["editor", settings.editor_backup || {}],
+  ];
+  for (const [role, backup] of backups) {
+    document.getElementById(`f-${role}-backup-base`).value = backup.base_url || "";
+    document.getElementById(`f-${role}-backup-model`).value = backup.model || "";
+    document.getElementById(`f-${role}-backup-label`).value = backup.label || "";
+    const keyField = document.getElementById(`f-${role}-backup-key`);
+    keyField.value = "";
+    keyField.placeholder = backup.api_key_set
+      ? `已保存：${backup.api_key_masked}（留空表示不修改）`
+      : "留空表示不修改";
+  }
+  document.getElementById("backup-status").textContent = backups.some(
+    ([, backup]) => backup.base_url && backup.api_key_set
+  )
+    ? "备用配置已启用：主用失败时自动切换。"
+    : "未配置备用：主用失败会如实报错（会给出可操作建议）。";
   switchSettingsSection(section || state.settingsSection || "model");
   document.getElementById("settings-modal").hidden = false;
   refreshProviders().then(() => {
@@ -2179,7 +2198,21 @@ async function saveProviderForm() {
       .map((line) => line.trim())
       .filter(Boolean),
     step_command_rounds: Number(document.getElementById("f-command-rounds").value) || 0,
+    // 备用配置：Key 留空 = 不修改（和主 Key 一致的约定）
+    architect_backup_base_url: document.getElementById("f-architect-backup-base").value.trim(),
+    architect_backup_model: document.getElementById("f-architect-backup-model").value.trim(),
+    architect_backup_label: document.getElementById("f-architect-backup-label").value.trim(),
+    editor_backup_base_url: document.getElementById("f-editor-backup-base").value.trim(),
+    editor_backup_model: document.getElementById("f-editor-backup-model").value.trim(),
+    editor_backup_label: document.getElementById("f-editor-backup-label").value.trim(),
   };
+  for (const [field, elementId] of [
+    ["architect_backup_api_key", "f-architect-backup-key"],
+    ["editor_backup_api_key", "f-editor-backup-key"],
+  ]) {
+    const typed = document.getElementById(elementId).value.trim();
+    if (typed) globals[field] = typed;
+  }
   const result = state.editingProviderId
     ? await api.updateProvider(state.editingProviderId, data)
     : await api.createProvider({ ...data, activate: false });

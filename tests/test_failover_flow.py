@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -89,3 +90,28 @@ def test_no_backup_configured_keeps_5xx_error_readable(tmp_path: Path):
     hint = run["error"].get("hint", "")
     assert hint, run["error"]
     assert "备用" in hint or "重试" in hint or "切换" in hint
+
+
+def test_backup_settings_round_trip_through_api(tmp_path: Path):
+    """备用配置要能在界面上填、并且读回来（Key 只回掩码）。"""
+
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        saved = client.put(
+            "/api/v1/settings",
+            json={
+                "architect_backup_base_url": "https://backup.test/v1",
+                "architect_backup_api_key": "sk-backup-123456",
+                "architect_backup_model": "gpt-5.6-sol",
+                "architect_backup_label": "备用中转",
+            },
+        ).json()
+        assert saved["architect_backup"]["base_url"] == "https://backup.test/v1"
+        assert saved["architect_backup"]["api_key_set"] is True
+        assert saved["architect_backup"]["api_key_masked"].startswith("sk-")
+        assert "sk-backup-123456" not in json.dumps(saved, ensure_ascii=False)
+
+        # 留空 Key = 不修改：再存一次只改模型，Key 仍然有效
+        again = client.put("/api/v1/settings", json={"architect_backup_model": "gpt-5.2"}).json()
+        assert again["architect_backup"]["api_key_set"] is True
+        assert again["architect_backup"]["model"] == "gpt-5.2"
