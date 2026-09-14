@@ -28,7 +28,16 @@ class AppError(Exception):
         self.details = details or {}
 
     def as_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "details": self.details}
+        payload: dict[str, Any] = {
+            "code": self.code,
+            "message": self.message,
+            "details": self.details,
+        }
+        # 把 hint 提到顶层：界面直接用得上（"该怎么处理"），不必再往 details 里翻
+        hint = getattr(self, "hint", None)
+        if hint:
+            payload["hint"] = hint
+        return payload
 
 
 class ConfigurationError(AppError):

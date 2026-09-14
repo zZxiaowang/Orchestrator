@@ -1015,6 +1015,13 @@ textarea.feedback {
   font-size: 13px;
 }
 
+.error-hint {
+  margin-top: 6px;
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
 .empty {
   margin: auto;
   max-width: 560px;

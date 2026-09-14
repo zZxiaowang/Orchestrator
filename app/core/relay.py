@@ -723,3 +723,14 @@ def iter_chunks(text: str, size: int = 24) -> Iterable[str]:
     """把整段文本切成小块，用于模拟流式输出（测试与回放用）。"""
     for index in range(0, len(text), size):
         yield text[index : index + size]
+
+
+def unwrap_result(value: Any) -> RelayResult:
+    """兼容两种客户端：``RelayClient`` 直接返回结果，``FailoverRunner`` 返回 (结果, 降级摘要)。
+
+    让上层（架构段 / 执行段 / 意图分流）不必关心自己拿到的是哪种客户端。
+    """
+
+    if isinstance(value, tuple):
+        return value[0]
+    return value

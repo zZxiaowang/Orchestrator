@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass
 
 from app.core.jsonx import extract_json_object
-from app.core.relay import CallStats, RelayClient
+from app.core.relay import CallStats, RelayClient, unwrap_result
 
 CHAT = "chat"
 TASK = "task"
@@ -179,8 +179,10 @@ async def detect_intent(
     try:
         # 分类只要一个极短的 JSON：给它一个很小的输出上限，
         # 避免推理模型在这里"想很久"，把纲领开始之前的空档拖成几十秒。
-        result = await client.acomplete(
-            messages, model=model, json_mode=True, max_tokens=64, stats=stats
+        result = unwrap_result(
+            await client.acomplete(
+                messages, model=model, json_mode=True, max_tokens=64, stats=stats
+            )
         )
     except Exception:  # noqa: BLE001 - 分流失败不能拦住真需求
         return Intent(TASK, "意图分类调用失败，按需求处理", source="fallback")

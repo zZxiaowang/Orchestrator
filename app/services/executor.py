@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from app.core.jsonx import extract_json_object
-from app.core.relay import CallStats, RelayClient
+from app.core.relay import CallStats, RelayClient, unwrap_result
 from app.schemas.step import StepOutput
 
 EXECUTOR_SYSTEM = """你是一名执行工程师，负责把已经定稿的**纲领**落地成具体产出。
@@ -96,7 +96,9 @@ async def run_step(
         )
         if stats is not None:
             stats.retry()
-        result = await client.acomplete(retry, model=model, json_mode=True, stats=stats)
+        result = unwrap_result(
+            await client.acomplete(retry, model=model, json_mode=True, stats=stats)
+        )
         raw = result.text
         output = parse_step_output(raw)
     if output is None:

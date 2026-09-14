@@ -20,12 +20,21 @@ import httpx
 
 from app.core.config import Endpoint, Settings, get_settings
 from app.core.errors import AppError, ConfigurationError, NotFoundError, WorkspaceError
+from app.core.fallback import (
+    FailoverRunner,
+    RelayCandidate,
+    backup_configured,
+    backup_fields,
+    default_client_factory,
+    mask_endpoint,
+)
 from app.core.relay import CallStats, RelayClient
 from app.schemas.run import (
     PHASE_ARCHITECT,
     PHASE_EXECUTOR,
     ChangedFile,
     CommandRun,
+    PhaseMetrics,
     Run,
     RunMessage,
     RunStatus,
@@ -152,7 +161,8 @@ class Orchestrator:
                 message="正在判断这是需求还是问答…",
             )
 
-            client = self._client(endpoint, settings)
+            # 主用 → 备用：网关 502/503 时自动切到备用配置，而不是把错误丢给用户
+            client = self._runner(settings, PHASE_ARCHITECT, endpoint)
             stats = CallStats()
 
             # 先分流：问答（"你是哪个模型"）不该走"纲领 → 确认 → 执行"这条重流程。
@@ -206,6 +216,7 @@ class Orchestrator:
                     endpoint,
                     phase=PHASE_ARCHITECT,
                     context_chars=message_chars(messages),
+                    runner=client,
                 )
 
             plan = plan.model_copy(
@@ -301,7 +312,7 @@ class Orchestrator:
         endpoint = settings.resolve_architect()
         try:
             self._require_endpoint(endpoint)
-            client = self._client(endpoint, settings)
+            client = self._runner(settings, PHASE_ARCHITECT, endpoint)
             stats = CallStats()
             context = self._build_context(run, settings)
             messages = build_continue_messages(
@@ -328,6 +339,7 @@ class Orchestrator:
                     endpoint,
                     phase=PHASE_ARCHITECT,
                     context_chars=message_chars(messages),
+                    runner=client,
                 )
 
             additions = plan.steps[: settings.max_plan_steps]
@@ -427,6 +439,7 @@ class Orchestrator:
                 endpoint,
                 phase=PHASE_ARCHITECT,
                 context_chars=len(run.task) + len(run.brief),
+                runner=client,
             )
 
         run.kind = "chat"
@@ -470,7 +483,8 @@ class Orchestrator:
             )
 
             workspace = Workspace(Path(run.workspace_dir), backup_dir=self.store.backup_dir(run.id))
-            client = self._client(endpoint, settings)
+            # 注意：fallback 模块的阶段名是 architect / editor（与指标里的 executor 不同名）
+            client = self._runner(settings, "editor", endpoint)
 
             for step in run.steps:
                 if run_id in self._cancelled:
@@ -637,6 +651,7 @@ class Orchestrator:
                 "fetch": int(fetch_rounds),
                 "repair": int(command_rounds_used),
             },
+            runner=client,
         )
         step.retries = int(entry.retries if entry is not None else 0)
 
@@ -963,6 +978,42 @@ class Orchestrator:
             model_hint=endpoint.model,
         )
 
+    def _runner(self, settings: Settings, phase: str, endpoint: Endpoint) -> FailoverRunner:
+        """主用 → 备用 的运行器。
+
+        这是 502/503 这类"上游过载"的实际解法：主用失败时自动切到备用配置继续跑，
+        而不是把网关错误直接丢给用户。备用未配置时行为与单个客户端完全一致。
+        """
+
+        candidates = [
+            RelayCandidate(
+                label="primary",
+                alias=endpoint.label or endpoint.role,
+                model=endpoint.model,
+                base_url=mask_endpoint(endpoint.base_url),
+                client=self._client(endpoint, settings),
+            )
+        ]
+        if backup_configured(settings, phase):
+            fields = backup_fields(settings, phase)
+            candidates.append(
+                RelayCandidate(
+                    label="backup",
+                    alias=fields.get("label") or f"{endpoint.label or endpoint.role}·备用",
+                    model=fields["model"],
+                    base_url=mask_endpoint(fields["base_url"]),
+                    client=default_client_factory(
+                        base_url=fields["base_url"],
+                        api_key=fields["api_key"],
+                        wire_api=fields["wire_api"],
+                        model=fields["model"],
+                        timeout=settings.request_timeout_seconds,
+                        transport=self._transport,
+                    ),
+                )
+            )
+        return FailoverRunner(candidates, max_attempts=len(candidates))
+
     def _require_endpoint(self, endpoint: Endpoint) -> None:
         if not endpoint.configured:
             raise ConfigurationError(
@@ -1039,6 +1090,7 @@ class Orchestrator:
         context_chars: int | None = None,
         context_stats: dict[str, int] | None = None,
         rounds: dict[str, int] | None = None,
+        runner: FailoverRunner | None = None,
     ):
         """把一次调用的账本写进 ``run.metrics``（同一阶段/步骤累加，不重复建条目）。"""
 
@@ -1052,6 +1104,7 @@ class Orchestrator:
                 }
             if rounds:
                 entry.rounds = {key: int(value) for key, value in rounds.items()}
+            self._note_failover(run, runner, endpoint, entry)
         except Exception:  # noqa: BLE001 - 指标绝不能让主流程失败
             return None
         self.bus.publish(
@@ -1061,6 +1114,30 @@ class Orchestrator:
             summary=run.metrics_summary(),
         )
         return entry
+
+    def _note_failover(
+        self,
+        run: Run,
+        runner: FailoverRunner | None,
+        endpoint: Endpoint,
+        entry: PhaseMetrics | None = None,
+    ) -> None:
+        """主备切换留痕：指标里记实际用的配置，并推一条事件让界面能提示。"""
+
+        outcome = getattr(runner, "last_outcome", None)
+        if outcome is None or not outcome.switched:
+            return
+        if entry is not None and outcome.used_alias:
+            entry.route = {**entry.route, "alias": outcome.used_alias}
+        self.bus.publish(
+            run.id,
+            "fallback",
+            reason=outcome.switch_reason,
+            used_alias=outcome.used_alias,
+            primary=endpoint.label or endpoint.role,
+            attempts=[item.as_dict() for item in (outcome.attempts or [])][-3:],
+            message=f"主用配置失败，已切换到备用：{outcome.used_alias}",
+        )
 
     def _apply_edits(
         self, run: Run, step: RunStep, workspace: Workspace, output: StepOutput

@@ -298,15 +298,23 @@ class FailoverRunner:
         self,
         messages: Sequence[dict[str, Any]],
         *,
+        model: str | None = None,  # 上层可能传；以候选自己的模型为准
         json_mode: bool = False,
         temperature: float | None = None,
+        stats: Any = None,
+        max_tokens: int | None = None,
     ) -> tuple[Any, FallbackOutcome]:
         switched = False
         last_exc: BaseException | None = None
         for index, candidate in enumerate(self.candidates):
             try:
                 result = await candidate.client.acomplete(
-                    messages, model=candidate.model, json_mode=json_mode, temperature=temperature
+                    messages,
+                    model=candidate.model,
+                    json_mode=json_mode,
+                    temperature=temperature,
+                    stats=stats,
+                    max_tokens=max_tokens,
                 )
             except asyncio.CancelledError:
                 raise
@@ -335,10 +343,13 @@ class FailoverRunner:
     ) -> AsyncIterator[str]:
         committed = False
         switched = False
+        # 上层习惯带 model 调用（RelayClient 就是这样）；这里必须丢掉它，
+        # 否则会与候选自己的模型撞成 "multiple values for keyword argument 'model'"
+        options = {key: value for key, value in kwargs.items() if key != "model"}
         for index, candidate in enumerate(self.candidates):
             try:
                 async for chunk in candidate.client.astream_with_fallback(
-                    messages, model=candidate.model, **kwargs
+                    messages, model=candidate.model, **options
                 ):
                     if chunk:
                         committed = True
@@ -373,6 +384,13 @@ class FailoverRunner:
             self._outcome(candidate, switched=switched)
             return
         raise self._exhausted(RuntimeError("没有可用的候选配置。"), switched)
+
+    #: 与 ``RelayClient`` 同名：上层（架构段 / 执行段）不必关心自己拿到的是哪种客户端
+    async def astream_with_fallback(
+        self, messages: Sequence[dict[str, Any]], **kwargs: Any
+    ) -> AsyncIterator[str]:
+        async for chunk in self.astream(messages, **kwargs):
+            yield chunk
 
     # ── 内部 ──
 

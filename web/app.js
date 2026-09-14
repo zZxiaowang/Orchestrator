@@ -706,6 +706,15 @@ function handleEvent(event) {
       loadDocs();
       break;
     }
+    case "fallback": {
+      // 主用配置失败并切到备用：必须让用户知道，否则"怎么突然用别的配置了"
+      if (state.run) {
+        state.statusHint = event.data.message || "主用配置失败，已切换到备用配置";
+        updateStatus();
+      }
+      showToast(event.data.message || "主用配置失败，已切换到备用配置");
+      break;
+    }
     default:
       break;
   }
@@ -945,7 +954,18 @@ function renderTimeline() {
   if (canContinue) nodes.push(renderContinueCard(run));
 
   if (run.error) {
-    nodes.push(h("div", { class: "error-box", text: `运行失败：${run.error.message || JSON.stringify(run.error)}` }));
+    // 可操作的提示（怎么处理）必须一起显示，不能只丢网关原文
+    const hint = run.error.hint || run.error.details?.hint || "";
+    nodes.push(
+      h(
+        "div",
+        { class: "error-box" },
+        h("div", { text: `运行失败：${run.error.message || JSON.stringify(run.error)}` }),
+        hint && hint !== run.error.message
+          ? h("div", { class: "error-hint", text: `建议：${hint}` })
+          : null,
+      )
+    );
   }
 
   if (run.status === "done") {

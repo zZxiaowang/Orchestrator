@@ -10,7 +10,7 @@ from typing import Any
 
 from app.core.errors import PlanParseError
 from app.core.jsonx import extract_json_object
-from app.core.relay import CallStats, RelayClient
+from app.core.relay import CallStats, RelayClient, unwrap_result
 from app.schemas.plan import ArchitecturePlan
 
 ARCHITECT_SYSTEM = """你是一名资深架构师，负责把需求转成**纲领性架构**，交给另一位工程师（执行段）落地。
@@ -234,7 +234,9 @@ async def _retry_as_json(
         on_token("\n\n[架构段输出无法解析为 JSON，正在强制重试…]\n")
     if stats is not None:
         stats.retry()
-    result = await client.acomplete(retry_messages, model=model, json_mode=True, stats=stats)
+    result = unwrap_result(
+        await client.acomplete(retry_messages, model=model, json_mode=True, stats=stats)
+    )
     return parse_plan(result.text, max_steps=0), result.text
 
 

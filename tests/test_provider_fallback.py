@@ -51,8 +51,19 @@ class FakeClient:
         self.model = model
         self.calls: list[dict[str, object]] = []
 
-    async def acomplete(self, messages, *, model, json_mode=False, temperature=None):
-        self.calls.append({"model": model, "json_mode": json_mode, "stream": False})
+    async def acomplete(
+        self, messages, *, model, json_mode=False, temperature=None, stats=None, max_tokens=None
+    ):
+        # 签名要与真实 RelayClient 一致：编排器会带上指标账本与输出上限
+        self.calls.append(
+            {
+                "model": model,
+                "json_mode": json_mode,
+                "stream": False,
+                "stats": stats,
+                "max_tokens": max_tokens,
+            }
+        )
         if self.error is not None:
             raise self.error
         return RelayResult(text=self.text, model=model or self.model)
@@ -241,7 +252,9 @@ def test_gateway_hint_text_without_status_is_retryable():
 
 def test_user_cancellation_is_never_retried():
     class CancelClient(FakeClient):
-        async def acomplete(self, messages, *, model, json_mode=False, temperature=None):
+        async def acomplete(
+            self, messages, *, model, json_mode=False, temperature=None, stats=None, max_tokens=None
+        ):
             raise asyncio.CancelledError()
 
     primary = CancelClient()
