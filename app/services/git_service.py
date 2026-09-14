@@ -181,6 +181,65 @@ class GitService:
             "all": [line.strip() for line in out.splitlines() if line.strip()],
         }
 
+    def checkout_branch(self, name: str, *, create: bool = False) -> dict[str, object]:
+        """切换分支（create=True 时新建并切换）。"""
+        branch = (name or "").strip()
+        if not branch or any(ch in branch for ch in " ~^:?*[\\"):
+            raise GitError(f"分支名不合法：{name}", details={"branch": branch})
+        args = ["checkout", "-b", branch] if create else ["checkout", branch]
+        result = self._run(*args, check=False)
+        return {
+            "ok": result.returncode == 0,
+            "stdout": (result.stdout or "").strip()[:400],
+            "stderr": (result.stderr or "").strip()[:400],
+            "hint": ""
+            if result.returncode == 0
+            else "切换失败：可能有未提交改动会冲突，请先提交或丢弃。",
+            "branches": self.branches(),
+        }
+
+    def discard(self, paths: list[str]) -> dict[str, object]:
+        """丢弃改动（已跟踪文件回滚到 HEAD；未跟踪文件删除）。破坏性操作，界面需二次确认。"""
+        if not paths:
+            raise GitError("请先选择要丢弃的文件。")
+        status_by_path = {item.path: item for item in self.changed_files()}
+        tracked: list[str] = []
+        untracked: list[str] = []
+        for path in paths:
+            safe = self._relative(path)
+            item = status_by_path.get(safe)
+            (untracked if item and item.label == "?" else tracked).append(safe)
+        if tracked:
+            self._run("checkout", "--", *tracked, check=False)
+        if untracked:
+            self._run("clean", "-fd", "--", *untracked, check=False)
+        return {"discarded": tracked + untracked, "status": self.status()}
+
+    def show_commit(self, commit: str) -> dict[str, object]:
+        """查看某次提交的改动（历史列表点开时用）。"""
+        target = (commit or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{4,40}", target):
+            raise GitError(f"非法的提交号：{commit}", details={"commit": target})
+        meta = self._run(
+            "show",
+            "-s",
+            "--pretty=%h%x1f%an%x1f%ad%x1f%s",
+            "--date=format:%Y-%m-%d %H:%M",
+            target,
+            check=False,
+        ).stdout.strip()
+        diff = self._run("show", "--no-color", "--unified=3", target, check=False).stdout
+        parts = meta.split("\x1f")
+        return {
+            "commit": {
+                "hash": parts[0] if parts else target,
+                "author": parts[1] if len(parts) > 1 else "",
+                "date": parts[2] if len(parts) > 2 else "",
+                "subject": parts[3] if len(parts) > 3 else "",
+            },
+            "diff": diff[:200_000],
+        }
+
     # ── 差异 ──
 
     def diff(self, path: str, *, staged: bool = False) -> str:
@@ -245,6 +304,71 @@ class GitService:
         }
 
     # ── 每日开机自动提交（Windows 计划任务）──
+
+    # ── 代理（Windows 系统代理与 git 不通用，这里显式管理）──
+
+    PROXY_KEY = "http.https://github.com/.proxy"
+
+    def system_proxy(self) -> str:
+        """读取 Windows「Internet 选项」里的代理（git 默认不读它）。"""
+        if os.name != "nt":
+            return ""
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            ) as key:
+                enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+                server, _ = winreg.QueryValueEx(key, "ProxyServer")
+            if not int(enabled) or not server:
+                return ""
+            server = str(server)
+            if "=" in server:  # 形如 http=127.0.0.1:10809;https=...
+                parts = dict(item.split("=", 1) for item in server.split(";") if "=" in item)
+                server = parts.get("https") or parts.get("http") or ""
+            if server and not server.startswith("http"):
+                server = f"http://{server}"
+            return server
+        except (OSError, ValueError, ImportError):
+            return ""
+
+    def proxy_status(self) -> dict[str, object]:
+        scoped = self._run(
+            "config", "--global", "--get", self.PROXY_KEY, check=False
+        ).stdout.strip()
+        generic = self._run("config", "--global", "--get", "http.proxy", check=False).stdout.strip()
+        system = self.system_proxy()
+        return {
+            "git_proxy": scoped or generic,
+            "scoped": bool(scoped),
+            "generic": generic,
+            "system_proxy": system,
+            "active": bool(scoped or generic),
+            "suggestion": ""
+            if (scoped or generic)
+            else (f"系统开着代理 {system}，但 git 不走它——建议一键配置。" if system else ""),
+            "target": "https://github.com/",
+        }
+
+    def set_proxy(self, proxy_url: str) -> dict[str, object]:
+        value = (proxy_url or "").strip()
+        if not value:
+            raise GitError("代理地址不能为空。")
+        if "://" not in value:
+            value = f"http://{value}"
+        scheme, _, rest = value.partition("://")
+        if scheme not in ("http", "https", "socks5", "socks5h") or not rest:
+            raise GitError(f"代理地址格式不正确：{proxy_url}（示例 http://127.0.0.1:10809）")
+        self._run("config", "--global", self.PROXY_KEY, value)
+        # 之前手动设过全局代理时，一并清掉，避免两处配置打架
+        self._run("config", "--global", "--unset", "http.proxy", check=False)
+        return self.proxy_status()
+
+    def clear_proxy(self) -> dict[str, object]:
+        self._run("config", "--global", "--unset", self.PROXY_KEY, check=False)
+        return self.proxy_status()
 
     def auto_commit_script(self) -> Path:
         return Path(__file__).resolve().parents[2] / "scripts" / "auto-commit.cmd"

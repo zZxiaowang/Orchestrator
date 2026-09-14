@@ -167,6 +167,15 @@ const api = {
   gitAutoCommitEnable: (push) => request("POST", "/api/v1/git/auto-commit", { push }),
   gitAutoCommitDisable: () => request("DELETE", "/api/v1/git/auto-commit"),
   gitAutoCommitRun: () => request("POST", "/api/v1/git/auto-commit/run", {}),
+  gitStage: (paths) => request("POST", "/api/v1/git/stage", { paths }),
+  gitUnstage: (paths) => request("POST", "/api/v1/git/unstage", { paths }),
+  gitDiscard: (paths) => request("POST", "/api/v1/git/discard", { paths }),
+  gitBranches: () => request("GET", "/api/v1/git/branches"),
+  gitCheckout: (name, create) => request("POST", "/api/v1/git/branches", { name, create }),
+  gitShow: (commit) => request("GET", `/api/v1/git/show?commit=${encodeURIComponent(commit)}`),
+  gitProxyStatus: () => request("GET", "/api/v1/git/proxy"),
+  gitProxySet: (proxyUrl) => request("POST", "/api/v1/git/proxy", { proxy_url: proxyUrl }),
+  gitProxyClear: () => request("DELETE", "/api/v1/git/proxy"),
 };
 
 const STATUS_TEXT = {
@@ -1828,19 +1837,151 @@ async function renderGitPanel() {
   }
   nodes.push(actions);
 
+  // 代理：Windows 系统代理与 git 不通用，这里给按钮直接用
+  const proxy = await api.gitProxyStatus().catch(() => null);
+  if (proxy) {
+    const proxyInput = h("input", { type: "text", placeholder: "http://127.0.0.1:10809" });
+    proxyInput.value = proxy.git_proxy || proxy.system_proxy || "";
+    const useSystem = h("button", { class: "btn ghost", text: "使用系统代理" });
+    useSystem.addEventListener(
+      "click",
+      safe(async () => {
+        const result = await api.gitProxySet("");
+        showToast(`git 已走代理：${result.git_proxy}`);
+        await renderGitPanel();
+      })
+    );
+    const applyProxy = h("button", { class: "btn ghost", text: "设为代理" });
+    applyProxy.addEventListener(
+      "click",
+      safe(async () => {
+        const result = await api.gitProxySet(proxyInput.value.trim());
+        showToast(`git 已走代理：${result.git_proxy}`);
+        await renderGitPanel();
+      })
+    );
+    const clearProxy = h("button", { class: "btn ghost", text: "清除代理" });
+    clearProxy.addEventListener(
+      "click",
+      safe(async () => {
+        await api.gitProxyClear();
+        showToast("已清除 git 代理（回到直连）");
+        await renderGitPanel();
+      })
+    );
+    nodes.push(
+      h("h3", { class: "section-label", text: "网络代理" }),
+      h(
+        "div",
+        { class: "check-item" },
+        h("div", {
+          class: "muted-small",
+          text: proxy.active
+            ? `当前 git 代理：${proxy.git_proxy}（${proxy.scoped ? "仅 github.com" : "全局"}）`
+            : `未配置 git 代理${proxy.system_proxy ? `；系统代理为 ${proxy.system_proxy}` : ""}`,
+        }),
+        h("div", { class: "market-toolbar" }, proxyInput, useSystem, applyProxy, clearProxy)
+      )
+    );
+  }
+
+  // 分支：切换 / 新建
+  const branchBox = h("div", { class: "check-item" });
+  const branchSelect = h(
+    "select",
+    {},
+    ...(history.branches.all || []).map((name) =>
+      h("option", { value: name, text: name === history.branches.current ? `${name}（当前）` : name })
+    )
+  );
+  const switchButton = h("button", { class: "btn ghost", text: "切换分支" });
+  switchButton.addEventListener(
+    "click",
+    safe(async () => {
+      const result = await api.gitCheckout(branchSelect.value, false);
+      showToast(result.ok ? `已切换到 ${branchSelect.value}` : result.hint || "切换失败");
+      await renderGitPanel();
+    })
+  );
+  const newBranchInput = h("input", { type: "text", placeholder: "新分支名，如 feature/git-panel" });
+  const createButton = h("button", { class: "btn ghost", text: "新建并切换" });
+  createButton.addEventListener(
+    "click",
+    safe(async () => {
+      const name = newBranchInput.value.trim();
+      if (!name) {
+        showToast("请先填分支名。");
+        return;
+      }
+      const result = await api.gitCheckout(name, true);
+      showToast(result.ok ? `已创建并切换到 ${name}` : result.hint || "创建失败");
+      await renderGitPanel();
+    })
+  );
+  branchBox.append(
+    h("div", { class: "muted-small", text: `当前分支：${history.branches.current}` }),
+    h("div", { class: "market-toolbar" }, branchSelect, switchButton),
+    h("div", { class: "market-toolbar" }, newBranchInput, createButton)
+  );
+  nodes.push(h("h3", { class: "section-label", text: "分支" }), branchBox);
+
   // 变更列表
+  const selected = new Set();
+  const selectedPaths = () => [...selected];
   nodes.push(h("h3", { class: "section-label", text: `变更（${status.files.length}）` }));
   if (!status.files.length) {
     nodes.push(h("p", { class: "muted-small", text: "工作区干净，没有待提交的改动。" }));
   } else {
+    const batch = h("div", { class: "market-toolbar" });
+    const stageAll = h("button", { class: "btn ghost", text: "全部暂存" });
+    stageAll.addEventListener("click", safe(async () => {
+      await api.gitStage(status.files.map((file) => file.path));
+      showToast("已全部暂存");
+      await renderGitPanel();
+    }));
+    const unstageAll = h("button", { class: "btn ghost", text: "全部取消暂存" });
+    unstageAll.addEventListener("click", safe(async () => {
+      await api.gitUnstage(status.files.map((file) => file.path));
+      showToast("已全部取消暂存");
+      await renderGitPanel();
+    }));
+    const stageSelected = h("button", { class: "btn ghost", text: "暂存选中" });
+    stageSelected.addEventListener("click", safe(async () => {
+      if (!selected.size) { showToast("请先勾选文件。"); return; }
+      await api.gitStage(selectedPaths());
+      await renderGitPanel();
+    }));
+    const discardSelected = h("button", { class: "btn ghost", text: "丢弃选中改动" });
+    discardSelected.addEventListener("click", safe(async () => {
+      if (!selected.size) { showToast("请先勾选文件。"); return; }
+      const ok = await appConfirm({
+        title: "丢弃改动",
+        message: `将丢弃 ${selected.size} 个文件的改动：已跟踪文件回滚到上次提交，未跟踪文件会被删除。此操作不可撤销。`,
+        confirmText: "丢弃",
+        danger: true,
+      });
+      if (!ok) return;
+      const result = await api.gitDiscard(selectedPaths());
+      showToast(`已丢弃 ${result.discarded.length} 个文件的改动`);
+      await renderGitPanel();
+    }));
+    batch.append(stageAll, unstageAll, stageSelected, discardSelected);
+    nodes.push(batch);
+
     const list = h("div", { class: "checklist" });
     for (const file of status.files) {
+      const check = h("input", { type: "checkbox" });
+      check.addEventListener("change", () => {
+        if (check.checked) selected.add(file.path);
+        else selected.delete(file.path);
+      });
       const row = h(
         "div",
         { class: "check-item", dataset: { file: file.path } },
         h(
           "div",
           { class: "check-title" },
+          check,
           h("span", { class: "badge", text: file.label }),
           h("span", { class: "file-path", text: file.path }),
           h("span", { class: "muted-small", text: file.staged ? "已暂存" : "未暂存" })
@@ -1865,6 +2006,35 @@ async function renderGitPanel() {
         })
       );
       row.querySelector(".check-title").append(diffButton);
+
+      const stageToggle = h("button", { class: "copy-btn", text: file.staged ? "取消暂存" : "暂存" });
+      stageToggle.addEventListener(
+        "click",
+        safe(async (event) => {
+          event.stopPropagation();
+          if (file.staged) await api.gitUnstage([file.path]);
+          else await api.gitStage([file.path]);
+          await renderGitPanel();
+        })
+      );
+      const discardOne = h("button", { class: "copy-btn", text: "丢弃" });
+      discardOne.addEventListener(
+        "click",
+        safe(async (event) => {
+          event.stopPropagation();
+          const ok = await appConfirm({
+            title: "丢弃这个文件的改动",
+            message: `确定丢弃 ${file.path} 的改动？已跟踪文件回滚到上次提交，未跟踪文件会被删除。`,
+            confirmText: "丢弃",
+            danger: true,
+          });
+          if (!ok) return;
+          await api.gitDiscard([file.path]);
+          showToast(`已丢弃 ${file.path}`);
+          await renderGitPanel();
+        })
+      );
+      row.querySelector(".check-title").append(stageToggle, discardOne);
       list.append(row);
     }
     nodes.push(list);
@@ -1897,7 +2067,25 @@ async function renderGitPanel() {
       }
     })
   );
-  nodes.push(h("h3", { class: "section-label", text: "提交" }), message, h("div", { class: "approval-actions" }, commitButton));
+  const commitSelectedButton = h("button", { class: "btn ghost", text: "只提交已暂存的文件" });
+  commitSelectedButton.addEventListener(
+    "click",
+    safe(async () => {
+      const text = message.value.trim();
+      if (!text) {
+        showToast("请先填写提交信息。");
+        return;
+      }
+      const result = await api.gitCommit({ message: text, paths: [], add_all: false });
+      showToast(result.committed ? `已提交：${result.commit?.subject || ""}` : result.reason || "没有暂存的改动");
+      await renderGitPanel();
+    })
+  );
+  nodes.push(
+    h("h3", { class: "section-label", text: "提交" }),
+    message,
+    h("div", { class: "approval-actions" }, commitButton, commitSelectedButton)
+  );
 
   // 每日开机自动提交
   const toggle = h("input", { type: "checkbox" });
@@ -1954,17 +2142,41 @@ async function renderGitPanel() {
       "div",
       { class: "checklist" },
       ...history.commits.map((commit) =>
-        h(
+        (() => {
+          const row = h(
           "div",
           { class: "check-item" },
           h(
             "div",
             { class: "check-title" },
             h("span", { class: "badge", text: commit.hash }),
-            h("span", { text: commit.subject })
+            h("span", { text: commit.subject }),
+            (() => {
+              const button = h("button", { class: "copy-btn", text: "看改动" });
+              button.addEventListener(
+                "click",
+                safe(async (event) => {
+                  event.stopPropagation();
+                  const payload = await api.gitShow(commit.hash);
+                  const block = h("div", { class: "diff" });
+                  for (const line of (payload.diff || "（无差异）").split("\n")) {
+                    let cls = "diff-line";
+                    if (line.startsWith("@@")) cls += " hunk";
+                    else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+                    else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+                    block.append(h("div", { class: cls, text: line }));
+                  }
+                  row.querySelector(".diff")?.remove();
+                  row.append(block);
+                })
+              );
+              return button;
+            })()
           ),
           h("div", { class: "check-goal", text: `${commit.author} · ${commit.date}` })
-        )
+          );
+          return row;
+        })()
       )
     )
   );

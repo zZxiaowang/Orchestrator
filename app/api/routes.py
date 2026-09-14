@@ -572,6 +572,57 @@ class GitAutoCommitRequest(BaseModel):
     push: bool = Field(False, description="提交后是否同时推送（默认只提交到本地）")
 
 
+class GitBranchRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    create: bool = False
+
+
+class GitProxyRequest(BaseModel):
+    proxy_url: str = Field("", description="例如 http://127.0.0.1:10809；留空表示用系统代理")
+
+
+@router.get("/git/branches")
+async def git_branches(request: Request) -> dict[str, Any]:
+    service = _git(request)
+    return service.branches()
+
+
+@router.post("/git/branches")
+async def git_checkout(payload: GitBranchRequest, request: Request) -> dict[str, Any]:
+    return _git(request).checkout_branch(payload.name, create=payload.create)
+
+
+@router.post("/git/discard")
+async def git_discard(payload: GitPathsRequest, request: Request) -> dict[str, Any]:
+    """丢弃选中的改动（破坏性，界面有二次确认）。"""
+    return _git(request).discard(payload.paths)
+
+
+@router.get("/git/show")
+async def git_show(request: Request, commit: str) -> dict[str, Any]:
+    return _git(request).show_commit(commit)
+
+
+@router.get("/git/proxy")
+async def git_proxy_status(request: Request) -> dict[str, Any]:
+    """Windows 系统代理与 git 代理的关系（git 默认不读系统代理）。"""
+    return _git(request).proxy_status()
+
+
+@router.post("/git/proxy")
+async def git_proxy_set(payload: GitProxyRequest, request: Request) -> dict[str, Any]:
+    service = _git(request)
+    target = payload.proxy_url.strip() or service.system_proxy()
+    if not target:
+        raise AppError("没有可用的代理地址：请填写，或先打开系统代理。", code="no_proxy")
+    return service.set_proxy(target)
+
+
+@router.delete("/git/proxy")
+async def git_proxy_clear(request: Request) -> dict[str, Any]:
+    return _git(request).clear_proxy()
+
+
 @router.get("/git/status")
 async def git_status(request: Request) -> dict[str, Any]:
     return _git(request).status()
