@@ -59,6 +59,14 @@ def test_run_records_architect_and_step_metrics(tmp_path: Path):
             assert entry["route"]["model"] == "deepseek-v4"
             assert entry["usage_source"] == "provider"
 
+        # 每步的上下文构成与轮次都要留档（"这一步的钱花在哪"）
+        for entry in executor:
+            stats = entry["context_stats"]
+            assert stats, entry
+            assert set(stats) >= {"task", "plan", "tree", "completed", "current", "files"}
+            assert stats["current"] > 0
+            assert entry["rounds"] == {"initial": 1, "fetch": 0, "repair": 0}
+
         # 步骤级字段同步：重试次数可从 step.retries 直接看到
         assert all(step["retries"] == 0 for step in run["steps"])
 

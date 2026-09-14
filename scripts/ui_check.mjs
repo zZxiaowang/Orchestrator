@@ -687,6 +687,14 @@ async function main() {
       presetClicked.hit && presetState.lines >= 3 && presetState.enabled,
       JSON.stringify(presetState),
     );
+    // 还原：自检自己配上的白名单会污染演示实例（后面的运行会真的去跑 pytest 并失败）
+    await cdp.evaluate(`(() => {
+      document.getElementById("f-command-allowlist").value = "";
+      document.getElementById("f-allow-cmd").checked = false;
+      return true;
+    })()`);
+    await cdp.clickSelector("#settings-save");
+    await sleep(600);
     await cdp.clickSelector("#settings-cancel");
     await sleep(250);
 
@@ -1070,6 +1078,56 @@ async function main() {
           dashDetail.cells >= 5,
       ),
       JSON.stringify(dashDetail),
+    );
+
+    // 每步的 token / 耗时 / 上下文构成只在**新记录**里才有：
+    // 让刚提交的这条真的跑完（顺便验证「运行操作条」的确认按钮）
+    const approved = await cdp.evaluate(`(() => {
+      const btn = Array.from(document.querySelectorAll("#run-actions button"))
+        .find((el) => el.textContent.includes("确认并开始执行"));
+      if (!btn) return false;
+      btn.click();
+      return true;
+    })()`);
+    let finished = "";
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      finished = await cdp.evaluate(`document.getElementById("status-pill").textContent.trim()`);
+      if (finished.includes("已完成")) break;
+      await sleep(500);
+    }
+    if ((await cdp.evaluate(`document.body.dataset.panel`)) !== "open") {
+      await cdp.clickSelector("#inspector-toggle");
+      await sleep(300);
+    }
+    await cdp.clickSelector('#inspector-tabs [data-tab="stats"]');
+    await sleep(500);
+    await cdp.clickSelector("#dash-toggle");
+    await sleep(400);
+
+    const stepSpend = await cdp.evaluate(`(() => {
+      const head = document.querySelector(".card.step .card-head .muted");
+      return head ? head.textContent.trim() : "";
+    })()`);
+    check(
+      "步骤卡片内联显示耗时与 token",
+      approved && finished.includes("已完成") && stepSpend.includes("tokens") && stepSpend.includes("上下文"),
+      JSON.stringify({ approved, finished, head: stepSpend.slice(0, 140) }),
+    );
+
+    const composition = await cdp.evaluate(`(() => {
+      const rows = Array.from(document.querySelectorAll(".dash-step-row"));
+      const text = rows.map((row) => row.textContent).join(" | ");
+      return {
+        rows: rows.length,
+        hasComposition: text.includes("上下文构成"),
+        hasRounds: text.includes("调用轮次"),
+        snippet: text.replace(/\\s+/g, " ").slice(0, 180),
+      };
+    })()`);
+    check(
+      "看板显示每步的上下文构成与调用轮次",
+      composition.rows >= 1 && composition.hasComposition && composition.hasRounds,
+      JSON.stringify(composition),
     );
 
     const dashText = await cdp.evaluate(

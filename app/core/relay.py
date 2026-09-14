@@ -72,6 +72,8 @@ class CallStats:
     #: 提供方明确返回过 usage 的调用次数
     usage_calls: int = 0
     usage_totals: dict[str, int] = field(default_factory=dict)
+    #: 模型实际产出的字符数（提供方不给 usage 时，用它估算 completion tokens）
+    output_chars: int = 0
 
     def retry(self, count: int = 1) -> None:
         """记一次主动重试（与传输层重试区分开）。"""
@@ -243,6 +245,7 @@ class RelayClient:
             stats.duration_ms += _ms(started)
             stats.protocol = self.wire_api
             stats.record_usage(data.get("usage"))
+            stats.output_chars += len(self._extract_text(data))
         return RelayResult(
             text=self._extract_text(data),
             model=data.get("model") or model,
@@ -293,6 +296,9 @@ class RelayClient:
                 messages, model=model, temperature=temperature, stats=stats
             ):
                 emitted = True
+                if stats is not None:
+                    # 统计模型产出的字符数：提供方不给 usage 时用它估算 completion tokens
+                    stats.output_chars += len(chunk)
                 yield chunk
             return
         except RelayError as exc:

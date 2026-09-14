@@ -203,10 +203,10 @@ class Settings(BaseSettings):
     context_tree_limit: int = 120
     #: 单步上下文字符预算（超出后按优先级裁剪，而不是让模型自己压缩）
     context_budget_chars: int = 24000
-    #: 单个文件注入上下文的字符上限（超出取头尾）
-    file_context_max_chars: int = 6000
+    #: 单个文件注入上下文的字符上限（超出改为"结构索引 + 头尾节选"）
+    file_context_max_chars: int = 2400
     #: 文件段总字符上限（否则"每文件 6k"叠加后可能比旧实现更费 token）
-    files_context_max_chars: int = 12000
+    files_context_max_chars: int = 3000
     #: 工作区文件树注入的字符上限
     tree_context_max_chars: int = 2000
     #: 已完成步骤交接日志的字符上限

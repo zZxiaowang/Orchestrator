@@ -1285,9 +1285,42 @@ function renderResumeCard(run) {
   );
 }
 
+/** 把"这一步花了多少"压成一行：耗时 · token（估算标注）· 上下文 · 轮次。 */
+function stepSpend(step) {
+  const metric = (state.run?.metrics || []).find(
+    (item) => item.phase === "executor" && Number(item.step_id) === Number(step.id)
+  );
+  if (!metric) {
+    return step.context_chars
+      ? `上下文 ${(step.context_chars / 1000).toFixed(1)}k 字符`
+      : "";
+  }
+  const parts = [];
+  if (metric.duration_ms) {
+    const seconds = metric.duration_ms / 1000;
+    parts.push(
+      seconds < 60 ? `⏱ ${seconds.toFixed(1)}s` : `⏱ ${Math.floor(seconds / 60)}m${Math.round(seconds % 60)}s`
+    );
+  }
+  if (typeof metric.total_tokens === "number") {
+    const tag = metric.usage_source === "estimated" ? "（估算）" : "";
+    parts.push(`🪙 ${metric.total_tokens.toLocaleString("zh-CN")} tokens${tag}`);
+  } else {
+    parts.push("🪙 用量未知");
+  }
+  const contextChars = metric.context_chars || step.context_chars || 0;
+  if (contextChars) parts.push(`上下文 ${(contextChars / 1000).toFixed(1)}k`);
+  const rounds = metric.rounds || {};
+  const extra = (rounds.fetch || 0) + (rounds.repair || 0);
+  parts.push(`${metric.calls || 1} 次调用${extra ? `（含索取 ${rounds.fetch || 0} / 修错 ${rounds.repair || 0}）` : ""}`);
+  return parts.join(" · ");
+}
+
 function renderStepCard(step) {
   const status = step.status || "pending";
   const body = h("div", { class: "card-body" });
+  // 这一步花了多少：耗时 / token（真实或估算）/ 调用轮次构成
+  const spent = stepSpend(step);
   const bufferKey = `step:${step.id}`;
   const buffer = state.buffers[bufferKey] || "";
 
@@ -1439,9 +1472,7 @@ function renderStepCard(step) {
         class: "muted",
         text:
           (STEP_STATUS_TEXT[status] || status) +
-          (step.context_chars
-            ? ` · 上下文 ${(step.context_chars / 1000).toFixed(1)}k 字符`
-            : "") +
+          (spent ? ` · ${spent}` : "") +
           (step.verification?.length
             ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
             : "") +
@@ -3577,6 +3608,30 @@ function showToast(message) {
       ["用量来源", reason ? `${source}（${reason}）` : source],
       ["路由", route],
     ];
+    // 上下文构成：让用户看到"这一步的钱花在哪"（文件 / 树 / 历史 / 当前步…）
+    const stats = item.context_stats || {};
+    if (Object.keys(stats).length) {
+      const order = [
+        ["files", "文件"],
+        ["tree", "树"],
+        ["completed", "历史"],
+        ["current", "当前步"],
+        ["plan", "计划"],
+        ["task", "任务"],
+        ["brief", "简报"],
+      ];
+      const parts = order
+        .filter(([key]) => stats[key] > 0)
+        .map(([key, label]) => `${label} ${(stats[key] / 1000).toFixed(1)}k`);
+      if (parts.length) cells.push(["上下文构成", parts.join(" / ")]);
+    }
+    const rounds = item.rounds || {};
+    if (rounds.initial || rounds.fetch || rounds.repair) {
+      cells.push([
+        "调用轮次",
+        `首轮 ${rounds.initial || 0} · 索取文件 ${rounds.fetch || 0} · 按报错修正 ${rounds.repair || 0}`,
+      ]);
+    }
     return h(
       "div",
       { class: `dash-step-row${isFallback ? " is-fallback" : ""}` },

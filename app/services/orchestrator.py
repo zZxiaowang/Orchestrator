@@ -559,6 +559,8 @@ class Orchestrator:
             read_file=workspace.read,
             user_notes=run.user_notes,
             brief_text=run.brief,
+            # 文件树只在第一步给全量：后面每步都给全量，既贵又破坏前缀缓存
+            tree_full=step.id == run.steps[0].id,
         )
         messages = build_step_messages(packet)
 
@@ -603,15 +605,7 @@ class Orchestrator:
 
         step.context_chars = packet.chars
         step.fetched_files = list(dict.fromkeys(fetched))
-        entry = self._record_metrics(
-            run,
-            stats,
-            endpoint,
-            phase=PHASE_EXECUTOR,
-            step_id=step.id,
-            context_chars=packet.chars,
-        )
-        step.retries = int(entry.retries if entry is not None else 0)
+        fetch_rounds = rounds
 
         step.summary = output.summary
         step.handoff = output.handoff or output.summary
@@ -628,6 +622,23 @@ class Orchestrator:
         raw, last_command_results, command_rounds_used = await self._run_step_commands(
             run, step, workspace, client, endpoint, settings, messages, raw, stats
         )
+        # 指标在**所有轮次跑完之后**再记：这样 calls / 耗时 / 上下文构成
+        # 覆盖到索取文件与按报错修正的每一轮，轮次也单独留档。
+        entry = self._record_metrics(
+            run,
+            stats,
+            endpoint,
+            phase=PHASE_EXECUTOR,
+            step_id=step.id,
+            context_chars=packet.chars,
+            context_stats=packet.stats,
+            rounds={
+                "initial": 1,
+                "fetch": int(fetch_rounds),
+                "repair": int(command_rounds_used),
+            },
+        )
+        step.retries = int(entry.retries if entry is not None else 0)
 
         failures = [f for f in step.files if f.error]
         # 只看**最后一轮**的结果：第一轮失败、修好后第二轮通过，就应该算通过
@@ -1026,12 +1037,21 @@ class Orchestrator:
         phase: str,
         step_id: int | None = None,
         context_chars: int | None = None,
+        context_stats: dict[str, int] | None = None,
+        rounds: dict[str, int] | None = None,
     ):
         """把一次调用的账本写进 ``run.metrics``（同一阶段/步骤累加，不重复建条目）。"""
 
         try:
             entry = run.metrics_for(phase, step_id)
             apply_call(entry, stats, context_chars=context_chars, route=route_of(endpoint))
+            if context_stats:
+                # 上下文构成：让"这一步的钱花在哪"可查（不是只给一个总字符数）
+                entry.context_stats = {
+                    key: int(value) for key, value in context_stats.items() if key != "budget"
+                }
+            if rounds:
+                entry.rounds = {key: int(value) for key, value in rounds.items()}
         except Exception:  # noqa: BLE001 - 指标绝不能让主流程失败
             return None
         self.bus.publish(

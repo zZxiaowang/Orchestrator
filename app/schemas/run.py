@@ -137,6 +137,10 @@ class PhaseMetrics(BaseModel):
     usage_reason: str = ""
     #: 累计耗时（毫秒）
     duration_ms: int = 0
+    #: 本步上下文的构成（各段字符数）：task/brief/plan/tree/completed/current/files
+    context_stats: dict[str, int] = Field(default_factory=dict)
+    #: 本步的调用轮次：initial / fetch（按需索取文件）/ repair（按报错修正）
+    rounds: dict[str, int] = Field(default_factory=dict)
     route: dict[str, str] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=_now)
 

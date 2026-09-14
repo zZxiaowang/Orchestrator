@@ -264,6 +264,21 @@ def summarize(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
 #: usage_source 的「悲观程度」：合并多次调用时保留最不确定的那个口径
 _SOURCE_RANK = {"provider": 0, "estimated": 1, "unknown": 2}
 
+#: 字符 → token 的粗略换算（中英混排的经验值）。只用于**估算**，且必须标注来源。
+CHARS_PER_TOKEN = 3.5
+
+
+def estimate_usage(input_chars: int, output_chars: int) -> dict[str, int]:
+    """提供方不给 usage 时按字符估算 token（结果会标注 usage_source=estimated）。"""
+
+    prompt = max(1, int(round(max(0, int(input_chars)) / CHARS_PER_TOKEN)))
+    completion = max(1, int(round(max(0, int(output_chars)) / CHARS_PER_TOKEN)))
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
 
 def usage_verdict(stats: Any) -> tuple[str, str]:
     """从调用账本推出 ``(usage_source, usage_reason)``。
@@ -322,12 +337,22 @@ def apply_call(
             0, int(getattr(stats, "duration_ms", 0) or 0)
         )
         usage = getattr(stats, "usage", None) or {}
+        source, reason = usage_verdict(stats)
+        if source == "unknown":
+            # 提供方没给 usage：按字符估算，并**明确标注是估算**——
+            # 界面上"未知"对用户没有信息量，估算 + 标注才有（两者必须区分开）。
+            estimated = estimate_usage(
+                context_chars if context_chars is not None else int(entry.context_chars or 0),
+                int(getattr(stats, "output_chars", 0) or 0),
+            )
+            if int(getattr(stats, "output_chars", 0) or 0) > 0:
+                usage = estimated
+                source, reason = "estimated", "estimated_from_chars"
         for key in USAGE_KEYS:
             value = usage.get(key) if isinstance(usage, Mapping) else None
             if value is None:
                 continue
             setattr(entry, key, int(getattr(entry, key) or 0) + int(value))
-        source, reason = usage_verdict(stats)
         if had_calls:
             _merge_verdict(entry, source, reason)
         else:

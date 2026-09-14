@@ -7,15 +7,22 @@
 
 这里改成"编排器做确定性裁剪"：
 
-1. **稳定段在前**（系统提示 → 任务 → 纲领摘要 → 文件树），变量段在后
-   （已完成交接日志 → 当前步骤 → 相关文件），对支持前缀缓存的网关更省钱；
+1. **稳定前缀逐字不变**（系统提示 → 任务 → 补充简报 → 纲领摘要），
+   变量段全部后移（当前步骤 → 相关文件 → 已完成交接 → 文件树）。
+   顺序一变，网关的前缀缓存就命中不了——所以文件树这类"每步都在变"的内容
+   必须放在最后，绝不插在稳定段中间；
 2. 超预算时**按优先级丢**：先丢文件内容（并明确告诉模型"可用 need_files 索取"），
    再压文件树，最后把"最早的历史步骤"折成一行；
-3. **当前步骤与纲领决策永不裁剪**——这是本步的硬需求。
+3. **当前步骤与纲领决策永不裁剪**——这是本步的硬需求；
+4. 文件内容不再"能塞就塞"：默认只给**结构索引 + 头尾节选**，全文走 need_files。
+   自开发场景实测：两个大文件曾经占单步上下文的 84%（12k 字符），
+   而模型通常只需要改其中一处。
 """
 
 from __future__ import annotations
 
+import ast
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
@@ -29,6 +36,13 @@ FILE_TAIL_MARK = (
     "\n…（本文件较长，中间省略 {skipped} 字符；需要完整内容请用 need_files 索取 {path}）\n"
 )
 
+#: 超过这个长度就不再整篇注入，改成"结构索引 + 头尾节选"
+STRUCTURE_THRESHOLD = 1200
+#: 结构索引最多列多少条符号
+STRUCTURE_ENTRIES = 24
+#: 结构索引的字符上限
+STRUCTURE_MAX_CHARS = 420
+
 
 @dataclass
 class ContextPacket:
@@ -39,17 +53,16 @@ class ContextPacket:
     current: str
     completed: str = ""
     files: str = ""
+    #: 文件树（每步都会变，放在最后）
+    tree: str = ""
     omitted: list[str] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
 
     @property
     def user_content(self) -> str:
-        # 顺序：稳定段 → 当前步骤 → 已完成交接 → 相关文件。
-        # 当前步骤紧跟纲领之后，模型注意力落在"这一步要做什么"上；
-        # 变化最频繁的内容放在最后，前面仍可命中网关的前缀缓存。
-        parts = [self.brief, self.current, self.completed]
-        if self.files:
-            parts.append(self.files)
+        # 顺序：稳定前缀 → 当前步骤 → 相关文件 → 已完成交接 → 文件树。
+        # 后三项每一步都会变（工作区在改），放在最后，前面的稳定前缀才能命中缓存。
+        parts = [self.brief, self.current, self.files, self.completed, self.tree]
         return "\n\n".join(part for part in parts if part)
 
     @property
@@ -58,18 +71,14 @@ class ContextPacket:
 
 
 def plan_digest(plan: ArchitecturePlan, *, current_step_id: int, max_chars: int = 1200) -> str:
-    """把整份纲领压成"够用"的摘要：决策 + 组件 + 其他步骤一行标题。
+    """把整份纲领压成"够用"的摘要：目标 + 思路 + 其他步骤标题。
 
-    完整纲领 JSON 往往上千字符，而单步执行其实只需要：为什么这么拆（原则/组件）+
-    自己这一步 + 其他步骤的标题（避免重复劳动）。
+    刻意**不带** principles / components / risks —— 那些是给人看的架构决策，
+    对"这一步怎么写代码"帮助很小，却是每一步都要重复付费的固定成本。
     """
     lines: list[str] = [f"目标：{plan.goal.strip()}"]
     if plan.summary.strip():
-        lines.append(f"思路：{plan.summary.strip()[:300]}")
-    if plan.principles:
-        lines.append("原则：" + "；".join(item[:60] for item in plan.principles[:5]))
-    if plan.components:
-        lines.append("组件：" + "；".join(component.name[:40] for component in plan.components[:8]))
+        lines.append(f"思路：{plan.summary.strip()[:220]}")
     others = [f"{step.id}.{step.title}" for step in plan.steps if step.id != current_step_id]
     if others:
         lines.append("其他步骤（本次只做当前步骤）：" + " | ".join(others[:12]))
@@ -141,6 +150,7 @@ class StepContextBuilder:
         extra_paths: Iterable[str] = (),
         user_notes: Sequence[str] = (),
         brief_text: str = "",
+        tree_full: bool = True,
     ) -> ContextPacket:
         omitted: list[str] = []
         remaining = self.budget_chars - len(system)
@@ -164,19 +174,6 @@ class StepContextBuilder:
             else ""
         )
         remaining -= len(task_block) + len(brief_block) + len(plan_block) + len(notes_block)
-
-        # ── 稳定段：文件树（按预算给一部分） ──
-        tree_text = "\n".join(list(tree)[: self.tree_limit]) or "（空工作区）"
-        tree_block = (
-            f"## 工作区文件\n{clip(tree_text, min(self.tree_max_chars, max(0, remaining // 3)))}"
-        )
-        if len(tree_text) > len(tree_block):
-            omitted.append("部分工作区文件路径")
-        remaining -= len(tree_block)
-
-        # ── 变量段：已完成步骤的交接日志（超长先把最早的压成一行） ──
-        log_block = f"## 已完成步骤\n{self._completed_log(steps)}"
-        remaining -= len(log_block)
 
         # ── 变量段：当前步骤（永不裁剪） ──
         current_block = self._current_step(step)
@@ -205,14 +202,32 @@ class StepContextBuilder:
             sections.append(marker + "：" + "、".join(dict.fromkeys(omitted))[:400])
         files_block = "\n\n".join(sections)
 
+        # ── 变量段：已完成步骤的交接日志（超长先把最早的压成一行） ──
+        log_block = f"## 已完成步骤\n{self._completed_log(steps)}"
+        remaining -= len(log_block)
+
+        # ── 变量段：文件树（每步都在变，放最后；后续步骤只给一小段） ──
+        entries = list(tree)[: self.tree_limit] if tree_full else list(tree)[:20]
+        tree_text = "\n".join(entries) or "（空工作区）"
+        tree_cap = (
+            min(self.tree_max_chars, max(0, remaining))
+            if tree_full
+            else min(600, max(0, remaining))
+        )
+        tree_block = f"## 工作区文件\n{clip(tree_text, tree_cap)}"
+        if not tree_full:
+            tree_block += "\n（只列前 20 项；需要别的文件请用 need_files 索取）"
+        if len(tree_text) > tree_cap:
+            omitted.append("部分工作区文件路径")
+
         return ContextPacket(
             system=system,
-            brief="\n\n".join(
-                part for part in (task_block, brief_block, plan_block, tree_block) if part
-            ),
+            # 稳定前缀：这几块在一次运行里逐字不变，顺序也不要动（网关前缀缓存）
+            brief="\n\n".join(part for part in (task_block, brief_block, plan_block) if part),
             current="\n\n".join(part for part in (notes_block, current_block) if part),
             completed=log_block,
             files=files_block,
+            tree=tree_block,
             omitted=omitted,
             stats={
                 "budget": self.budget_chars,
@@ -274,9 +289,9 @@ class StepContextBuilder:
         candidates.extend(
             item for item in step.deliverables if item and not item.startswith("http")
         )
-        for previous in steps:
-            if previous.status == StepStatus.DONE:
-                candidates.extend(change.path for change in previous.files)
+        # 刻意**不**再打包"前面步骤改过的文件"：那些内容下一步多半用不到，
+        # 却因为"能塞就塞"把单步上下文顶到上万字符（自开发场景实测占 84%）。
+        # 需要时模型可以自己用 need_files 索取，或在 handoff 里说明。
 
         # 先把"确实存在且读得到"的文件收齐，再**按文件数均分预算**。
         # 否则第一个大文件就会吃满预算，后面的文件全被省略——
@@ -301,11 +316,103 @@ class StepContextBuilder:
                 omitted.append(f"文件 {path}")
                 continue
             per_file = min(self.file_max_chars, max(200, min(share, room)))
-            piece = clip_head_tail(content, per_file, path=path)
-            block = f"### {path}\n```\n{piece}\n```"
+            block = self._file_block(path, content, per_file)
             if used + len(block) > budget:
                 omitted.append(f"文件 {path}")
                 continue
             chunks.append(block)
             used += len(block)
         return "\n\n".join(chunks), omitted
+
+    def _file_block(self, path: str, content: str, per_file: int) -> str:
+        """长文件给"结构索引 + 头尾节选"，短文件给全文。
+
+        索引让模型知道"文件里有哪些函数/段落、大概在哪"，需要细节时再按路径索取全文；
+        比直接塞 6k 字符的节选更有用，也更便宜。
+        """
+
+        if len(content) <= STRUCTURE_THRESHOLD:
+            return f"### {path}\n```\n{content}\n```"
+
+        index = structure_index(path, content)
+        # 索引占一部分预算，剩下给头尾节选
+        index_cap = min(STRUCTURE_MAX_CHARS, max(120, per_file // 3))
+        if len(index) > index_cap:
+            index = clip(index, index_cap)
+        excerpt = clip_head_tail(content, max(200, per_file - len(index) - 40), path=path)
+        parts = [f"### {path}（结构索引）\n```\n{index}\n```"]
+        parts.append(
+            f"### {path}（节选：开头与结尾）\n```\n{excerpt}\n```\n"
+            f"需要完整内容或某段代码，请用 need_files 索取 `{path}`。"
+        )
+        return "\n\n".join(parts)
+
+
+def structure_index(path: str, content: str) -> str:
+    """给文件列一份"有什么、在第几行"的索引（尽量短、尽量准）。
+
+    * ``.py``：用 ast 取顶层函数/类与方法名（解析失败就退化成正则）；
+    * ``.js/.ts/.mjs/.jsx``：函数、类、常见 const/箭头函数，以及 ``/* ── 段落 ── */`` 分隔；
+    * ``.css``：顶层选择器；
+    * 其他：只给前几行（当作"文件开头"提示）。
+    """
+
+    suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    lines = content.splitlines()
+    entries: list[str] = []
+
+    if suffix == "py":
+        try:
+            tree = ast.parse(content)
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    kind = "class" if isinstance(node, ast.ClassDef) else "def"
+                    entries.append(f"L{node.lineno} {kind} {node.name}")
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    module = getattr(node, "module", None) or ",".join(
+                        alias.name for alias in node.names[:3]
+                    )
+                    entries.append(f"L{node.lineno} import {module}")
+        except SyntaxError:
+            entries = _regex_index(lines, suffix)
+    elif suffix in ("js", "mjs", "cjs", "ts", "jsx", "tsx"):
+        entries = _regex_index(lines, suffix)
+    elif suffix == "css":
+        for number, line in enumerate(lines, start=1):
+            text = line.strip()
+            if text.endswith("{") and not text.startswith(("@", "}", ".")) and ":" not in text[:20]:
+                continue
+            if text.endswith("{") and text and not line.startswith((" ", "\t")):
+                entries.append(f"L{number} {text[:-1].strip()[:60]}")
+    else:
+        entries = [f"L{n} {line.strip()[:80]}" for n, line in enumerate(lines[:6], start=1)]
+
+    if not entries:
+        entries = [f"L{n} {line.strip()[:80]}" for n, line in enumerate(lines[:6], start=1)]
+    return "\n".join(entries[:STRUCTURE_ENTRIES])
+
+
+_JS_PATTERNS = (
+    re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)"),
+    re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\("),
+    re.compile(
+        r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?function"
+    ),
+)
+_JS_SECTION = re.compile(r"^\s*/\*\s*[─\-=]{2,}\s*(.+?)\s*[─\-=]{2,}\s*\*/")
+
+
+def _regex_index(lines: list[str], suffix: str) -> list[str]:
+    entries: list[str] = []
+    for number, line in enumerate(lines, start=1):
+        section = _JS_SECTION.match(line)
+        if section:
+            entries.append(f"L{number} ── {section.group(1)[:50]}")
+            continue
+        for pattern in _JS_PATTERNS:
+            match = pattern.match(line)
+            if match:
+                entries.append(f"L{number} {match.group(1)}")
+                break
+    return entries
