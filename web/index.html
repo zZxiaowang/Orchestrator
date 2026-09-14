@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>编排器 · GPT 架构 → DeepSeek 执行</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b5cff'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white'%3E%E2%97%88%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css?v=__ASSET_VERSION__" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar" id="sidebar" data-wide="true">
+        <div class="brand">
+          <div class="brand-mark">◈</div>
+          <div class="brand-text">
+            <strong>Orchestrator</strong>
+            <span>架构 / 执行 双模型</span>
+          </div>
+          <button class="icon-btn" id="sidebar-toggle" title="折叠 / 展开左侧任务栏">⇤</button>
+        </div>
+        <button class="btn primary block" id="new-run-btn">＋ 新任务</button>
+        <div class="run-search">
+          <input id="run-search" type="search" placeholder="搜索任务…" />
+          <button class="icon-btn" id="run-archive-toggle" title="显示/隐藏已归档">▣</button>
+        </div>
+        <div class="section-label">运行记录</div>
+        <div class="run-list" id="run-list"></div>
+
+        <div class="foot-area">
+          <div class="sidebar-route" id="sidebar-route"></div>
+          <label class="quick-switch">
+            <span>配置</span>
+            <select id="provider-quick" title="切换中转 / 个人 Key 直连"></select>
+          </label>
+          <!-- 槽位：插件可在 sidebar.footer.action 里追加入口 -->
+          <div class="footer-actions">
+            <div data-slot="sidebar.footer.action" style="display: contents">
+              <button class="foot-btn" id="market-btn" data-entry="market" type="button">
+                <span class="foot-icon">⌂</span><span class="foot-label">插件市场</span>
+              </button>
+              <button class="foot-btn" id="plugins-btn" data-entry="plugins" type="button">
+                <span class="foot-icon">◫</span><span class="foot-label">已装插件</span>
+              </button>
+              <button class="foot-btn" id="updates-btn" data-entry="updates" type="button">
+                <span class="foot-icon">↑</span><span class="foot-label">更新与版本</span>
+              </button>
+              <span id="plugin-footer-actions" class="plugin-actions"></span>
+            </div>
+          </div>
+          <div class="settings-area">
+            <div data-slot="sidebar.settings" style="display: contents">
+              <button class="foot-btn" id="settings-btn" data-seat="settings" type="button">
+                <span class="foot-icon">⚙</span><span class="foot-label">设置</span>
+              </button>
+            </div>
+          </div>
+          <div class="build-tag">v__APP_VERSION__ · 构建 __ASSET_VERSION__</div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-left">
+            <h1 id="run-title">新任务</h1>
+            <span class="status-pill" id="status-pill" data-status="idle">待开始</span>
+          </div>
+          <div class="route-chips" id="route-chips"></div>
+        </header>
+
+        <section class="dashboard" id="run-dashboard" hidden></section>
+
+        <section class="timeline" id="timeline"></section>
+
+        <footer class="composer">
+          <div class="composer-box">
+            <textarea
+              id="task-input"
+              rows="3"
+              placeholder="描述目标，例如：为现有 FastAPI 项目补一套可回滚的数据迁移流程（Ctrl+Enter 发送）"
+            ></textarea>
+            <div class="composer-bar">
+              <div class="composer-hint" id="composer-hint"></div>
+              <div class="composer-actions">
+                <button class="btn ghost" id="cancel-btn" hidden>停止</button>
+                <button class="btn primary" id="send-btn">发送</button>
+              </div>
+            </div>
+          </div>
+          <div class="composer-meta">
+            <label class="inline-field">
+              <span>落地目录</span>
+              <input id="target-dir" placeholder="留空 = 在运行目录内新建工作区" />
+            </label>
+          </div>
+        </footer>
+      </main>
+
+      <aside class="inspector">
+        <div class="tabs" id="inspector-tabs">
+          <button class="tab active" data-tab="plan">纲领</button>
+          <button class="tab" data-tab="changes">变更</button>
+          <button class="tab" data-tab="files">文件</button>
+          <button class="tab" data-tab="docs">文档</button>
+        </div>
+        <div class="inspector-body" id="inspector-body"></div>
+      </aside>
+    </div>
+
+    <div class="modal-backdrop" id="settings-modal" hidden>
+      <div class="modal">
+        <div class="modal-head">
+          <h2>中转与模型设置</h2>
+          <button class="icon-btn" id="settings-close">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="hint">
+            可以保存多套配置（中转网关 / 个人 Key 直连），随时切换、互不覆盖。密钥明文保存在本机
+            <code>orchestrator/data/settings.json</code>（已在 .gitignore 中排除）。
+          </p>
+
+          <div class="provider-bar">
+            <select id="f-provider-select"></select>
+            <button class="btn ghost" id="provider-new">＋ 新建</button>
+            <button class="btn ghost" id="provider-copy">复制</button>
+            <button class="btn ghost" id="provider-delete">删除</button>
+            <button class="btn primary" id="provider-activate">设为当前</button>
+          </div>
+          <div class="provider-hint" id="provider-hint"></div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>配置名称</span>
+              <input id="f-provider-name" placeholder="例如：公司中转 / 个人 Key" />
+            </label>
+            <label class="field">
+              <span>类型</span>
+              <select id="f-provider-kind">
+                <option value="relay">中转网关</option>
+                <option value="official">个人 Key 直连</option>
+              </select>
+            </label>
+            <label class="field span-2">
+              <span>中转地址 base_url</span>
+              <input id="f-relay-base" placeholder="https://your-relay.example.com/v1" />
+            </label>
+            <div class="preset-row span-2" id="provider-presets"></div>
+            <label class="field span-2">
+              <span>中转 API Key</span>
+              <input
+                id="f-relay-key"
+                type="password"
+                placeholder="留空表示不修改（填 Key，不是地址；一般形如 sk-xxxx）"
+              />
+            </label>
+            <label class="field">
+              <span>协议</span>
+              <select id="f-relay-wire">
+                <option value="chat_completions">chat_completions</option>
+                <option value="responses">responses</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>最大步骤数</span>
+              <input id="f-max-steps" type="number" min="1" max="20" />
+            </label>
+            <label class="field">
+              <span>架构段模型（GPT）</span>
+              <input id="f-architect-model" placeholder="gpt-5" />
+            </label>
+            <label class="field">
+              <span>执行段模型（DeepSeek）</span>
+              <input id="f-editor-model" placeholder="deepseek-v4" />
+            </label>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="f-split-mode" />
+            <span
+              >分段使用不同配置：架构段与执行段各自指定（例如架构走中转、执行走个人
+              Key，反之亦可）</span
+            >
+          </label>
+          <div class="field-grid" id="split-fields" hidden>
+            <label class="field">
+              <span>架构段用哪套配置</span>
+              <select id="f-architect-provider"></select>
+            </label>
+            <label class="field">
+              <span>架构段模型（留空用该配置默认）</span>
+              <input id="f-architect-model-route" placeholder="gpt-5.6-sol" />
+            </label>
+            <label class="field">
+              <span>执行段用哪套配置</span>
+              <select id="f-editor-provider"></select>
+            </label>
+            <label class="field">
+              <span>执行段模型（留空用该配置默认）</span>
+              <input id="f-editor-model-route" placeholder="deepseek-v4-flash" />
+            </label>
+          </div>
+          <div class="test-row">
+            <button class="btn ghost" id="settings-test">测试当前配置</button>
+            <span class="test-result" id="settings-test-result"></span>
+          </div>
+          <label class="checkbox">
+            <input type="checkbox" id="f-allow-cmd" />
+            <span>允许自动执行执行段给出的命令（默认关闭，仅展示）</span>
+          </label>
+          <div class="modal-status" id="settings-status"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn ghost" id="settings-cancel">取消</button>
+          <button class="btn primary" id="settings-save">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="market-modal" hidden>
+      <div class="modal market-modal">
+        <div class="modal-head">
+          <h2>插件市场</h2>
+          <div class="tabs tabs-inline" id="market-tabs">
+            <button class="tab active" data-mtab="market">市场</button>
+            <button class="tab" data-mtab="installed">已装插件</button>
+            <button class="tab" data-mtab="sources">来源</button>
+          </div>
+          <button class="icon-btn" id="market-close">✕</button>
+        </div>
+        <div class="modal-body" id="market-body"></div>
+      </div>
+    </div>
+
+    <!-- 应用内确认框：不依赖 WebView 的原生 confirm（某些 WebView 里会卡住点击） -->
+    <div class="modal-backdrop" id="confirm-modal" hidden>
+      <div class="modal confirm-modal">
+        <div class="modal-head"><h2 id="confirm-title">确认操作</h2></div>
+        <div class="modal-body"><p id="confirm-message"></p></div>
+        <div class="modal-foot">
+          <button class="btn ghost" id="confirm-cancel">取消</button>
+          <button class="btn primary" id="confirm-ok">确定</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 命令面板（Ctrl+K，Codex 式） -->
+    <div class="modal-backdrop" id="palette-modal" hidden>
+      <div class="modal palette-modal">
+        <div class="modal-head">
+          <input id="palette-input" type="text" placeholder="输入命令…（↑↓ 选择，Enter 执行，Esc 关闭）" />
+        </div>
+        <div class="modal-body" id="palette-list"></div>
+      </div>
+    </div>
+
+    <script src="/app.js?v=__ASSET_VERSION__"></script>
+  </body>
+</html>

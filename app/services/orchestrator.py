@@ -1,0 +1,802 @@
+"""编排器：把架构段与执行段串成一条可控的状态机。
+
+状态流转：
+
+``planning`` → ``awaiting_approval`` →（人工确认）→ ``executing`` → ``done``
+
+任何一段失败都会落到 ``failed`` 并保留上下文，便于在界面上直接查看与重试。
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Callable
+from datetime import UTC, datetime
+from fnmatch import fnmatch
+from pathlib import Path
+
+import httpx
+
+from app.core.config import Endpoint, Settings, get_settings
+from app.core.errors import AppError, ConfigurationError, NotFoundError, WorkspaceError
+from app.core.relay import RelayClient
+from app.schemas.run import (
+    ChangedFile,
+    Run,
+    RunMessage,
+    RunStatus,
+    RunStep,
+    StepStatus,
+)
+from app.schemas.step import StepOutput
+from app.services.architect import build_architect_messages, run_architect
+from app.services.context import StepContextBuilder, clip, clip_head_tail
+from app.services.events import EventBus
+from app.services.executor import EXECUTOR_SYSTEM, build_step_messages, run_step
+from app.services.storage import RunStore, new_run_id
+from app.services.workspace import Workspace
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        store: RunStore,
+        bus: EventBus,
+        *,
+        settings_provider: Callable[[], Settings] = get_settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.store = store
+        self.bus = bus
+        self._settings_provider = settings_provider
+        self._transport = transport
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancelled: set[str] = set()
+
+    # ── 生命周期 ──
+
+    def create_run(
+        self,
+        task: str,
+        *,
+        title: str = "",
+        target_dir: str = "",
+        context: str = "",
+        brief: str = "",
+    ) -> Run:
+        task = (task or "").strip()
+        if not task:
+            raise AppError("任务描述不能为空。", code="invalid_request")
+
+        settings = self._settings_provider()
+        run_id = new_run_id()
+        workspace_path, target = self._resolve_workspace(run_id, target_dir)
+
+        run = Run(
+            id=run_id,
+            title=title.strip() or task.splitlines()[0][:60],
+            task=task,
+            brief=brief.strip(),
+            status=RunStatus.PLANNING,
+            workspace_dir=str(workspace_path),
+            target_dir=str(target) if target else "",
+            route=self.describe_route(settings),
+        )
+        run.messages.append(RunMessage(role="user", phase="task", content=task))
+        if context.strip():
+            run.messages.append(RunMessage(role="user", phase="context", content=context.strip()))
+            run.user_notes.append(context.strip())
+        self.store.save(run)
+        return run
+
+    def _resolve_workspace(self, run_id: str, target_dir: str) -> tuple[Path, Path | None]:
+        run_workspace = self.store.workspace_dir(run_id)
+        raw = (target_dir or "").strip()
+        if not raw:
+            return run_workspace, None
+        target = Path(raw).expanduser().resolve()
+        if not target.exists() or not target.is_dir():
+            raise WorkspaceError(
+                f"目标目录不存在或不是目录：{target}",
+                details={"target_dir": str(target)},
+            )
+        if target.parent == target:
+            raise WorkspaceError(
+                "拒绝把磁盘根目录作为工作区。", details={"target_dir": str(target)}
+            )
+        return target, target
+
+    # ── 架构段 ──
+
+    def start_planning(self, run_id: str, *, feedback: str | None = None) -> None:
+        self._cancelled.discard(run_id)
+        self._tasks[run_id] = asyncio.create_task(self._plan(run_id, feedback=feedback))
+
+    async def _plan(self, run_id: str, *, feedback: str | None) -> None:
+        run = self.store.load(run_id)
+        settings = self._settings_provider()
+        endpoint = settings.resolve_architect()
+        try:
+            self._require_endpoint(endpoint)
+            run.status = RunStatus.PLANNING
+            run.error = None
+            self.store.save(run)
+            self.bus.publish(
+                run_id,
+                "status",
+                status=run.status.value,
+                message="架构段（GPT）正在产出纲领…",
+            )
+
+            context = self._build_context(run, settings)
+            messages = build_architect_messages(
+                run.task,
+                max_steps=settings.max_plan_steps,
+                feedback=feedback,
+                context=context,
+                previous_plan=run.plan_raw if feedback else None,
+            )
+            if feedback and run.plan_revision:
+                run.plan_revision += 1
+                self.bus.publish(
+                    run_id, "status", status=run.status.value, message="按反馈修订纲领…"
+                )
+
+            client = self._client(endpoint, settings)
+            plan, raw = await run_architect(
+                client,
+                messages,
+                model=endpoint.model,
+                on_token=lambda text: self.bus.publish(
+                    run_id, "token", phase="architect", model=endpoint.model, text=text
+                ),
+            )
+
+            plan = plan.model_copy(
+                update={
+                    "steps": plan.steps[: settings.max_plan_steps],
+                }
+            )
+            plan.normalize()
+
+            if run.plan_revision == 0:
+                run.plan_revision = 1
+            run.plan = plan
+            run.plan_raw = raw
+            run.steps = [
+                RunStep(
+                    id=step.id,
+                    title=step.title,
+                    goal=step.goal,
+                    deliverables=list(step.deliverables),
+                    acceptance=list(step.acceptance),
+                )
+                for step in plan.steps
+            ]
+            run.status = RunStatus.AWAITING_APPROVAL
+            run.messages.append(
+                RunMessage(
+                    role="assistant",
+                    phase="architect",
+                    model=endpoint.model,
+                    content=raw,
+                )
+            )
+            self.store.save(run)
+            self._write_plan_doc(run)
+            self.bus.publish(
+                run_id,
+                "plan",
+                plan=run.plan.model_dump(mode="json") if run.plan else {},
+                steps=[step.model_dump(mode="json") for step in run.steps],
+                raw=raw,
+                message="纲领已生成，等待确认后执行。",
+            )
+            self.bus.publish(run_id, "status", status=run.status.value)
+        except AppError as exc:
+            self._fail(run, exc)
+        except asyncio.CancelledError:  # pragma: no cover - 主动取消
+            raise
+        except Exception as exc:  # noqa: BLE001 - 兜底，避免后台任务静默失败
+            self._fail(run, AppError(f"架构段异常：{exc}", code="architect_error"))
+
+    # ── 执行段 ──
+
+    def start_execution(self, run_id: str) -> None:
+        self._cancelled.discard(run_id)
+        self._tasks[run_id] = asyncio.create_task(self._execute(run_id))
+
+    async def _execute(self, run_id: str) -> None:
+        run = self.store.load(run_id)
+        settings = self._settings_provider()
+        endpoint = settings.resolve_editor()
+        try:
+            self._require_endpoint(endpoint)
+            if not run.plan or not run.steps:
+                raise AppError("还没有可执行的纲领。", code="plan_missing")
+
+            run.status = RunStatus.EXECUTING
+            run.error = None
+            self.store.save(run)
+            self.bus.publish(
+                run_id,
+                "status",
+                status=run.status.value,
+                message="执行段（DeepSeek V4）开始按纲领落地…",
+            )
+
+            workspace = Workspace(Path(run.workspace_dir), backup_dir=self.store.backup_dir(run.id))
+            client = self._client(endpoint, settings)
+
+            for step in run.steps:
+                if run_id in self._cancelled:
+                    run.status = RunStatus.CANCELLED
+                    break
+                if step.status == StepStatus.DONE:
+                    continue
+                await self._execute_step(run, step, workspace, client, endpoint, settings)
+                if step.status in (StepStatus.FAILED, StepStatus.BLOCKED):
+                    # 被阻塞 ≠ 失败：这是"缺信息"，用户可以补充后从这一步继续
+                    run.status = (
+                        RunStatus.BLOCKED if step.status == StepStatus.BLOCKED else RunStatus.FAILED
+                    )
+                    run.error = {
+                        "code": "step_failed",
+                        "message": f"第 {step.id} 步{('被阻塞' if step.status == StepStatus.BLOCKED else '执行失败')}：{step.error or step.summary}",
+                    }
+                    break
+                if run.stop_after_step and step.id >= run.stop_after_step:
+                    # 分批交付：本批跑完就停，状态是"已暂停"而不是"完成"
+                    run.status = RunStatus.PAUSED
+                    run.error = None
+                    break
+            else:
+                run.status = RunStatus.DONE
+
+            if run_id in self._cancelled and run.status == RunStatus.EXECUTING:
+                run.status = RunStatus.CANCELLED
+
+            self.store.save(run)
+            self._write_report_doc(run)
+            self.bus.publish(
+                run_id,
+                "done",
+                status=run.status.value,
+                summary=self._run_summary(run),
+            )
+        except AppError as exc:
+            self._fail(run, exc)
+        except asyncio.CancelledError:  # pragma: no cover
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._fail(run, AppError(f"执行段异常：{exc}", code="executor_error"))
+
+    async def _execute_step(
+        self,
+        run: Run,
+        step: RunStep,
+        workspace: Workspace,
+        client: RelayClient,
+        endpoint: Endpoint,
+        settings: Settings,
+    ) -> None:
+        step.status = StepStatus.RUNNING
+        step.started_at = datetime.now(UTC)
+        self.store.save(run)
+        self.bus.publish(
+            run.id,
+            "step_start",
+            step_id=step.id,
+            title=step.title,
+            goal=step.goal,
+            acceptance=step.acceptance,
+        )
+
+        # 分层装配上下文：按预算裁剪，而不是把整份纲领和所有文件都塞给模型，
+        # 让模型自己去压缩（那既贵又不可控）。
+        builder = StepContextBuilder(
+            budget_chars=settings.context_budget_chars,
+            file_max_chars=settings.file_context_max_chars,
+            files_max_chars=settings.files_context_max_chars,
+            tree_max_chars=settings.tree_context_max_chars,
+            log_max_chars=settings.completed_log_max_chars,
+            brief_max_chars=settings.brief_max_chars,
+            tree_limit=settings.context_tree_limit,
+        )
+        packet = builder.build(
+            system=EXECUTOR_SYSTEM,
+            task=run.task,
+            plan=run.plan,
+            step=step,
+            steps=run.steps,
+            tree=workspace.tree(limit=settings.context_tree_limit),
+            read_file=workspace.read,
+            user_notes=run.user_notes,
+            brief_text=run.brief,
+        )
+        messages = build_step_messages(packet)
+
+        output, raw = await self._call_executor(run, step, client, endpoint, messages)
+
+        # 执行段发现上下文不足时，可以按需索取文件：补给它后再跑同一轮，
+        # 这样它不必为了"看一眼"而把整个仓库读进上下文。
+        fetched: list[str] = []
+        rounds = 0
+        while (
+            output.need_files
+            and not output.files
+            and not output.blocked
+            and rounds < settings.step_fetch_rounds
+        ):
+            requested = self._resolve_requested_files(
+                workspace, output.need_files, limit=settings.step_file_fetch_limit
+            )
+            if not requested:
+                break
+            fetched.extend(requested)
+            self.bus.publish(
+                run.id, "fetch", step_id=step.id, files=requested, reason=output.need_reason
+            )
+            messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": self._requested_files_block(workspace, requested, settings)
+                    + f"\n\n请继续完成第 {step.id} 步，仍然只输出那一个 JSON 对象。"
+                    "若已足够，请直接给出 files/commands。",
+                },
+            ]
+            output, raw = await self._call_executor(run, step, client, endpoint, messages)
+            rounds += 1
+
+        step.context_chars = packet.chars
+        step.fetched_files = list(dict.fromkeys(fetched))
+
+        step.summary = output.summary
+        step.handoff = output.handoff or output.summary
+        step.notes = list(output.notes)
+        step.commands = [
+            {"cmd": item.cmd, "why": item.why} for item in output.commands if item.cmd.strip()
+        ]
+
+        for edit in output.files:
+            change = workspace.apply_edit(edit)
+            changed = ChangedFile(
+                path=change.path,
+                action=change.action,
+                additions=change.additions,
+                deletions=change.deletions,
+                diff=change.diff,
+                size=change.size,
+                error=change.error,
+            )
+            step.files.append(changed)
+            self.bus.publish(
+                run.id,
+                "file",
+                step_id=step.id,
+                file=changed.model_dump(mode="json"),
+            )
+
+        failures = [f for f in step.files if f.error]
+        still_asking = bool(output.need_files) and not output.files
+        no_output = not output.files and not (output.summary.strip() or output.notes)
+        if output.blocked:
+            step.status = StepStatus.BLOCKED
+            step.error = output.block_reason or "执行段报告被阻塞。"
+        elif failures:
+            step.status = StepStatus.FAILED
+            step.error = "；".join(f"{f.path}: {f.error}" for f in failures)
+        elif still_asking:
+            # 连续索取文件却始终不产出改动：不能算完成，标成"被阻塞"更诚实
+            step.status = StepStatus.BLOCKED
+            step.error = (
+                f"执行段连续 {max(rounds, 1)} 轮只请求文件、未产出任何改动"
+                f"（已补齐：{'、'.join(dict.fromkeys(fetched)) or '无'}）。"
+                "可补充说明后继续，或直接告诉它「按现有内容修改，不要再索取文件」。"
+            )
+        elif no_output:
+            step.status = StepStatus.BLOCKED
+            step.error = "执行段没有返回任何文件改动或说明，无法确认这一步已完成。"
+        else:
+            step.status = StepStatus.DONE
+
+        step.finished_at = datetime.now(UTC)
+        run.messages.append(
+            RunMessage(
+                role="assistant",
+                phase="executor",
+                model=endpoint.model,
+                content=raw,
+            )
+        )
+        self.store.save(run)
+        self.bus.publish(
+            run.id,
+            "step_done",
+            step=step.model_dump(mode="json"),
+            message=f"第 {step.id} 步{('已完成' if step.status == StepStatus.DONE else '未完成')}",
+        )
+
+    # ── 取消 ──
+
+    def recover_interrupted(self) -> int:
+        """启动时收敛"上次被中断"的运行。
+
+        进程被杀/重启时，运行记录会停在 ``executing``、步骤停在 ``running``，
+        界面看起来像还在跑但永远不会动。这里统一改成 ``paused`` 并把未完成的步骤
+        退回 ``pending``，用户点"继续执行"即可接着跑。
+        """
+        recovered = 0
+        for summary in self.store.list_runs():
+            run = self.store.load(str(summary["id"]))
+            if run.status not in (RunStatus.PLANNING, RunStatus.EXECUTING):
+                continue
+            for step in run.steps:
+                if step.status == StepStatus.RUNNING:
+                    step.status = StepStatus.PENDING
+                    step.error = ""
+                    step.summary = ""
+                    step.files = []
+                    step.commands = []
+                    step.fetched_files = []
+                    step.context_chars = 0
+            run.status = RunStatus.PAUSED
+            run.error = {
+                "code": "interrupted",
+                "message": "服务重启导致本次执行中断，已自动暂停；点「继续执行」会从当前步骤接着跑。",
+            }
+            self.store.save(run)
+            self.bus.publish(
+                run.id,
+                "status",
+                status=run.status.value,
+                message=run.error["message"],
+            )
+            recovered += 1
+        return recovered
+
+    def resume(
+        self,
+        run_id: str,
+        *,
+        note: str = "",
+        target_dir: str = "",
+        stop_after_step: int | None = None,
+    ) -> Run:
+        """补充信息后从被阻塞/失败的那一步继续（不必从头重跑）。
+
+        可以顺带指定落地目录——"任务提到现有代码但没给目录"是最常见的阻塞原因。
+        """
+        run = self.store.load(run_id)
+        note = (note or "").strip()
+        raw_dir = (target_dir or "").strip()
+        if raw_dir:
+            path = Path(raw_dir).expanduser().resolve()
+            if not path.is_dir():
+                raise WorkspaceError(
+                    f"目标目录不存在或不是目录：{path}", details={"target_dir": str(path)}
+                )
+            run.target_dir = str(path)
+            run.workspace_dir = str(path)
+        if note:
+            run.user_notes.append(note)
+            run.messages.append(RunMessage(role="user", phase="context", content=note))
+
+        for step in run.steps:
+            if step.status in (StepStatus.BLOCKED, StepStatus.FAILED):
+                step.status = StepStatus.PENDING
+                step.error = ""
+                step.summary = ""
+                step.notes = []
+                step.commands = []
+                step.files = []
+                step.fetched_files = []
+        run.error = None
+        run.status = RunStatus.EXECUTING
+        # 续跑默认一路跑完；需要继续分批就显式再给一个停靠点
+        run.stop_after_step = stop_after_step
+        self.store.save(run)
+        self.bus.publish(
+            run_id,
+            "status",
+            status=run.status.value,
+            message="已补充信息，从被阻塞的步骤继续。",
+        )
+        self.start_execution(run_id)
+        return self.store.load(run_id)
+
+    def update_run_meta(
+        self,
+        run_id: str,
+        *,
+        title: str | None = None,
+        pinned: bool | None = None,
+        archived: bool | None = None,
+    ) -> Run:
+        """运行记录管理：重命名 / 置顶 / 归档（Codex 式任务列表）。"""
+        run = self.store.load(run_id)
+        if title is not None:
+            cleaned = " ".join(title.split())[:120]
+            if cleaned:
+                run.title = cleaned
+        if pinned is not None:
+            run.pinned = bool(pinned)
+        if archived is not None:
+            run.archived = bool(archived)
+        self.store.save(run)
+        return run
+
+    def retry_step(
+        self,
+        run_id: str,
+        step_id: int,
+        *,
+        note: str = "",
+        stop_after: bool = True,
+    ) -> Run:
+        """重做某一步（用于"这一步标了完成但其实没产出"或想换个说法重试）。
+
+        默认只跑这一步就停下，避免顺手把后面的批次也带跑。
+        """
+        run = self.store.load(run_id)
+        target = next((step for step in run.steps if step.id == step_id), None)
+        if target is None:
+            raise NotFoundError(f"未找到第 {step_id} 步", details={"step_id": step_id})
+
+        note = (note or "").strip()
+        if note:
+            run.user_notes.append(note)
+            run.messages.append(RunMessage(role="user", phase="context", content=note))
+
+        target.status = StepStatus.PENDING
+        target.error = ""
+        target.summary = ""
+        target.handoff = ""
+        target.notes = []
+        target.commands = []
+        target.files = []
+        target.fetched_files = []
+        target.context_chars = 0
+        run.error = None
+        run.stop_after_step = step_id if stop_after else None
+        run.status = RunStatus.EXECUTING
+        self.store.save(run)
+        self.bus.publish(
+            run_id,
+            "status",
+            status=run.status.value,
+            message=f"重新执行第 {step_id} 步…",
+        )
+        self.start_execution(run_id)
+        return self.store.load(run_id)
+
+    def cancel(self, run_id: str) -> Run:
+        self._cancelled.add(run_id)
+        run = self.store.load(run_id)
+        task = self._tasks.get(run_id)
+        if task and not task.done():
+            task.cancel()
+        if run.status in (
+            RunStatus.PLANNING,
+            RunStatus.EXECUTING,
+            RunStatus.AWAITING_APPROVAL,
+        ):
+            run.status = RunStatus.CANCELLED
+            # 正在执行的步骤退回 pending：否则会出现"运行已取消、步骤仍显示执行中"的悬挂状态
+            for step in run.steps:
+                if step.status == StepStatus.RUNNING:
+                    step.status = StepStatus.PENDING
+                    step.error = ""
+                    step.summary = ""
+            self.store.save(run)
+        self.bus.publish(run_id, "status", status=run.status.value, message="已取消。")
+        return run
+
+    # ── 辅助 ──
+
+    def describe_route(self, settings: Settings | None = None) -> dict[str, object]:
+        settings = settings or self._settings_provider()
+        return {
+            "architect": settings.resolve_architect().describe(),
+            "editor": settings.resolve_editor().describe(),
+        }
+
+    def _client(self, endpoint: Endpoint, settings: Settings) -> RelayClient:
+        return RelayClient(
+            endpoint.base_url,
+            endpoint.api_key,
+            wire_api=endpoint.wire_api,
+            timeout=settings.request_timeout_seconds,
+            transport=self._transport,
+            model_hint=endpoint.model,
+        )
+
+    def _require_endpoint(self, endpoint: Endpoint) -> None:
+        if not endpoint.configured:
+            raise ConfigurationError(
+                f"{endpoint.label}未配置完整（需要 base_url / api_key / model）。",
+                details={
+                    "role": endpoint.role,
+                    "model": endpoint.model,
+                    "base_url": endpoint.base_url,
+                },
+            )
+
+    def _build_context(self, run: Run, settings: Settings) -> str:
+        lines: list[str] = []
+        if run.brief.strip():
+            lines.append("## 前期沟通简报（本次运行的背景，务必据此判断）")
+            lines.append(clip(run.brief, settings.brief_max_chars))
+            lines.append("")
+        workspace = Workspace(Path(run.workspace_dir))
+        tree = workspace.tree(limit=settings.context_tree_limit)
+        if run.target_dir:
+            lines.append(f"本次运行会直接改动这个目录：{run.target_dir}")
+        else:
+            lines.append("本次运行使用**全新空工作区**（用户未指定落地目录，也没有提供现有代码）。")
+        if tree:
+            lines.append("工作区中已存在的文件（部分）：")
+            lines.extend(f"- {item}" for item in tree)
+        else:
+            lines.append("工作区当前没有任何文件。")
+            lines.append(
+                "因此：如果需求提到「现有 / 已有 / 当前」的实现，请不要把步骤设计成"
+                "「盘点现有代码」——执行段看不到那些代码。应当二选一："
+                "把需要澄清的入口/仓库位置写进 open_questions，或把步骤改成「从零新建」。"
+            )
+        for note in run.user_notes:
+            lines.append(f"用户补充说明：{note}")
+        for message in run.messages:
+            if message.phase == "context":
+                lines.append(f"用户补充说明：{message.content}")
+        return "\n".join(lines)
+
+    async def _call_executor(
+        self,
+        run: Run,
+        step: RunStep,
+        client: RelayClient,
+        endpoint: Endpoint,
+        messages: list[dict[str, str]],
+    ) -> tuple[StepOutput, str]:
+        return await run_step(
+            client,
+            messages,
+            model=endpoint.model,
+            on_token=lambda text: self.bus.publish(
+                run.id,
+                "token",
+                phase="executor",
+                step_id=step.id,
+                model=endpoint.model,
+                text=text,
+            ),
+        )
+
+    @staticmethod
+    def _resolve_requested_files(
+        workspace: Workspace, patterns: list[str], *, limit: int
+    ) -> list[str]:
+        """解析执行段索要的文件：支持精确路径与 ``*`` 通配，全部限定在工作区内。"""
+        tree = workspace.tree(limit=400, max_depth=8)
+        matched: list[str] = []
+        for raw in patterns:
+            pattern = str(raw).strip().replace("\\", "/").lstrip("./")
+            if not pattern:
+                continue
+            if any(ch in pattern for ch in "*?["):
+                for path in tree:
+                    if fnmatch(path, pattern) or fnmatch(path.rsplit("/", 1)[-1], pattern):
+                        matched.append(path)
+            elif pattern in tree or workspace.exists(pattern):
+                matched.append(pattern)
+        return list(dict.fromkeys(matched))[:limit]
+
+    @staticmethod
+    def _requested_files_block(workspace: Workspace, paths: list[str], settings: Settings) -> str:
+        chunks: list[str] = []
+        for path in paths:
+            try:
+                content = workspace.read(path)
+            except AppError:
+                continue
+            piece = clip_head_tail(content, settings.file_context_max_chars, path=path)
+            chunks.append(f"### {path}\n```\n{piece}\n```")
+        return "## 你索要的文件\n" + ("\n\n".join(chunks) or "（这些文件当前不存在）")
+
+    def _write_plan_doc(self, run: Run) -> None:
+        if not run.plan:
+            return
+        plan = run.plan
+        lines = [
+            f"# 纲领：{run.title}",
+            "",
+            f"> 运行 ID：`{run.id}`　架构段模型：`{run.route.get('architect', {}).get('model', '')}`",
+            "",
+            f"## 目标\n{plan.goal}",
+            "",
+            f"## 纲领性说明\n{plan.summary}",
+            "",
+        ]
+        if plan.principles:
+            lines.append("## 设计原则")
+            lines.extend(f"- {item}" for item in plan.principles)
+            lines.append("")
+        if plan.components:
+            lines.append("## 组件与职责")
+            for component in plan.components:
+                interfaces = "、".join(component.interfaces) or "—"
+                lines.append(
+                    f"- **{component.name}**：{component.responsibility}（接口：{interfaces}）"
+                )
+            lines.append("")
+        lines.append("## 执行步骤")
+        for step in plan.steps:
+            lines.append(f"### {step.id}. {step.title}")
+            lines.append(f"- 目标：{step.goal}")
+            if step.deliverables:
+                lines.append(f"- 交付物：{'、'.join(step.deliverables)}")
+            if step.acceptance:
+                lines.append("- 验收标准：")
+                lines.extend(f"  - {item}" for item in step.acceptance)
+            lines.append("")
+        if plan.risks:
+            lines.append("## 风险")
+            lines.extend(f"- {item}" for item in plan.risks)
+            lines.append("")
+        if plan.open_questions:
+            lines.append("## 待澄清")
+            lines.extend(f"- {item}" for item in plan.open_questions)
+            lines.append("")
+        self._write_run_doc(run, "plan.md", "\n".join(lines))
+
+    def _write_report_doc(self, run: Run) -> None:
+        lines = [
+            f"# 执行报告：{run.title}",
+            "",
+            f"> 运行 ID：`{run.id}`　状态：`{run.status.value}`",
+            "",
+            "## 步骤结果",
+        ]
+        for step in run.steps:
+            lines.append(f"### {step.id}. {step.title} — {step.status.value}")
+            if step.summary:
+                lines.append(step.summary)
+            for change in step.files:
+                marker = f" (+{change.additions}/-{change.deletions})" if change.diff else ""
+                lines.append(
+                    f"- `{change.path}`{marker}{' — ' + change.error if change.error else ''}"
+                )
+            if step.commands:
+                lines.append("- 建议命令：")
+                lines.extend(f"  - `{item.get('cmd', '')}`" for item in step.commands)
+            lines.append("")
+        if run.error:
+            lines.append(f"## 失败原因\n{run.error.get('message', '')}")
+        self._write_run_doc(run, "report.md", "\n".join(lines))
+
+    def _write_run_doc(self, run: Run, name: str, content: str) -> None:
+        try:
+            directory = self.store.run_dir(run.id)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / name).write_text(content, encoding="utf-8")
+            self.bus.publish(run.id, "artifact", name=name, content=content)
+        except OSError:
+            pass
+
+    def _run_summary(self, run: Run) -> dict[str, object]:
+        return {
+            "steps_total": len(run.steps),
+            "steps_done": sum(1 for s in run.steps if s.status == StepStatus.DONE),
+            "files_changed": sum(len(s.files) for s in run.steps),
+            "status": run.status.value,
+        }
+
+    def _fail(self, run: Run, exc: AppError) -> None:
+        run.status = RunStatus.FAILED
+        run.error = exc.as_dict()
+        self.store.save(run)
+        self.bus.publish(run.id, "error", error=exc.as_dict(), status=run.status.value)
+        self.bus.publish(run.id, "status", status=run.status.value)
