@@ -550,6 +550,53 @@ async function main() {
     }
 
     // 3a2) 自开发相关：命令白名单可配置 + 步骤卡片能回滚
+    // 3a1) 右侧明细面板默认收起（主区占满），按需滑出
+    const panelClosed = await cdp.evaluate(`(() => {
+      const panel = document.querySelector(".inspector").getBoundingClientRect();
+      const main = document.querySelector(".main").getBoundingClientRect();
+      return {
+        state: document.body.dataset.panel,
+        panelWidth: Math.round(panel.width),
+        mainWidth: Math.round(main.width),
+      };
+    })()`);
+    check(
+      "明细面板默认收起、主区占满",
+      panelClosed.state === "closed" && panelClosed.panelWidth < 5 && panelClosed.mainWidth > 800,
+      JSON.stringify(panelClosed),
+    );
+
+    const stepLinkClicked = await cdp.clickSelector(".step-changes");
+    await sleep(400);
+    const panelOpened = await cdp.evaluate(`(() => {
+      const panel = document.querySelector(".inspector").getBoundingClientRect();
+      const main = document.querySelector(".main").getBoundingClientRect();
+      return {
+        state: document.body.dataset.panel,
+        panelWidth: Math.round(panel.width),
+        mainWidth: Math.round(main.width),
+        tab: document.querySelector(".tab.active")?.dataset.tab || null,
+      };
+    })()`);
+    check(
+      "点「看变更」按需滑出明细面板",
+      stepLinkClicked.hit &&
+        panelOpened.state === "open" &&
+        panelOpened.panelWidth > 300 &&
+        panelOpened.tab === "changes",
+      JSON.stringify(panelOpened),
+    );
+
+    // Esc 收起面板（没有弹窗时）
+    await cdp.pressKey({ key: "Escape", code: "Escape", virtualKeyCode: 27 });
+    await sleep(300);
+    const afterEsc = await cdp.evaluate(`document.body.dataset.panel`);
+    check("Esc 收起明细面板", afterEsc === "closed", `panel=${afterEsc}`);
+
+    // 后续的标签页 / 滚轮检查需要面板是打开的
+    await cdp.clickSelector("#inspector-toggle");
+    await sleep(350);
+
     await cdp.clickSelector("#settings-btn");
     await sleep(400);
     const allowlistFilled = await cdp.evaluate(`(() => {
@@ -708,10 +755,44 @@ async function main() {
     );
     check("纲领/步骤卡片提供复制按钮", copyButtons > 0, `copy-btn=${copyButtons}`);
 
-    // 3f) 右上角「架构 → 执行」标签：点开就能改分段路由
+    // 3f) 右上角「架构 → 执行」：点哪个标签就只改哪一段
     const chipClicked = await cdp.clickSelector("#route-chips button.chip.architect");
-    const routeOpened = await cdp.evaluate(
-      `!document.getElementById("route-modal").hidden`,
+    const architectView = await cdp.evaluate(`(() => {
+      const modal = document.getElementById("route-modal");
+      const dialog = document.querySelector("#route-modal .route-modal");
+      const hidden = (sel) => getComputedStyle(document.querySelector(sel)).display === "none";
+      return {
+        opened: !modal.hidden,
+        stage: dialog.dataset.stage,
+        title: document.getElementById("route-title").textContent.trim(),
+        editorHidden: hidden(".route-field-editor"),
+        architectVisible: !hidden(".route-field-architect"),
+      };
+    })()`);
+    check(
+      "点「架构」标签只显示架构段设置",
+      chipClicked.hit &&
+        architectView.opened &&
+        architectView.stage === "architect" &&
+        architectView.editorHidden &&
+        architectView.architectVisible,
+      JSON.stringify(architectView),
+    );
+    // 弹窗里可以切到执行段（不需要关掉再点另一个标签）
+    const switched = await cdp.clickSelector("#route-switch");
+    const editorView = await cdp.evaluate(`(() => {
+      const dialog = document.querySelector("#route-modal .route-modal");
+      const hidden = (sel) => getComputedStyle(document.querySelector(sel)).display === "none";
+      return {
+        stage: dialog.dataset.stage,
+        architectHidden: hidden(".route-field-architect"),
+        editorVisible: !hidden(".route-field-editor"),
+      };
+    })()`);
+    check(
+      "弹窗内可切到执行段",
+      switched.hit && editorView.stage === "editor" && editorView.architectHidden,
+      JSON.stringify(editorView),
     );
     await cdp.evaluate(`(() => {
       const el = document.getElementById("route-editor-model");
@@ -725,8 +806,8 @@ async function main() {
     );
     check(
       "右上角架构→执行标签可点击修改",
-      chipClicked.hit && routeOpened && routeSaved.hit && chipsText.includes("deepseek-v4-uitest"),
-      JSON.stringify({ opened: routeOpened, chips: chipsText }),
+      routeSaved.hit && chipsText.includes("deepseek-v4-uitest"),
+      JSON.stringify({ chips: chipsText }),
     );
 
     // 还原成"两段都跟随当前配置"，避免自检改坏演示配置

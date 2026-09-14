@@ -71,6 +71,9 @@
             <span class="status-pill" id="status-pill" data-status="idle">待开始</span>
           </div>
           <div class="route-chips" id="route-chips"></div>
+          <button class="btn ghost panel-toggle" id="inspector-toggle" type="button" aria-pressed="false">
+            ▤ 明细
+          </button>
         </header>
 
         <section class="dashboard" id="run-dashboard" hidden></section>
@@ -106,11 +109,14 @@
       </main>
 
       <aside class="inspector">
-        <div class="tabs" id="inspector-tabs">
-          <button class="tab active" data-tab="plan">纲领</button>
-          <button class="tab" data-tab="changes">变更</button>
-          <button class="tab" data-tab="files">文件</button>
-          <button class="tab" data-tab="docs">文档</button>
+        <div class="inspector-head">
+          <div class="tabs" id="inspector-tabs">
+            <button class="tab active" data-tab="plan">纲领</button>
+            <button class="tab" data-tab="changes">变更</button>
+            <button class="tab" data-tab="files">文件</button>
+            <button class="tab" data-tab="docs">文档</button>
+          </div>
+          <button class="icon-btn" id="inspector-close" type="button" title="收起明细面板">✕</button>
         </div>
         <div class="inspector-body" id="inspector-body"></div>
       </aside>
@@ -279,9 +285,10 @@
 
     <!-- 分段路由：点右上角「架构 → 执行」标签或 ✎ 打开 -->
     <div class="modal-backdrop" id="route-modal" hidden>
-      <div class="modal route-modal">
+      <div class="modal route-modal" data-stage="both">
         <div class="modal-head">
-          <h2>分段路由：架构段 → 执行段</h2>
+          <h2 id="route-title">分段路由：架构段 → 执行段</h2>
+          <button class="btn link" id="route-switch" type="button" hidden></button>
           <button class="icon-btn" id="route-close" type="button">✕</button>
         </div>
         <div class="modal-body">
@@ -290,19 +297,19 @@
             DeepSeek）。选「跟随当前配置」表示与侧栏当前配置一致。
           </p>
           <div class="field-grid">
-            <label class="field">
+            <label class="field route-field-architect">
               <span>架构段配置</span>
               <select id="route-architect-provider"></select>
             </label>
-            <label class="field">
+            <label class="field route-field-architect">
               <span>架构段模型</span>
               <input id="route-architect-model" placeholder="例如 gpt-5.6-sol" />
             </label>
-            <label class="field">
+            <label class="field route-field-editor">
               <span>执行段配置</span>
               <select id="route-editor-provider"></select>
             </label>
-            <label class="field">
+            <label class="field route-field-editor">
               <span>执行段模型</span>
               <input id="route-editor-model" placeholder="例如 deepseek-v4-flash" />
             </label>

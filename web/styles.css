@@ -50,7 +50,8 @@ pre,
 
 .app {
   display: grid;
-  grid-template-columns: var(--sidebar-width, 248px) minmax(0, 1fr) 400px;
+  /* 右侧明细面板默认收起：主区占满，需要时才滑出（Codex 式） */
+  grid-template-columns: var(--sidebar-width, 248px) minmax(0, 1fr) var(--panel-width, 0px);
   transition: grid-template-columns 0.15s ease;
   height: 100vh;
   overflow: hidden;
@@ -58,6 +59,10 @@ pre,
 
 .app.collapsed {
   --sidebar-width: 60px;
+}
+
+body[data-panel="open"] .app {
+  --panel-width: 400px;
 }
 
 /* 关键：三栏都必须允许被压缩到 0 高度，内部各自滚动。
@@ -709,6 +714,17 @@ button.chip:focus-visible {
   font-size: 12px;
 }
 
+/* 只看当前要改的那一段：点「架构」标签就不该同时看到执行段的字段 */
+.route-modal[data-stage="architect"] .route-field-editor,
+.route-modal[data-stage="editor"] .route-field-architect {
+  display: none;
+}
+
+.route-modal .modal-head .btn.link {
+  font-size: 12px;
+  color: var(--accent);
+}
+
 .chip.architect {
   border-color: rgba(130, 80, 223, 0.35);
   color: #8250df;
@@ -1105,6 +1121,24 @@ textarea#task-input {
   background: var(--panel);
   border-left: 1px solid var(--border);
   min-width: 0;
+  /* 收起时不能占位、也不接受点击 */
+  overflow: hidden;
+}
+
+body[data-panel="closed"] .inspector {
+  border-left: none;
+  pointer-events: none;
+  visibility: hidden;
+}
+
+.panel-toggle {
+  white-space: nowrap;
+}
+
+.panel-toggle[aria-pressed="true"] {
+  border-color: rgba(9, 105, 218, 0.45);
+  color: var(--accent);
+  background: #f2f7ff;
 }
 
 .tabs {
@@ -1112,6 +1146,22 @@ textarea#task-input {
   gap: 4px;
   padding: 10px 10px 0;
   border-bottom: 1px solid var(--border);
+}
+
+.inspector-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.inspector-head .tabs {
+  flex: 1;
+  border-bottom: none;
+}
+
+.inspector-head .icon-btn {
+  margin-right: 8px;
 }
 
 .tab {

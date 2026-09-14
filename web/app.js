@@ -5,6 +5,7 @@
 
 const STORAGE_KEY = "orchestrator.lastRun";
 const SIDEBAR_KEY = "orchestrator.sidebarWide";
+const PANEL_KEY = "orchestrator.panelOpen";
 
 /* ── 前端错误留证：点不动的问题必须能在后端查到 ── */
 
@@ -57,6 +58,10 @@ const state = {
   tab: "plan",
   docs: [],
   fileView: null,
+  //: 右侧明细面板是否展开（默认收起：主区占满，Codex 式）
+  panelOpen: false,
+  //: 分段路由弹窗当前编辑哪一段（architect / editor / both）
+  routeStage: "both",
   renderQueued: false,
   providers: [],
   activeProviderId: "",
@@ -226,6 +231,8 @@ function streamKeyFor(event) {
 async function boot() {
   bindEvents();
   applySidebarMode();
+  // 明细面板默认收起；只恢复用户上次的显式选择
+  setPanelOpen(localStorage.getItem(PANEL_KEY) === "1");
   try {
     state.settings = await api.settings();
   } catch (error) {
@@ -262,6 +269,9 @@ function bindEvents() {
   on("settings-cancel", "click", closeSettings);
   on("route-close", "click", closeRouteModal);
   on("route-cancel", "click", closeRouteModal);
+  on("route-switch", "click", () => {
+    renderRouteStage(state.routeStage === "architect" ? "editor" : "architect");
+  });
   on("route-save", "click", saveRouteModal);
   on("route-follow", "click", followCurrentProvider);
   on("route-modal", "click", (event) => {
@@ -311,10 +321,10 @@ function bindEvents() {
   on("inspector-tabs", "click", (event) => {
     const tab = event.target.closest(".tab");
     if (!tab) return;
-    state.tab = tab.dataset.tab;
-    document.querySelectorAll(".tab").forEach((node) => node.classList.toggle("active", node === tab));
-    renderInspector();
+    switchInspectorTab(tab.dataset.tab);
   });
+  on("inspector-toggle", "click", togglePanel);
+  on("inspector-close", "click", () => setPanelOpen(false));
   // 任务列表：搜索 / 归档开关
   on("run-search", "input", (event) => {
     state.runQuery = event.target.value.trim();
@@ -360,6 +370,13 @@ function handleGlobalKeydown(event) {
     showShortcutHelp();
     return;
   }
+  // Ctrl/⌘+1..4：直接切右侧明细标签（并自动展开面板）
+  if ((event.ctrlKey || event.metaKey) && ["1", "2", "3", "4"].includes(event.key)) {
+    const tabs = ["plan", "changes", "files", "docs"];
+    event.preventDefault();
+    switchInspectorTab(tabs[Number(event.key) - 1]);
+    return;
+  }
   if (event.key === "Escape") {
     if (state.palette.open) {
       closePalette();
@@ -371,6 +388,11 @@ function handleGlobalKeydown(event) {
         modal.hidden = true;
         return;
       }
+    }
+    // 没有弹窗时，Esc 收起右侧明细面板
+    if (state.panelOpen) {
+      setPanelOpen(false);
+      return;
     }
   }
 }
@@ -720,10 +742,11 @@ function updateRouteChips() {
     const node = h("button", {
       class: `chip ${role}${configured ? "" : " missing"}`,
       type: "button",
-      title: `${label} · 点击修改分段路由`,
+      title: `修改${role === "architect" ? "架构段" : "执行段"}：用哪套配置、哪个模型`,
       text: `${label}${configured ? "" : " · 未配置"}`,
     });
-    node.addEventListener("click", safe(openRouteModal));
+    // 点哪个标签就只改哪一段（之前两个标签打开同一个"两段都在"的弹窗，容易让人困惑）
+    node.addEventListener("click", safe(() => openRouteModal(role)));
     return node;
   };
   dom.routeChips.replaceChildren(
@@ -736,7 +759,7 @@ function updateRouteChips() {
       type: "button",
       title: "修改分段路由（两段各用哪套配置 / 模型）",
       text: "✎",
-      onclick: safe(openRouteModal),
+      onclick: safe(() => openRouteModal("both")),
     })
   );
   if (!architect.configured || !editor.configured) {
@@ -1309,6 +1332,17 @@ function renderStepCard(step) {
               }/${step.command_results.filter((item) => !item.skipped).length} 通过`
             : ""),
       }),
+      (step.files || []).length
+        ? (() => {
+            const link = h("button", {
+              class: "btn link step-changes",
+              type: "button",
+              text: "看变更 →",
+            });
+            link.addEventListener("click", safe(() => switchInspectorTab("changes")));
+            return link;
+          })()
+        : null,
       copyButton(
         () =>
           [
@@ -1651,7 +1685,13 @@ async function applyDevMode(checked) {
 
 /* ── 分段路由（右上角标签点开的弹窗）── */
 
-async function openRouteModal() {
+/**
+ * 打开分段路由弹窗。
+ *
+ * ``stage``：``"architect"`` / ``"editor"`` = 只编辑那一段（点顶栏标签进来的默认行为）；
+ * ``"both"`` = 两段一起改（点 ✎ 进来）。
+ */
+async function openRouteModal(stage = "both") {
   const modal = document.getElementById("route-modal");
   if (!modal) return;
   document.getElementById("route-status").textContent = "";
@@ -1671,7 +1711,29 @@ async function openRouteModal() {
   document.getElementById("route-architect-model").value = architect.model || "";
   document.getElementById("route-editor-provider").value = editor.provider_id || "";
   document.getElementById("route-editor-model").value = editor.model || "";
+  renderRouteStage(stage);
   modal.hidden = false;
+}
+
+/** 只显示当前要改的那一段；另一段留一个切换入口，不一起挤在眼前。 */
+function renderRouteStage(stage) {
+  const view = stage === "architect" || stage === "editor" ? stage : "both";
+  state.routeStage = view;
+  // 注意：id 在遮罩层上，控制显示的是内层 .route-modal（CSS 按它匹配）
+  const dialog = document.querySelector("#route-modal .route-modal") || document.getElementById("route-modal");
+  dialog.dataset.stage = view;
+  const titles = {
+    architect: "架构段：用哪套配置 / 哪个模型",
+    editor: "执行段：用哪套配置 / 哪个模型",
+    both: "分段路由：架构段 → 执行段",
+  };
+  document.getElementById("route-title").textContent = titles[view];
+  document.getElementById("route-switch").textContent =
+    view === "architect" ? "也改执行段 →" : view === "editor" ? "← 改架构段" : "";
+  document.getElementById("route-switch").hidden = view === "both";
+  // 打开就聚焦到该段第一个输入，键盘用户可以直接改
+  const focusId = view === "editor" ? "route-editor-provider" : "route-architect-provider";
+  if (view !== "both") document.getElementById(focusId).focus();
 }
 
 function closeRouteModal() {
@@ -2684,11 +2746,30 @@ function paletteCommands() {
 }
 
 function switchInspectorTab(tab) {
+  // 切换明细标签一律把面板打开：用户点它就是想看
+  setPanelOpen(true);
   state.tab = tab;
   document.querySelectorAll("#inspector-tabs .tab").forEach((node) => {
     node.classList.toggle("active", node.dataset.tab === tab);
   });
   renderInspector();
+}
+
+/** 右侧明细面板开合（默认收起，让主区占满）。 */
+function setPanelOpen(open) {
+  state.panelOpen = Boolean(open);
+  document.body.dataset.panel = state.panelOpen ? "open" : "closed";
+  const toggle = document.getElementById("inspector-toggle");
+  if (toggle) toggle.setAttribute("aria-pressed", String(state.panelOpen));
+  try {
+    localStorage.setItem(PANEL_KEY, state.panelOpen ? "1" : "0");
+  } catch {
+    /* 隐私模式下忽略 */
+  }
+}
+
+function togglePanel() {
+  setPanelOpen(!state.panelOpen);
 }
 
 function togglePalette() {
