@@ -53,6 +53,7 @@ const state = {
   reconnectTimer: null,
   lastSeq: 0,
   buffers: {}, // key -> 流式文本缓冲区
+  statusHint: "", // 后端给当前状态的一句话说明（例如"正在判断这是需求还是问答…"）
   tab: "plan",
   docs: [],
   fileView: null,
@@ -596,6 +597,10 @@ function handleEvent(event) {
     }
     case "status": {
       if (state.run) state.run.status = event.data.status;
+      state.statusHint = event.data.message || "";
+      if (["done", "failed", "cancelled", "blocked"].includes(event.data.status)) {
+        state.statusHint = "";
+      }
       updateStatus();
       updateComposer();
       if (["done", "failed", "cancelled"].includes(event.data.status)) refreshRuns();
@@ -674,7 +679,10 @@ function render() {
 function updateStatus() {
   const status = state.run ? state.run.status : "idle";
   dom.statusPill.dataset.status = status;
-  dom.statusPill.textContent = STATUS_TEXT[status] || status;
+  // 运行中优先显示后端说明：等待模型返回的那段时间里，用户得知道系统在干什么
+  const transient = status === "planning" || status === "executing";
+  dom.statusPill.textContent =
+    (transient && state.statusHint) || STATUS_TEXT[status] || status;
   dom.runTitle.textContent = state.run ? state.run.title : "新任务";
 }
 

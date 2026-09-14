@@ -92,6 +92,17 @@ _TASK_HINTS = (
     "按钮",
     "功能",
     "优化",
+    "改",
+    "调整",
+    "升级",
+    "接入",
+    "支持",
+    "补",
+    "替换",
+    "迁移",
+    "重写",
+    "整理",
+    "重构",
 )
 
 
@@ -108,11 +119,16 @@ def heuristic_intent(task: str) -> Intent | None:
     ):
         return Intent(CHAT, "问候或询问助手自身", source="heuristic")
 
+    # 有明确"产出动作"的词就直接判需求：这类请求占绝大多数，
+    # 绝不能为它们多付一次模型往返——那会在纲领开始流式输出前先卡住几十秒。
+    if any(hint in lowered for hint in _TASK_HINTS):
+        return Intent(TASK, "包含明确的产出动作", source="heuristic")
+
     # 短句 + 没有任何产出动作 + 明显是问句 → 问答
     is_question = text.endswith(("?", "？")) or text.startswith(
         ("为什么", "怎么", "能否", "可以吗", "是不是")
     )
-    if len(text) <= 60 and is_question and not any(hint in lowered for hint in _TASK_HINTS):
+    if len(text) <= 60 and is_question:
         return Intent(CHAT, "短问句且不含产出动作", source="heuristic")
 
     return None
@@ -161,7 +177,11 @@ async def detect_intent(
 
     messages = build_intent_messages(task, brief=brief)
     try:
-        result = await client.acomplete(messages, model=model, json_mode=True, stats=stats)
+        # 分类只要一个极短的 JSON：给它一个很小的输出上限，
+        # 避免推理模型在这里"想很久"，把纲领开始之前的空档拖成几十秒。
+        result = await client.acomplete(
+            messages, model=model, json_mode=True, max_tokens=64, stats=stats
+        )
     except Exception:  # noqa: BLE001 - 分流失败不能拦住真需求
         return Intent(TASK, "意图分类调用失败，按需求处理", source="fallback")
     parsed = parse_intent(result.text)

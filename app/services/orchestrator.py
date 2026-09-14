@@ -141,7 +141,7 @@ class Orchestrator:
                 run_id,
                 "status",
                 status=run.status.value,
-                message="架构段（GPT）正在产出纲领…",
+                message="正在判断这是需求还是问答…",
             )
 
             client = self._client(endpoint, settings)
@@ -160,6 +160,12 @@ class Orchestrator:
                 await self._answer_chat(run, client, endpoint, intent, stats)
                 return
 
+            self.bus.publish(
+                run_id,
+                "status",
+                status=run.status.value,
+                message="架构段（GPT）正在产出纲领…",
+            )
             context = self._build_context(run, settings)
             messages = build_architect_messages(
                 run.task,

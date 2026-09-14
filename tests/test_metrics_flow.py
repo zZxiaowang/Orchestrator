@@ -42,10 +42,12 @@ def test_run_records_architect_and_step_metrics(tmp_path: Path):
         assert architect[0]["route"]["model"] == "gpt-5"
         assert architect[0]["route"]["alias"]
         # 流式 usage 由 stream_options.include_usage 取回，不再永远是"未知"。
-        # 架构段这一条累计了两次调用：意图分流 18 + 纲领生成 18。
+        # 这条任务的文案含明确产出动作，分流走启发式（零模型调用），
+        # 所以架构段这里只有纲领生成这一次调用。
         assert architect[0]["usage_source"] == "provider"
         assert architect[0]["usage_reason"] == ""
-        assert architect[0]["total_tokens"] == 36
+        assert architect[0]["calls"] == 1
+        assert architect[0]["total_tokens"] == 18
         # 健康运行不该显示"重试 1 次"：分流是一次独立调用，不是重试
         assert architect[0]["retries"] == 0
 
@@ -76,7 +78,7 @@ def test_metrics_endpoint_returns_contract_shape(tmp_path: Path):
         summary = payload["summary"]
         assert summary["architect"]["calls"] >= 1
         assert summary["executor"]["calls"] >= 2
-        assert summary["architect"]["total_tokens"] == 36
+        assert summary["architect"]["total_tokens"] == 18
         assert summary["unknown_usage"] == []
 
 
@@ -92,7 +94,7 @@ def test_forced_json_retry_is_the_only_thing_counted_as_retry(tmp_path: Path):
 
     architect = [item for item in run["metrics"] if item["phase"] == "architect"][0]
     assert architect["retries"] == 1
-    assert architect["calls"] == 3  # 分流 + 流式（垃圾输出）+ 强制 JSON 重试
+    assert architect["calls"] == 2  # 流式（垃圾输出）+ 强制 JSON 重试
 
 
 def test_metrics_endpoint_404_for_unknown_run(tmp_path: Path):
@@ -138,8 +140,10 @@ def test_failed_architect_call_still_records_usage_attempt(tmp_path: Path):
 
     architect = [item for item in run["metrics"] if item["phase"] == "architect"]
     assert architect, run.get("error")
-    # 分流那次成功（18），架构段那次失败：账本要同时反映"确实调用过"和"用量不全"
-    assert architect[0]["calls"] >= 2
-    assert architect[0]["usage_source"] == "provider"
-    assert architect[0]["usage_reason"] == "provider_partial_usage"
-    assert architect[0]["total_tokens"] == 18
+    # 分流走启发式（零调用）。架构段两次调用都失败且都被记下：
+    # 1) 流式请求重试 3 次后失败；2) 降级为非流式再试一次也失败。
+    assert architect[0]["calls"] == 2
+    assert architect[0]["retries"] == 4  # 传输层重试 = 6 次 HTTP - 2 次逻辑调用
+    assert architect[0]["usage_source"] == "unknown"
+    assert architect[0]["usage_reason"] == "provider_stream_no_usage"
+    assert architect[0]["total_tokens"] is None

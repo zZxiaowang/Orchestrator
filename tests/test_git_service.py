@@ -18,6 +18,11 @@ def _init_repo(path: Path) -> Path:
         ("config", "user.email", "test@example.com"),
     ):
         subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    # 和真实项目一样忽略 .logs：自动提交会把日志写在被操作仓库的 .logs 下，
+    # 若该目录不被忽略，仓库在提交后会立刻变脏。先提交一次，让仓库从干净状态开始。
+    (path / ".gitignore").write_text(".logs/\n", encoding="utf-8")
+    for args in (("add", ".gitignore"), ("commit", "-m", "chore: 初始化测试仓库")):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
     return path
 
 
@@ -114,6 +119,12 @@ def test_auto_commit_script_commits_changes(tmp_path: Path):
     subjects = [item["subject"] for item in service.log(5)]
     assert subjects and subjects[0].startswith("chore(auto): 每日自动提交")
     assert service.status()["clean"] is True
+
+    # 日志必须写在**被操作的仓库**里。以前它跟着脚本位置走，导致用临时仓库
+    # 跑这个脚本会把"已提交"写进真实项目的日志，看起来像真实仓库被自动提交了。
+    log_file = repo / ".logs" / "auto-commit.log"
+    assert log_file.is_file(), "自动提交日志应当落在被操作仓库的 .logs 下"
+    assert "已提交 1 个文件" in log_file.read_text(encoding="utf-8")
 
     second = service.run_auto_commit_now()
     assert "无改动，跳过提交" in second["output"]

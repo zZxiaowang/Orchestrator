@@ -217,10 +217,16 @@ class RelayClient:
         model: str,
         json_mode: bool = False,
         temperature: float | None = None,
+        max_tokens: int | None = None,
         stats: CallStats | None = None,
     ) -> RelayResult:
         body: dict[str, Any] = self._build_body(
-            messages, model=model, stream=False, json_mode=json_mode, temperature=temperature
+            messages,
+            model=model,
+            stream=False,
+            json_mode=json_mode,
+            temperature=temperature,
+            max_tokens=max_tokens,
         )
         started = time.perf_counter()
         try:
@@ -373,6 +379,7 @@ class RelayClient:
         stream: bool,
         json_mode: bool,
         temperature: float | None,
+        max_tokens: int | None = None,
     ) -> dict[str, Any]:
         if self.wire_api == "responses":
             body: dict[str, Any] = {
@@ -386,6 +393,8 @@ class RelayClient:
                 ],
                 "stream": stream,
             }
+            if max_tokens:
+                body["max_output_tokens"] = int(max_tokens)
             if stream:
                 body["stream"] = True
             return body
@@ -393,6 +402,9 @@ class RelayClient:
         body = {"model": model, "messages": list(messages), "stream": stream}
         if json_mode:
             body["response_format"] = {"type": "json_object"}
+        if max_tokens:
+            # 只给"短回答"类调用设上限（例如意图分流）；网关不认这个参数时会自动去掉重试
+            body["max_tokens"] = int(max_tokens)
         if stream:
             # 多数网关默认不在流式响应里给 usage；显式索取，拿不到就按「未知」记账。
             # 若网关不认这个参数（400），_post_stream 会去掉它重试。

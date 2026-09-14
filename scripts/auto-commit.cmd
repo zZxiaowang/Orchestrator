@@ -1,12 +1,18 @@
 @echo off
 REM ============================================================
-REM  每日开机自动提交（由计划任务 Orchestrator-DailyAutoCommit 调用）
+REM  Daily auto-commit. Called by the Startup launcher and by the
+REM  Git panel's "run now" button.
 REM
-REM  用法：auto-commit.cmd           只提交到本地
-REM        auto-commit.cmd push      提交后同时推送
-REM        auto-commit.cmd local     同上（显式本地）
+REM  Usage: auto-commit.cmd          commit to local only
+REM         auto-commit.cmd push     commit, then push
 REM
-REM  没有改动时不做任何事；日志写到 .logs\auto-commit.log
+REM  The log path follows the repo being operated on
+REM  (ORCHESTRATOR_AUTOCOMMIT_REPO), NOT this script's location:
+REM  otherwise running the script against a temporary repo (tests,
+REM  verification) writes "committed" noise into the real project log.
+REM
+REM  NOTE: keep this file ASCII + CRLF. cmd.exe reads .cmd as ANSI, so
+REM  non-ASCII comments turn into garbage commands on Chinese Windows.
 REM ============================================================
 setlocal
 chcp 65001 >nul
@@ -16,8 +22,11 @@ set PYTHONIOENCODING=utf-8
 set DO_PUSH=%1
 if "%DO_PUSH%"=="" set DO_PUSH=local
 
-if not exist ".logs" mkdir ".logs"
-set LOG=%~dp0..\.logs\auto-commit.log
+if defined ORCHESTRATOR_AUTOCOMMIT_REPO (
+    set "LOG=%ORCHESTRATOR_AUTOCOMMIT_REPO%\.logs\auto-commit.log"
+) else (
+    set "LOG=%~dp0..\.logs\auto-commit.log"
+)
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0auto-commit.ps1" -Push:"%DO_PUSH%" -LogFile "%LOG%"
 exit /b %ERRORLEVEL%
