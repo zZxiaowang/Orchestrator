@@ -48,6 +48,10 @@
 | 28 | 「你是哪个模型」被当成需求走编排 | ✅ 新增意图分流：明显问答/闲聊不生成纲领、不碰工作区（`app/services/intent.py`） |
 | 29 | 统计看板永远是空的 | ✅ 指标接线：中继层记 attempts/耗时/usage，主链路写入 `run.metrics`，新增 `GET /api/v1/runs/{id}/metrics` |
 | 30 | 「完成」只靠模型自己说 | ✅ 步骤级**客观验收**：文件存在 / 含指定内容 / Python 可编译 / JSON 合法 / 通配匹配，不通过就不算完成（`app/services/verify.py`） |
+| 31 | 右上角「架构 → 执行」应该可点 | ✅ 标签可点击 + ✎ 入口，弹窗里改两段的配置/模型（同一份 `routes` 配置） |
+| 32 | git 提交老是弹黑窗 | ✅ 所有 git 子进程加 `CREATE_NO_WINDOW`；开机启动项改成静默 `.vbs` |
+| 33 | 它应该能自己跑验证、按报错改（自开发闭环 P1/P2） | ✅ 受控命令执行（白名单+超时+截断）+ 失败回灌同一步继续修（`app/services/commands.py`） |
+| 34 | 改错了要能退回去 | ✅ 步骤级 git 锚点 + 「回滚这一步」（只还原该步碰过的文件，`app/services/gitguard.py`） |
 
 ## 三、数据与文件位置（重要）
 
@@ -122,7 +126,7 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **212 项**通过；ruff check/format 全绿；界面自检 **46 项全通过**（统计看板 2 项已随指标接线转为通过） |
+| 质量门 | pytest **241 项**通过；ruff check/format 全绿；界面自检 **47 项全通过** |
 | 桌面自检 | 渲染 PASS、点击链路 PASS、Git 面板 29 按钮 PASS |
 | 推送 | 已配置 `http.https://github.com/.proxy = http://127.0.0.1:10809`（**只对 github.com 生效**） |
 

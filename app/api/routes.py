@@ -94,6 +94,9 @@ class SettingsPatch(BaseModel):
     editor_wire_api: str | None = None
     max_plan_steps: int | None = None
     allow_command_execution: bool | None = None
+    command_allowlist: list[str] | None = None
+    command_timeout_seconds: float | None = None
+    step_command_rounds: int | None = None
     request_timeout_seconds: float | None = None
 
 
@@ -176,6 +179,9 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "relay_wire_api": settings.relay_wire_api,
         "max_plan_steps": settings.max_plan_steps,
         "allow_command_execution": settings.allow_command_execution,
+        "command_allowlist": list(settings.command_allowlist),
+        "command_timeout_seconds": settings.command_timeout_seconds,
+        "step_command_rounds": settings.step_command_rounds,
         "request_timeout_seconds": settings.request_timeout_seconds,
         "architect": architect.describe(),
         "editor": editor.describe(),
@@ -501,6 +507,18 @@ async def retry_step(
         run_id, step_id, note=payload.note, stop_after=payload.stop_after
     )
     return {"run": run.model_dump(mode="json"), "action": "retry_step"}
+
+
+@router.post("/runs/{run_id}/steps/{step_id}/revert")
+async def revert_step(run_id: str, step_id: int, request: Request) -> dict[str, Any]:
+    """回滚某一步的文件改动（只还原这一步碰过的路径），改错了不用手工翻 backup。"""
+
+    run, reverted = _orchestrator(request).revert_step(run_id, step_id)
+    return {
+        "run": run.model_dump(mode="json"),
+        "reverted": reverted,
+        "action": "revert_step",
+    }
 
 
 @router.get("/runs/{run_id}/metrics")

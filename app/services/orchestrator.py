@@ -25,6 +25,7 @@ from app.schemas.run import (
     PHASE_ARCHITECT,
     PHASE_EXECUTOR,
     ChangedFile,
+    CommandRun,
     Run,
     RunMessage,
     RunStatus,
@@ -33,9 +34,11 @@ from app.schemas.run import (
 )
 from app.schemas.step import StepOutput
 from app.services.architect import build_architect_messages, run_architect, run_chat
+from app.services.commands import failure_block, run_allowed
 from app.services.context import StepContextBuilder, clip, clip_head_tail
 from app.services.events import EventBus
 from app.services.executor import EXECUTOR_SYSTEM, build_step_messages, run_step
+from app.services.gitguard import revert_paths, snapshot
 from app.services.intent import detect_intent
 from app.services.metrics import apply_call, route_of
 from app.services.storage import RunStore, new_run_id
@@ -384,6 +387,8 @@ class Orchestrator:
     ) -> None:
         step.status = StepStatus.RUNNING
         step.started_at = datetime.now(UTC)
+        # 步骤级锚点：出错时可以"回滚这一步"（只还原这一步碰过的文件）
+        step.git_snapshot = snapshot(workspace.root).as_dict()
         self.store.save(run)
         self.bus.publish(
             run.id,
@@ -476,26 +481,20 @@ class Orchestrator:
             {"cmd": item.cmd, "why": item.why} for item in output.commands if item.cmd.strip()
         ]
 
-        for edit in output.files:
-            change = workspace.apply_edit(edit)
-            changed = ChangedFile(
-                path=change.path,
-                action=change.action,
-                additions=change.additions,
-                deletions=change.deletions,
-                diff=change.diff,
-                size=change.size,
-                error=change.error,
-            )
-            step.files.append(changed)
-            self.bus.publish(
-                run.id,
-                "file",
-                step_id=step.id,
-                file=changed.model_dump(mode="json"),
-            )
+        self._apply_edits(run, step, workspace, output)
+
+        # 受控命令执行 + 步骤内迭代（自开发的关键闭环）：
+        # 模型写完文件并不知道对不对，跑一次白名单内的验证命令才知道；
+        # 失败了就把报错回灌给它，让它在**同一步**里继续修，而不是丢给用户。
+        raw, last_command_results, command_rounds_used = await self._run_step_commands(
+            run, step, workspace, client, endpoint, settings, messages, raw, stats
+        )
 
         failures = [f for f in step.files if f.error]
+        # 只看**最后一轮**的结果：第一轮失败、修好后第二轮通过，就应该算通过
+        command_failures = [
+            item for item in last_command_results if not item.ok and not item.skipped
+        ]
         still_asking = bool(output.need_files) and not output.files
         no_output = not output.files and not (output.summary.strip() or output.notes)
 
@@ -520,6 +519,13 @@ class Orchestrator:
         elif failures:
             step.status = StepStatus.FAILED
             step.error = "；".join(f"{f.path}: {f.error}" for f in failures)
+        elif command_failures:
+            # 验证命令没过：不许标完成，但这是"可以补信息/改命令再来一次"的情形
+            step.status = StepStatus.BLOCKED
+            step.error = f"验证命令未通过（已自动修正 {command_rounds_used} 轮）：" + "；".join(
+                f"{item.cmd}（{item.error or f'退出码 {item.exit_code}'}）"
+                for item in command_failures[:3]
+            )
         elif still_asking:
             # 连续索取文件却始终不产出改动：不能算完成，标成"被阻塞"更诚实
             step.status = StepStatus.BLOCKED
@@ -708,6 +714,64 @@ class Orchestrator:
         self.start_execution(run_id)
         return self.store.load(run_id)
 
+    def revert_step(self, run_id: str, step_id: int) -> tuple[Run, dict[str, object]]:
+        """回滚某一步的文件改动，并把该步退回 ``pending``。
+
+        只还原**这一步碰过的路径**（来自 ``step.files``），不动用户其他未提交的改动；
+        原本就存在的文件用 git 还原，这一步新建的文件删掉。
+        非 git 仓库时仍会把步骤状态退回 pending，只是文件需要人工处理（backup/ 里还有原件）。
+        """
+
+        run = self.store.load(run_id)
+        step = next((item for item in run.steps if item.id == step_id), None)
+        if step is None:
+            raise NotFoundError(f"未找到第 {step_id} 步", details={"step_id": step_id})
+        if run.status in (RunStatus.PLANNING, RunStatus.EXECUTING):
+            raise AppError(
+                "运行正在执行中，等它跑完或先点「停止」再回滚。",
+                code="run_busy",
+            )
+
+        workspace = Workspace(Path(run.workspace_dir))
+        paths = [item.path for item in step.files if item.path and not item.error]
+        summary: dict[str, object] = {
+            "restored": [],
+            "removed": [],
+            "skipped": [],
+            "errors": [],
+        }
+        if paths:
+            summary = revert_paths(workspace.root, paths).as_dict()
+
+        step.status = StepStatus.PENDING
+        step.error = ""
+        step.summary = ""
+        step.handoff = ""
+        step.notes = []
+        step.commands = []
+        step.command_results = []
+        step.files = []
+        step.verification = []
+        step.fetched_files = []
+        step.context_chars = 0
+        step.retries = 0
+        step.started_at = None
+        step.finished_at = None
+        run.status = RunStatus.PAUSED
+        run.error = None
+        self.store.save(run)
+        self._write_report_doc(run)
+        self.bus.publish(
+            run.id,
+            "status",
+            status=run.status.value,
+            message=(
+                f"已回滚第 {step_id} 步：还原 {len(summary['restored'])} 个、"
+                f"删除 {len(summary['removed'])} 个文件。"
+            ),
+        )
+        return self.store.load(run_id), summary
+
     def cancel(self, run_id: str) -> Run:
         self._cancelled.add(run_id)
         run = self.store.load(run_id)
@@ -838,6 +902,114 @@ class Orchestrator:
             summary=run.metrics_summary(),
         )
         return entry
+
+    def _apply_edits(
+        self, run: Run, step: RunStep, workspace: Workspace, output: StepOutput
+    ) -> None:
+        """把一轮输出里的文件改动落到工作区，并推送 file 事件。"""
+
+        for edit in output.files:
+            change = workspace.apply_edit(edit)
+            changed = ChangedFile(
+                path=change.path,
+                action=change.action,
+                additions=change.additions,
+                deletions=change.deletions,
+                diff=change.diff,
+                size=change.size,
+                error=change.error,
+            )
+            step.files.append(changed)
+            self.bus.publish(
+                run.id,
+                "file",
+                step_id=step.id,
+                file=changed.model_dump(mode="json"),
+            )
+
+    async def _run_step_commands(
+        self,
+        run: Run,
+        step: RunStep,
+        workspace: Workspace,
+        client: RelayClient,
+        endpoint: Endpoint,
+        settings: Settings,
+        messages: list[dict[str, str]],
+        raw: str,
+        stats: CallStats,
+    ) -> tuple[str, list[CommandRun], int]:
+        """跑白名单内的验证命令；失败就把报错回灌给执行段，让它在同一步里继续修。
+
+        返回 ``(最新原始输出, 最后一轮的命令结果, 实际用掉的修正轮数)``。
+        只把**最后一轮**的结果交给状态判断——早先失败但已修好的，不该继续算失败。
+        """
+
+        rounds = 0
+        last_results: list[CommandRun] = []
+        while True:
+            requested = [str(item.get("cmd", "")) for item in step.commands if item.get("cmd")]
+            if not requested:
+                return raw, last_results, rounds
+
+            results = run_allowed(
+                requested,
+                cwd=workspace.root,
+                allowlist=settings.command_allowlist,
+                enabled=settings.allow_command_execution,
+                timeout=settings.command_timeout_seconds,
+            )
+            last_results = [CommandRun(**item.as_dict()) for item in results]
+            for item in results:
+                step.command_results.append(CommandRun(**item.as_dict()))
+                self.bus.publish(
+                    run.id,
+                    "command",
+                    step_id=step.id,
+                    result=item.as_dict(),
+                )
+            self.store.save(run)
+
+            failed = [item for item in results if not item.ok and not item.skipped]
+            if not failed or rounds >= max(0, settings.step_command_rounds):
+                return raw, last_results, rounds
+
+            rounds += 1
+            self.bus.publish(
+                run.id,
+                "status",
+                status=run.status.value,
+                message=f"第 {step.id} 步：验证命令未通过，正在按报错自动修正（第 {rounds} 轮）…",
+            )
+            retry_messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": (
+                        f"{failure_block(failed)}"
+                        f"\n\n请针对上面的报错继续修正第 {step.id} 步，"
+                        "只输出那一个 JSON 对象：需要改的文件放 files，"
+                        "改完想重新验证的命令放 commands。"
+                        "如果确认报错与你的改动无关（例如环境问题），"
+                        "请在 notes 里说明并把 blocked 设为 false。"
+                    ),
+                },
+            ]
+            output, raw = await self._call_executor(
+                run, step, client, endpoint, retry_messages, stats=stats
+            )
+            step.commands = [
+                {"cmd": item.cmd, "why": item.why} for item in output.commands if item.cmd.strip()
+            ]
+            if output.summary.strip():
+                step.summary = output.summary
+            if output.handoff.strip():
+                step.handoff = output.handoff
+            if output.notes:
+                step.notes = list(output.notes)
+            self._apply_edits(run, step, workspace, output)
+            self.store.save(run)
 
     @staticmethod
     def _resolve_requested_files(

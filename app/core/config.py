@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.errors import ConfigurationError, NotFoundError
@@ -118,6 +119,9 @@ OVERRIDABLE_FIELDS = (
     "editor_wire_api",
     "max_plan_steps",
     "allow_command_execution",
+    "command_allowlist",
+    "command_timeout_seconds",
+    "step_command_rounds",
     "request_timeout_seconds",
     "context_budget_chars",
     "file_context_max_chars",
@@ -189,6 +193,12 @@ class Settings(BaseSettings):
     max_plan_steps: int = 8
     #: 默认**不**自动执行模型给出的命令，避免不可控副作用
     allow_command_execution: bool = False
+    #: 允许执行的命令前缀白名单（逐行一条）。为空 = 什么都不执行。
+    command_allowlist: list[str] = Field(default_factory=list)
+    #: 单条命令的超时（秒）
+    command_timeout_seconds: float = 120.0
+    #: 命令失败后，允许在**同一步**内回灌报错让执行段继续修的轮数
+    step_command_rounds: int = 2
     #: 执行段可读的工作区文件树条目上限，避免上下文爆炸
     context_tree_limit: int = 120
     #: 单步上下文字符预算（超出后按优先级裁剪，而不是让模型自己压缩）

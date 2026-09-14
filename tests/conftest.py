@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from typing import Any
 
 import httpx
@@ -51,6 +52,9 @@ class FakeRelay:
         self.intent_calls = 0
         #: 注入到纲领第一步的客观检查项（用于验收测试）
         self.plan_checks: list[dict[str, Any]] | None = None
+        #: 命令执行闭环："" / "fix-after-failure"（先失败，拿到报错后修好）/ "always-fail"
+        self.command_flow = ""
+        self.python = sys.executable
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -185,6 +189,18 @@ class FakeRelay:
             "commands": [{"cmd": "echo ok", "why": "验证环境"}],
             "notes": [f"第 {step_id} 步完成"],
         }
+        if self.command_flow:
+            # 第二轮（用户消息里带着"系统已经执行过这些命令"）才给出能通过的命令，
+            # 用来验证"跑失败 → 回灌报错 → 继续修 → 复验通过"这条闭环。
+            repaired = "系统已经执行过这些命令" in user
+            if self.command_flow == "fix-after-failure" and repaired:
+                payload["summary"] = f"第 {step_id} 步：按报错修正后复验通过。"
+                payload["commands"] = [{"cmd": f"{self.python} -m pytest --version", "why": "复验"}]
+                payload["notes"] = ["按报错改好了"]
+            else:
+                payload["commands"] = [
+                    {"cmd": f"{self.python} -m pytest __no_such_tests_dir__", "why": "验证"}
+                ]
         return json.dumps(payload, ensure_ascii=False)
 
 

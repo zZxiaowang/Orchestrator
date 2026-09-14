@@ -549,6 +549,39 @@ async function main() {
       check("存在已完成步骤的运行记录", false, "列表为空，请先在演示模式下跑一次");
     }
 
+    // 3a2) 自开发相关：命令白名单可配置 + 步骤卡片能回滚
+    await cdp.clickSelector("#settings-btn");
+    await sleep(400);
+    const allowlistFilled = await cdp.evaluate(`(() => {
+      const el = document.getElementById("f-command-allowlist");
+      if (!el) return null;
+      el.value = "python -m pytest";
+      return el.value;
+    })()`);
+    await cdp.clickSelector("#settings-save");
+    await sleep(700);
+    const savedAllowlist = await cdp.evaluate(`(async () => {
+      const response = await fetch("/api/v1/settings");
+      const payload = await response.json();
+      return (payload.command_allowlist || []).join("|");
+    })()`);
+    check(
+      "设置里可配置命令白名单并保存",
+      allowlistFilled === "python -m pytest" && savedAllowlist.includes("python -m pytest"),
+      JSON.stringify({ filled: allowlistFilled, saved: savedAllowlist }),
+    );
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(250);
+
+    const revertLabels = await cdp.evaluate(
+      `Array.from(document.querySelectorAll(".step-actions button")).map((el) => el.textContent.trim())`,
+    );
+    check(
+      "步骤卡片提供一键回滚",
+      Array.isArray(revertLabels) && revertLabels.some((text) => text.includes("回滚")),
+      JSON.stringify(revertLabels),
+    );
+
     // 3b) 滚轮必须真的能滚动（flex 子项被压扁会导致"内容裁掉且滚不动"）
     for (const [label, selector] of [
       ["时间线", ".timeline"],

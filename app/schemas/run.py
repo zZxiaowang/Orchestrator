@@ -92,6 +92,22 @@ class ChangedFile(BaseModel):
     error: str = ""
 
 
+class CommandRun(BaseModel):
+    """**系统实际执行过**的命令及其结果（只是"建议"的命令不会出现在这里）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cmd: str = ""
+    ok: bool = False
+    #: 被白名单/开关拦下：没执行，仍然只是建议
+    skipped: bool = False
+    exit_code: int | None = None
+    duration_ms: int = 0
+    output: str = ""
+    truncated: bool = False
+    error: str = ""
+
+
 class PhaseMetrics(BaseModel):
     """按「阶段 + 步骤」聚合的可持久化指标。
 
@@ -151,6 +167,8 @@ class RunStep(BaseModel):
     handoff: str = ""
     notes: list[str] = Field(default_factory=list)
     commands: list[dict[str, str]] = Field(default_factory=list)
+    #: 系统实际执行过的验证命令（白名单内 + 用户开启命令执行时才会有内容）
+    command_results: list[CommandRun] = Field(default_factory=list)
     files: list[ChangedFile] = Field(default_factory=list)
     #: 本步实际发送给执行段的上下文字符数（用于观察 token 消耗）
     context_chars: int = 0
@@ -158,6 +176,8 @@ class RunStep(BaseModel):
     retries: int = 0
     #: 本步按需索取过的文件
     fetched_files: list[str] = Field(default_factory=list)
+    #: 本步开始前的 git 锚点（用于"回滚这一步"；非 git 仓库时为空）
+    git_snapshot: dict[str, Any] = Field(default_factory=dict)
     error: str = ""
     started_at: datetime | None = None
     finished_at: datetime | None = None

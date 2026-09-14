@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -9,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from app.core.config import Settings, SettingsStore
 from app.main import create_app
+from app.schemas.run import RunStatus
 from tests.conftest import FakeRelay
 
 #: 一次执行结束的全部终态（blocked = 需要用户补充信息，同样停止推进）
@@ -16,16 +19,22 @@ TERMINAL = {"done", "failed", "cancelled", "blocked"}
 
 
 def build_client(
-    tmp_path: Path, relay: FakeRelay, *, use_store_provider: bool = False
+    tmp_path: Path,
+    relay: FakeRelay,
+    *,
+    use_store_provider: bool = False,
+    settings_overrides: dict | None = None,
 ) -> TestClient:
-    settings = Settings(
-        relay_base_url="https://relay.test/v1",
-        relay_api_key="sk-test-1234567890",
-        relay_wire_api="chat_completions",
-        architect_model="gpt-5",
-        editor_model="deepseek-v4",
-        max_plan_steps=2,
-    )
+    fields = {
+        "relay_base_url": "https://relay.test/v1",
+        "relay_api_key": "sk-test-1234567890",
+        "relay_wire_api": "chat_completions",
+        "architect_model": "gpt-5",
+        "editor_model": "deepseek-v4",
+        "max_plan_steps": 2,
+    }
+    fields.update(settings_overrides or {})
+    settings = Settings(**fields)
     store = SettingsStore(tmp_path / "settings.json")
     app = create_app(
         transport=relay.transport(),
@@ -672,3 +681,162 @@ def test_verification_passes_are_recorded_not_just_failures(tmp_path: Path):
         for step in run["steps"]:
             assert step["verification"], step
             assert all(item["ok"] for item in step["verification"])
+
+
+def test_failing_verification_command_is_fed_back_and_fixed(tmp_path: Path):
+    """自开发闭环：跑命令失败 → 报错回灌 → 执行段继续修 → 复验通过。"""
+
+    relay = FakeRelay()
+    relay.command_flow = "fix-after-failure"
+    with build_client(
+        tmp_path,
+        relay,
+        settings_overrides={
+            "allow_command_execution": True,
+            "command_allowlist": [sys.executable],
+            "step_command_rounds": 2,
+        },
+    ) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架并跑通验证"}).json()["run"][
+            "id"
+        ]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        step = run["steps"][0]
+        results = step["command_results"]
+        # 第一次失败、修正后第二次通过——两次都留在记录里
+        assert [item["ok"] for item in results] == [False, True]
+        assert results[0]["exit_code"] not in (0, None)
+        assert step["status"] == "done"
+
+        # 关键：失败输出真的回到了执行段的上下文里（第二轮请求里能看到）
+        followups = [
+            item
+            for item in relay.requests
+            if "系统已经执行过这些命令" in item["body"]["messages"][-1]["content"]
+        ]
+        assert followups, "应当有第二轮请求带着失败输出"
+        assert "__no_such_tests_dir__" in followups[-1]["body"]["messages"][-1]["content"]
+
+
+def test_command_failure_after_rounds_blocks_the_step(tmp_path: Path):
+    """修不回来就不许标完成：轮次用尽后该步 blocked，报错摊开。"""
+
+    relay = FakeRelay()
+    relay.command_flow = "always-fail"
+    with build_client(
+        tmp_path,
+        relay,
+        settings_overrides={
+            "allow_command_execution": True,
+            "command_allowlist": [sys.executable],
+            "step_command_rounds": 1,
+        },
+    ) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架并跑通验证"}).json()["run"][
+            "id"
+        ]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "blocked", run
+        step = run["steps"][0]
+        assert step["status"] == "blocked"
+        assert "验证命令未通过" in step["error"]
+        assert len(step["command_results"]) == 2  # 首轮 + 一轮修正
+
+
+def test_non_whitelisted_command_stays_a_suggestion(tmp_path: Path):
+    """白名单外的命令永不执行——只是建议，步骤照样能完成。"""
+
+    relay = FakeRelay()
+    relay.command_flow = "always-fail"
+    with build_client(
+        tmp_path,
+        relay,
+        settings_overrides={
+            "allow_command_execution": True,
+            "command_allowlist": ["some-other-tool"],
+        },
+    ) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        step = run["steps"][0]
+        assert step["command_results"], step
+        assert all(item["skipped"] for item in step["command_results"])
+        assert all(item["exit_code"] is None for item in step["command_results"])
+
+
+def _init_project_repo(path: Path) -> Path:
+    """一个有初始提交的真实项目目录（模拟"让它改自己的仓库"）。"""
+
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.name", "测试"),
+        ("config", "user.email", "test@example.com"),
+    ):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    (path / "README.md").write_text("# 示例项目\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def test_step_can_be_reverted_with_git(tmp_path: Path):
+    """自开发的安全网：改错了能一键把这一步的改动还原回去。"""
+
+    project = _init_project_repo(tmp_path / "project")
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post(
+            "/api/v1/runs", json={"task": "改一下这个项目", "target_dir": str(project)}
+        ).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        created = project / "steps" / "step-1.md"
+        assert created.is_file()
+        assert run["steps"][0]["git_snapshot"]["head"], "应当记录步骤级 git 锚点"
+
+        reverted = client.post(f"/api/v1/runs/{run_id}/steps/1/revert").json()
+        assert reverted["action"] == "revert_step"
+        assert "steps/step-1.md" in reverted["reverted"]["removed"]
+        assert not created.exists()
+        assert reverted["reverted"]["errors"] == []
+
+        step = reverted["run"]["steps"][0]
+        assert step["status"] == "pending"
+        assert step["files"] == []
+        assert reverted["run"]["status"] == "paused"
+
+
+def test_revert_is_refused_while_running(tmp_path: Path):
+    """运行中不许回滚：否则刚写下的文件会和正在跑的步骤打架。"""
+
+    project = _init_project_repo(tmp_path / "project")
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post(
+            "/api/v1/runs", json={"task": "改一下这个项目", "target_dir": str(project)}
+        ).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+
+        # 人为把它标成"执行中"：真实场景就是某一步正在跑的时候
+        orchestrator = client.app.state.orchestrator
+        running = orchestrator.store.load(run_id)
+        running.status = RunStatus.EXECUTING
+        orchestrator.store.save(running)
+
+        response = client.post(f"/api/v1/runs/{run_id}/steps/1/revert")
+        assert response.status_code == 409

@@ -147,6 +147,7 @@ const api = {
   activateProvider: (id) => request("POST", `/api/v1/providers/${id}/activate`, {}),
   testProvider: (id) => request("POST", `/api/v1/providers/${id}/test`, {}),
   routes: (body) => request("PUT", "/api/v1/routes", body),
+  revertStep: (id, stepId) => request("POST", `/api/v1/runs/${id}/steps/${stepId}/revert`, {}),
   marketCapabilities: () => request("GET", "/api/v1/market/capabilities"),
   marketSources: () => request("GET", "/api/v1/market/sources"),
   addMarketSource: (manifestUrl) =>
@@ -1109,6 +1110,40 @@ function renderStepCard(step) {
       )
     );
   }
+  // 系统实际执行过的验证命令：退出码与输出都要能看见，否则"跑没跑"无从判断
+  if (step.command_results?.length) {
+    const ran = step.command_results.filter((item) => !item.skipped);
+    const passed = ran.filter((item) => item.ok).length;
+    body.append(
+      h("h3", {
+        class: "section-label",
+        text: ran.length
+          ? `验证命令（系统已执行 ${passed}/${ran.length} 通过）`
+          : "验证命令（未执行：不在白名单或未开启）",
+      })
+    );
+    for (const item of step.command_results) {
+      const line = item.skipped
+        ? `— ${item.cmd}：${item.error || "未执行"}`
+        : `${item.ok ? "✓" : "✗"} ${item.cmd}（退出码 ${item.exit_code ?? "—"}，${(
+            (item.duration_ms || 0) / 1000
+          ).toFixed(1)}s）`;
+      const row = h("div", {
+        class: `cmd-row ${item.skipped ? "muted" : item.ok ? "verify-ok" : "verify-fail"}`,
+        text: line,
+      });
+      if (item.output) {
+        row.classList.add("clickable");
+        const pre = h("pre", { class: "cmd-output", hidden: true, text: item.output });
+        row.addEventListener("click", () => {
+          pre.hidden = !pre.hidden;
+        });
+        body.append(row, pre);
+      } else {
+        body.append(row);
+      }
+    }
+  }
   if (step.notes?.length) {
     body.append(h("h3", { class: "section-label", text: "说明" }));
     body.append(h("ul", { class: "list" }, ...step.notes.map((item) => h("li", { text: item }))));
@@ -1157,6 +1192,37 @@ function renderStepCard(step) {
     body.append(h("ul", { class: "list" }, ...step.acceptance.map((item) => h("li", { text: item }))));
   }
 
+  // 自开发的安全网：改错了可以一键把这一步的改动还原（只动这一步碰过的文件）
+  const busy = ["planning", "executing"].includes(state.run?.status);
+  if ((step.files || []).length > 0 && !busy) {
+    const revert = h("button", { class: "btn ghost small", type: "button", text: "回滚这一步" });
+    revert.addEventListener(
+      "click",
+      safe(async () => {
+        const ok = await appConfirm({
+          title: `回滚第 ${step.id} 步`,
+          message:
+            "将把这一步改动过的文件还原到改动前（这一步新建的文件会被删除）。\n" +
+            "其他未提交的改动不受影响。",
+          confirmText: "回滚",
+          danger: true,
+        });
+        if (!ok) return;
+        const payload = await api.revertStep(state.run.id, step.id);
+        state.run = payload.run;
+        state.buffers = {};
+        render();
+        const reverted = payload.reverted || {};
+        showToast(
+          `已回滚：还原 ${(reverted.restored || []).length} 个、删除 ${
+            (reverted.removed || []).length
+          } 个文件。`
+        );
+      })
+    );
+    body.append(h("div", { class: "step-actions" }, revert));
+  }
+
   return h(
     "div",
     { class: "card step", dataset: { step: step.id, status } },
@@ -1174,6 +1240,11 @@ function renderStepCard(step) {
             : "") +
           (step.verification?.length
             ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
+            : "") +
+          (step.command_results?.length
+            ? ` · 命令 ${
+                step.command_results.filter((item) => !item.skipped && item.ok).length
+              }/${step.command_results.filter((item) => !item.skipped).length} 通过`
             : ""),
       }),
       copyButton(
@@ -1458,6 +1529,10 @@ function openSettings() {
   if (!settings) return;
   document.getElementById("f-max-steps").value = settings.max_plan_steps || 8;
   document.getElementById("f-allow-cmd").checked = Boolean(settings.allow_command_execution);
+  document.getElementById("f-command-allowlist").value = (
+    settings.command_allowlist || []
+  ).join("\n");
+  document.getElementById("f-command-rounds").value = settings.step_command_rounds ?? 2;
   document.getElementById("settings-modal").hidden = false;
   refreshProviders().then(() => {
     const target = state.editingProviderId || state.activeProviderId;
@@ -1739,6 +1814,11 @@ async function saveProviderForm() {
   const globals = {
     max_plan_steps: Number(document.getElementById("f-max-steps").value) || 8,
     allow_command_execution: document.getElementById("f-allow-cmd").checked,
+    command_allowlist: String(document.getElementById("f-command-allowlist").value || "")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+    step_command_rounds: Number(document.getElementById("f-command-rounds").value) || 0,
   };
   const result = state.editingProviderId
     ? await api.updateProvider(state.editingProviderId, data)

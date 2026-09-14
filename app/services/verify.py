@@ -22,6 +22,7 @@ from typing import Any
 
 from app.core.errors import WorkspaceError
 from app.schemas.plan import CheckResult, StepCheck
+from app.services.gitguard import safe_relative
 from app.services.workspace import Workspace
 
 #: 单个文件最多读取多少字符再判定（避免一个巨大的产物把验收拖死）
@@ -73,7 +74,9 @@ def derive_checks(deliverables: Iterable[str]) -> list[StepCheck]:
         text = str(raw or "").strip()
         if not _looks_like_path(text):
             continue
-        path = text.replace("\\", "/").lstrip("./")
+        path = safe_relative(text)
+        if path is None:
+            continue
         if path.lower() in seen:
             continue
         seen.add(path.lower())
@@ -218,7 +221,7 @@ def _read(path: Path) -> str:
 
 
 def _glob(workspace: Workspace, pattern: str) -> list[str]:
-    normalized = pattern.replace("\\", "/").lstrip("./")
+    normalized = safe_relative(pattern) or ""
     return [
         item
         for item in workspace.tree(limit=400, max_depth=8)

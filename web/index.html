@@ -209,7 +209,19 @@
           </div>
           <label class="checkbox">
             <input type="checkbox" id="f-allow-cmd" />
-            <span>允许自动执行执行段给出的命令（默认关闭，仅展示）</span>
+            <span>允许执行验证命令（默认关闭，仅展示建议）</span>
+          </label>
+          <label class="field">
+            <span>命令白名单：允许执行的前缀，每行一条（不在名单里的一律不执行）</span>
+            <textarea
+              id="f-command-allowlist"
+              rows="3"
+              placeholder="python -m pytest&#10;python -m ruff&#10;node scripts/ui_check.mjs"
+            ></textarea>
+          </label>
+          <label class="field">
+            <span>验证命令失败后，允许自动修正的轮数（0 = 不自动修）</span>
+            <input id="f-command-rounds" type="number" min="0" max="5" />
           </label>
           <div class="modal-status" id="settings-status"></div>
         </div>

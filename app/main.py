@@ -45,8 +45,16 @@ STATUS_BY_ERROR: tuple[tuple[type[AppError], int], ...] = (
     (RelayError, 502),
 )
 
+#: 按错误码给出的更精确状态码（覆盖"按类型"的默认值）：
+#: 这类失败不是请求本身写错了，而是**当前状态不允许**——409 更贴切。
+STATUS_BY_CODE: dict[str, int] = {
+    "run_busy": 409,
+}
+
 
 def _status_for(exc: AppError) -> int:
+    if exc.code in STATUS_BY_CODE:
+        return STATUS_BY_CODE[exc.code]
     for error_type, status in STATUS_BY_ERROR:
         if isinstance(exc, error_type):
             return status
