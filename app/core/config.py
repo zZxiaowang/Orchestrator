@@ -207,6 +207,8 @@ class Settings(BaseSettings):
     step_fetch_rounds: int = 3
     #: 每轮最多取回的文件数
     step_file_fetch_limit: int = 6
+    #: Git 面板操作的仓库目录；留空 = 本项目目录
+    git_dir: str = ""
 
     # ── 主备降级（备用字段全空 = 不启用自动降级）──
     #: 备用端点必须 base_url + api_key 成对填写，只填一半会在保存时被拦下

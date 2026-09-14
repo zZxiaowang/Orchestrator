@@ -44,6 +44,9 @@
               <button class="foot-btn" id="plugins-btn" data-entry="plugins" type="button">
                 <span class="foot-icon">◫</span><span class="foot-label">已装插件</span>
               </button>
+              <button class="foot-btn" id="git-btn" data-entry="git" type="button">
+                <span class="foot-icon">⑂</span><span class="foot-label">Git 提交</span>
+              </button>
               <button class="foot-btn" id="updates-btn" data-entry="updates" type="button">
                 <span class="foot-icon">↑</span><span class="foot-label">更新与版本</span>
               </button>
@@ -229,6 +232,17 @@
           <button class="icon-btn" id="market-close">✕</button>
         </div>
         <div class="modal-body" id="market-body"></div>
+      </div>
+    </div>
+
+    <div class="modal-backdrop" id="git-modal" hidden>
+      <div class="modal market-modal">
+        <div class="modal-head">
+          <h2>Git</h2>
+          <span class="muted-small" id="git-summary"></span>
+          <button class="icon-btn" id="git-close">✕</button>
+        </div>
+        <div class="modal-body" id="git-body"></div>
       </div>
     </div>
 

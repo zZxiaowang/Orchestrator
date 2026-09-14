@@ -1,0 +1,119 @@
+"""简化版 Git 服务：状态 / 差异 / 提交 / 历史 / 自动提交脚本。"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from app.services.git_service import GitError, GitService
+
+
+def _init_repo(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ("init", "-b", "main"),
+        ("config", "user.name", "测试"),
+        ("config", "user.email", "test@example.com"),
+    ):
+        subprocess.run(["git", *args], cwd=path, check=True, capture_output=True)
+    return path
+
+
+def test_status_lists_changes_with_labels(tmp_path: Path):
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    assert service.status()["is_repo"] is True
+
+    (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+    status = service.status()
+    assert status["clean"] is False
+    entry = status["files"][0]
+    assert entry["path"] == "a.txt"
+    assert entry["label"] == "?"  # 未跟踪
+    assert entry["staged"] is False
+
+
+def test_diff_commit_log_flow(tmp_path: Path):
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    (repo / "a.txt").write_text("第一行\n", encoding="utf-8")
+
+    # 未跟踪文件的差异用内容片段呈现
+    assert "第一行" in service.diff("a.txt")
+
+    result = service.commit("feat: 初始提交")
+    assert result["committed"] is True
+    assert result["commit"]["subject"] == "feat: 初始提交"
+    assert service.status()["clean"] is True
+
+    # 修改后再提交，历史里应有两笔
+    (repo / "a.txt").write_text("第一行\n第二行\n", encoding="utf-8")
+    assert "+第二行" in service.diff("a.txt")
+    service.commit("fix: 追加一行")
+    commits = service.log(10)
+    assert [item["subject"] for item in commits][:2] == ["fix: 追加一行", "feat: 初始提交"]
+    assert service.branches()["all"] == ["main"]
+
+
+def test_commit_requires_message_and_skips_empty(tmp_path: Path):
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    (repo / "a.txt").write_text("x\n", encoding="utf-8")
+
+    with pytest.raises(GitError):
+        service.commit("   ")
+
+    service.commit("chore: 第一次")
+    again = service.commit("chore: 没有改动")
+    assert again["committed"] is False
+    assert "没有需要提交的改动" in again["reason"]
+
+
+def test_stage_and_unstage(tmp_path: Path):
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    (repo / "a.txt").write_text("x\n", encoding="utf-8")
+    (repo / "b.txt").write_text("y\n", encoding="utf-8")
+
+    service.stage(["a.txt"])
+    by_path = {item["path"]: item for item in service.status()["files"]}
+    assert by_path["a.txt"]["staged"] is True
+    assert by_path["b.txt"]["staged"] is False
+
+    service.unstage(["a.txt"])
+    by_path = {item["path"]: item for item in service.status()["files"]}
+    assert by_path["a.txt"]["staged"] is False
+
+
+def test_path_escape_is_rejected(tmp_path: Path):
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    for bad in ("../outside.txt", "..\\outside.txt", "C:/Windows/x.txt"):
+        with pytest.raises(GitError):
+            service.diff(bad)
+
+
+def test_non_repo_reports_cleanly(tmp_path: Path):
+    service = GitService(tmp_path / "not-a-repo")
+    status = service.status()
+    assert status["is_repo"] is False
+    assert str(service.repo) in status["repo"]
+
+
+def test_auto_commit_script_commits_changes(tmp_path: Path):
+    """自动提交脚本：有改动就提交，无改动就跳过（用临时仓库验证，不动真实项目）。"""
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    (repo / "auto.txt").write_text("每日自动提交\n", encoding="utf-8")
+
+    first = service.run_auto_commit_now()
+    assert first["ok"] is True, first["output"]
+    assert "已提交 1 个文件" in first["output"]
+    subjects = [item["subject"] for item in service.log(5)]
+    assert subjects and subjects[0].startswith("chore(auto): 每日自动提交")
+    assert service.status()["clean"] is True
+
+    second = service.run_auto_commit_now()
+    assert "无改动，跳过提交" in second["output"]

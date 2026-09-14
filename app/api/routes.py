@@ -22,6 +22,7 @@ from app.core.errors import AppError, NotFoundError
 from app.core.plugins import PluginStore
 from app.core.providers import KIND_PRESETS
 from app.core.relay import RelayClient
+from app.services.git_service import GitService
 from app.services.orchestrator import Orchestrator
 from app.services.workspace import Workspace
 
@@ -137,6 +138,15 @@ def _plugins(request: Request) -> PluginStore:
 
 def _catalog(request: Request) -> CatalogStore:
     return request.app.state.catalog_store  # type: ignore[no-any-return]
+
+
+def _git(request: Request) -> GitService:
+    """Git 面板操作的仓库：默认就是本项目目录（可用 GIT_DIR 覆盖）。"""
+    from app.core.config import ORCHESTRATOR_ROOT
+
+    settings = _settings(request)
+    repo = Path(settings.git_dir).expanduser() if settings.git_dir else ORCHESTRATOR_ROOT
+    return GitService(repo)
 
 
 def plugins_payload(store: PluginStore) -> dict[str, Any]:
@@ -546,6 +556,91 @@ async def list_run_docs(run_id: str, request: Request) -> dict[str, Any]:
 
 
 # ── 插件市场 ──
+
+
+class GitPathsRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+
+
+class GitCommitRequest(BaseModel):
+    message: str = Field("", description="提交信息")
+    paths: list[str] = Field(default_factory=list, description="留空 = 提交全部改动")
+    add_all: bool = True
+
+
+class GitAutoCommitRequest(BaseModel):
+    push: bool = Field(False, description="提交后是否同时推送（默认只提交到本地）")
+
+
+@router.get("/git/status")
+async def git_status(request: Request) -> dict[str, Any]:
+    return _git(request).status()
+
+
+@router.get("/git/log")
+async def git_log(request: Request, limit: int = 30) -> dict[str, Any]:
+    service = _git(request)
+    return {"commits": service.log(limit), "branches": service.branches()}
+
+
+@router.get("/git/diff")
+async def git_diff(request: Request, path: str, staged: bool = False) -> dict[str, Any]:
+    return {"path": path, "staged": staged, "diff": _git(request).diff(path, staged=staged)}
+
+
+@router.post("/git/stage")
+async def git_stage(payload: GitPathsRequest, request: Request) -> dict[str, Any]:
+    service = _git(request)
+    service.stage(payload.paths)
+    return service.status()
+
+
+@router.post("/git/unstage")
+async def git_unstage(payload: GitPathsRequest, request: Request) -> dict[str, Any]:
+    service = _git(request)
+    service.unstage(payload.paths)
+    return service.status()
+
+
+@router.post("/git/commit")
+async def git_commit(payload: GitCommitRequest, request: Request) -> dict[str, Any]:
+    service = _git(request)
+    result = service.commit(payload.message, paths=payload.paths, add_all=payload.add_all)
+    return {**result, "status": service.status()}
+
+
+@router.post("/git/push")
+async def git_push(request: Request) -> dict[str, Any]:
+    service = _git(request)
+    return {**service.push(), "status": service.status()}
+
+
+@router.post("/git/pull")
+async def git_pull(request: Request) -> dict[str, Any]:
+    service = _git(request)
+    return {**service.pull(), "status": service.status()}
+
+
+@router.get("/git/auto-commit")
+async def git_auto_commit_status(request: Request) -> dict[str, Any]:
+    """每日开机自动提交的开关状态。"""
+    return _git(request).auto_commit_status()
+
+
+@router.post("/git/auto-commit")
+async def git_auto_commit_enable(payload: GitAutoCommitRequest, request: Request) -> dict[str, Any]:
+    return _git(request).enable_auto_commit(push=payload.push)
+
+
+@router.delete("/git/auto-commit")
+async def git_auto_commit_disable(request: Request) -> dict[str, Any]:
+    return _git(request).disable_auto_commit()
+
+
+@router.post("/git/auto-commit/run")
+async def git_auto_commit_run(request: Request) -> dict[str, Any]:
+    """立刻跑一次自动提交逻辑（验证开关是否按预期工作）。"""
+    return _git(request).run_auto_commit_now()
 
 
 @router.get("/market/capabilities")

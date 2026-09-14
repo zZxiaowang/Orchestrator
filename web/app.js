@@ -157,6 +157,16 @@ const api = {
   enablePlugin: (id) => request("POST", `/api/v1/plugins/${id}/enable`, {}),
   disablePlugin: (id) => request("POST", `/api/v1/plugins/${id}/disable`, {}),
   uninstallPlugin: (id) => request("DELETE", `/api/v1/plugins/${id}`),
+  gitStatus: () => request("GET", "/api/v1/git/status"),
+  gitLog: () => request("GET", "/api/v1/git/log?limit=15"),
+  gitDiff: (path) => request("GET", `/api/v1/git/diff?path=${encodeURIComponent(path)}`),
+  gitCommit: (body) => request("POST", "/api/v1/git/commit", body),
+  gitPush: () => request("POST", "/api/v1/git/push", {}),
+  gitPull: () => request("POST", "/api/v1/git/pull", {}),
+  gitAutoCommit: () => request("GET", "/api/v1/git/auto-commit"),
+  gitAutoCommitEnable: (push) => request("POST", "/api/v1/git/auto-commit", { push }),
+  gitAutoCommitDisable: () => request("DELETE", "/api/v1/git/auto-commit"),
+  gitAutoCommitRun: () => request("POST", "/api/v1/git/auto-commit/run", {}),
 };
 
 const STATUS_TEXT = {
@@ -254,6 +264,11 @@ function bindEvents() {
   });
   on("market-btn", "click", () => openMarket("market"));
   on("plugins-btn", "click", () => openMarket("installed"));
+  on("git-btn", "click", openGitPanel);
+  on("git-close", "click", closeGitPanel);
+  on("git-modal", "click", (event) => {
+    if (event.target.id === "git-modal") closeGitPanel();
+  });
   on("updates-btn", "click", showVersionInfo);
   on("market-close", "click", closeMarket);
   on("market-tabs", "click", (event) => {
@@ -1759,6 +1774,214 @@ function showVersionInfo() {
   );
 }
 
+/* ── Git 面板（简化版 IDEA Git 工具窗）──────────────────────── */
+
+async function openGitPanel() {
+  const modal = document.getElementById("git-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  document.getElementById("git-body").replaceChildren(h("p", { class: "muted", text: "读取仓库状态…" }));
+  await renderGitPanel();
+}
+
+function closeGitPanel() {
+  const modal = document.getElementById("git-modal");
+  if (modal) modal.hidden = true;
+}
+
+async function renderGitPanel() {
+  const body = document.getElementById("git-body");
+  let status;
+  let history = { commits: [], branches: { current: "", all: [] } };
+  let auto;
+  try {
+    [status, history, auto] = await Promise.all([
+      api.gitStatus(),
+      api.gitLog(),
+      api.gitAutoCommit(),
+    ]);
+  } catch (error) {
+    body.replaceChildren(h("div", { class: "error-box", text: error.message }));
+    return;
+  }
+  if (!status.is_repo) {
+    body.replaceChildren(
+      h("p", { class: "muted", text: `当前目录不是 git 仓库：${status.repo}` })
+    );
+    return;
+  }
+  document.getElementById("git-summary").textContent =
+    `${status.branch}　↑${status.ahead} ↓${status.behind}　${status.remote || "无远端"}`;
+
+  const nodes = [];
+
+  // 顶部操作
+  const actions = h("div", { class: "market-toolbar" });
+  for (const [label, handler] of [
+    ["刷新", async () => renderGitPanel()],
+    ["拉取", async () => runGitAction(() => api.gitPull(), "拉取")],
+    ["推送", async () => runGitAction(() => api.gitPush(), "推送")],
+  ]) {
+    const button = h("button", { class: "btn ghost", text: label });
+    button.addEventListener("click", safe(handler));
+    actions.append(button);
+  }
+  nodes.push(actions);
+
+  // 变更列表
+  nodes.push(h("h3", { class: "section-label", text: `变更（${status.files.length}）` }));
+  if (!status.files.length) {
+    nodes.push(h("p", { class: "muted-small", text: "工作区干净，没有待提交的改动。" }));
+  } else {
+    const list = h("div", { class: "checklist" });
+    for (const file of status.files) {
+      const row = h(
+        "div",
+        { class: "check-item", dataset: { file: file.path } },
+        h(
+          "div",
+          { class: "check-title" },
+          h("span", { class: "badge", text: file.label }),
+          h("span", { class: "file-path", text: file.path }),
+          h("span", { class: "muted-small", text: file.staged ? "已暂存" : "未暂存" })
+        )
+      );
+      const diffButton = h("button", { class: "copy-btn", text: "看差异" });
+      diffButton.addEventListener(
+        "click",
+        safe(async (event) => {
+          event.stopPropagation();
+          const payload = await api.gitDiff(file.path);
+          const pre = h("div", { class: "diff" });
+          for (const line of (payload.diff || "（无差异）").split("\n")) {
+            let cls = "diff-line";
+            if (line.startsWith("@@")) cls += " hunk";
+            else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+            else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+            pre.append(h("div", { class: cls, text: line }));
+          }
+          row.querySelector(".diff")?.remove();
+          row.append(pre);
+        })
+      );
+      row.querySelector(".check-title").append(diffButton);
+      list.append(row);
+    }
+    nodes.push(list);
+  }
+
+  // 提交
+  const message = h("textarea", {
+    class: "feedback",
+    placeholder: "提交信息，例如：feat: 增加 Git 面板与每日自动提交开关",
+  });
+  const commitButton = h("button", {
+    class: "btn primary",
+    text: `提交全部改动（${status.files.length} 个文件）`,
+  });
+  commitButton.disabled = !status.files.length;
+  commitButton.addEventListener(
+    "click",
+    safe(async () => {
+      commitButton.disabled = true;
+      try {
+        const result = await api.gitCommit({ message: message.value.trim(), paths: [], add_all: true });
+        showToast(
+          result.committed
+            ? `已提交：${result.commit?.hash || ""} ${result.commit?.subject || ""}`
+            : result.reason || "没有可提交的改动"
+        );
+        await renderGitPanel();
+      } finally {
+        commitButton.disabled = false;
+      }
+    })
+  );
+  nodes.push(h("h3", { class: "section-label", text: "提交" }), message, h("div", { class: "approval-actions" }, commitButton));
+
+  // 每日开机自动提交
+  const toggle = h("input", { type: "checkbox" });
+  toggle.checked = Boolean(auto.enabled);
+  toggle.addEventListener(
+    "change",
+    safe(async () => {
+      try {
+        const result = toggle.checked
+          ? await api.gitAutoCommitEnable(pushInput.checked)
+          : await api.gitAutoCommitDisable();
+        toggle.checked = Boolean(result.enabled);
+        autoStatus.textContent = result.detail || "";
+        showToast(result.enabled ? "已开启：登录 Windows 时自动提交" : "已关闭自动提交");
+      } catch (error) {
+        toggle.checked = !toggle.checked;
+        showToast(error.message);
+      }
+    })
+  );
+  const pushInput = h("input", { type: "checkbox" });
+  pushInput.checked = Boolean(auto.push);
+  const autoStatus = h("div", { class: "muted-small", text: auto.detail || "" });
+  const runNow = h("button", { class: "btn ghost", text: "立即执行一次" });
+  runNow.addEventListener(
+    "click",
+    safe(async () => {
+      const result = await api.gitAutoCommitRun();
+      showToast(result.ok ? "已执行（详见 .logs\\auto-commit.log）" : "执行失败，详见日志");
+      await renderGitPanel();
+    })
+  );
+  nodes.push(
+    h("h3", { class: "section-label", text: "每日开机自动提交" }),
+    h(
+      "div",
+      { class: "check-item" },
+      h(
+        "label",
+        { class: "checkbox" },
+        toggle,
+        h("span", { text: "每天打开电脑（登录 Windows）时自动提交一次" })
+      ),
+      h("label", { class: "checkbox" }, pushInput, h("span", { text: "提交后同时推送到远端" })),
+      autoStatus,
+      h("div", { class: "approval-actions" }, runNow)
+    )
+  );
+
+  // 历史
+  nodes.push(h("h3", { class: "section-label", text: "最近提交" }));
+  nodes.push(
+    h(
+      "div",
+      { class: "checklist" },
+      ...history.commits.map((commit) =>
+        h(
+          "div",
+          { class: "check-item" },
+          h(
+            "div",
+            { class: "check-title" },
+            h("span", { class: "badge", text: commit.hash }),
+            h("span", { text: commit.subject })
+          ),
+          h("div", { class: "check-goal", text: `${commit.author} · ${commit.date}` })
+        )
+      )
+    )
+  );
+
+  body.replaceChildren(...nodes);
+}
+
+async function runGitAction(action, label) {
+  const result = await action();
+  showToast(
+    result.ok
+      ? `${label}完成`
+      : `${label}失败：${(result.hint || result.stderr || "").slice(0, 120)}`
+  );
+  await renderGitPanel();
+}
+
 /* ── 命令面板（Ctrl+K，Codex 式）── */
 
 function paletteCommands() {
@@ -1768,6 +1991,7 @@ function paletteCommands() {
     { id: "open-plugins", label: "查看已装插件", hint: "启用 / 禁用 / 卸载", run: () => openMarket("installed") },
     { id: "open-sources", label: "管理目录来源", hint: "添加 HTTPS 目录清单", run: () => openMarket("sources") },
     { id: "open-settings", label: "打开设置", hint: "中转 / 个人 Key、分段路由", run: openSettings },
+    { id: "open-git", label: "打开 Git 面板", hint: "提交 / 推送 / 每日自动提交开关", run: openGitPanel },
     {
       id: "toggle-sidebar",
       label: "折叠 / 展开左侧任务栏",
