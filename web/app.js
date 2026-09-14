@@ -62,6 +62,8 @@ const state = {
   panelOpen: false,
   //: 分段路由弹窗当前编辑哪一段（architect / editor / both）
   routeStage: "both",
+  //: 设置弹窗当前分区
+  settingsSection: "model",
   renderQueued: false,
   providers: [],
   activeProviderId: "",
@@ -264,7 +266,25 @@ function bindEvents() {
       submitTask();
     }
   });
-  on("settings-btn", "click", openSettings);
+  // 注意：这里不能直接把 openSettings 当处理器——它第一个参数是"要显示哪个分区"，
+  // 直接传会把 MouseEvent 当成分区名，结果四个分区全部隐藏。
+  on("settings-btn", "click", () => openSettings());
+  on("settings-nav", "click", (event) => {
+    const item = event.target.closest(".settings-nav-item");
+    if (item) switchSettingsSection(item.dataset.section);
+  });
+  on("settings-open-market", "click", () => {
+    closeSettings();
+    openMarket("market");
+  });
+  on("settings-open-git", "click", () => {
+    closeSettings();
+    openGitPanel();
+  });
+  on("settings-open-stats", "click", () => {
+    closeSettings();
+    switchInspectorTab("plan");
+  });
   on("settings-close", "click", closeSettings);
   on("settings-cancel", "click", closeSettings);
   on("route-close", "click", closeRouteModal);
@@ -1620,7 +1640,19 @@ function startNewRun() {
 
 /* ── 设置 ── */
 
-function openSettings() {
+/** 设置分区切换（模型与路由 / 命令与安全 / 行为与上下文 / 插件与 Git）。 */
+function switchSettingsSection(section) {
+  const target = section || "model";
+  state.settingsSection = target;
+  document.querySelectorAll("#settings-nav .settings-nav-item").forEach((node) => {
+    node.classList.toggle("active", node.dataset.section === target);
+  });
+  document.querySelectorAll(".settings-section").forEach((node) => {
+    node.hidden = node.dataset.section !== target;
+  });
+}
+
+function openSettings(section = "model") {
   const settings = state.settings;
   if (!settings) return;
   document.getElementById("f-max-steps").value = settings.max_plan_steps || 8;
@@ -1629,6 +1661,7 @@ function openSettings() {
     settings.command_allowlist || []
   ).join("\n");
   document.getElementById("f-command-rounds").value = settings.step_command_rounds ?? 2;
+  switchSettingsSection(section || state.settingsSection || "model");
   document.getElementById("settings-modal").hidden = false;
   refreshProviders().then(() => {
     const target = state.editingProviderId || state.activeProviderId;

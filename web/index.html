@@ -128,13 +128,22 @@
           <h2>中转与模型设置</h2>
           <button class="icon-btn" id="settings-close">✕</button>
         </div>
-        <div class="modal-body">
-          <p class="hint">
-            可以保存多套配置（中转网关 / 个人 Key 直连），随时切换、互不覆盖。密钥明文保存在本机
-            <code>orchestrator/data/settings.json</code>（已在 .gitignore 中排除）。
-          </p>
+        <div class="modal-body settings-body">
+          <nav class="settings-nav" id="settings-nav">
+            <button class="settings-nav-item active" data-section="model" type="button">模型与路由</button>
+            <button class="settings-nav-item" data-section="command" type="button">命令与安全</button>
+            <button class="settings-nav-item" data-section="behavior" type="button">行为与上下文</button>
+            <button class="settings-nav-item" data-section="integrations" type="button">插件与 Git</button>
+          </nav>
 
-          <div class="provider-bar">
+          <div class="settings-sections">
+          <section class="settings-section" data-section="model">
+            <p class="hint">
+              可以保存多套配置（中转网关 / 个人 Key 直连），随时切换、互不覆盖。密钥明文保存在本机
+              <code>orchestrator/data/settings.json</code>（已在 .gitignore 中排除）。
+            </p>
+
+            <div class="provider-bar">
             <select id="f-provider-select"></select>
             <button class="btn ghost" id="provider-new">＋ 新建</button>
             <button class="btn ghost" id="provider-copy">复制</button>
@@ -176,10 +185,6 @@
               </select>
             </label>
             <label class="field">
-              <span>最大步骤数</span>
-              <input id="f-max-steps" type="number" min="1" max="20" />
-            </label>
-            <label class="field">
               <span>架构段模型（GPT）</span>
               <input id="f-architect-model" placeholder="gpt-5" />
             </label>
@@ -217,6 +222,13 @@
             <button class="btn ghost" id="settings-test">测试当前配置</button>
             <span class="test-result" id="settings-test-result"></span>
           </div>
+          </section>
+
+          <section class="settings-section" data-section="command" hidden>
+            <p class="hint">
+              执行段可以把验证命令写进产出里。默认<b>只展示不执行</b>；开启后，白名单内的命令会在
+              <b>工作区内</b>真的跑，失败会把报错回灌给执行段，让它在同一步里继续修。
+            </p>
           <label class="checkbox">
             <input type="checkbox" id="f-allow-cmd" />
             <span>允许执行验证命令（默认关闭，仅展示建议）</span>
@@ -236,6 +248,33 @@
             <span>验证命令失败后，允许自动修正的轮数（0 = 不自动修）</span>
             <input id="f-command-rounds" type="number" min="0" max="5" />
           </label>
+          <p class="hint">
+            安全边界：不经过 shell（<code>| &amp; ; &gt; %</code> 等一律拒绝）、只在工作区内执行、
+            有超时与输出截断。危险命令不该进白名单。
+          </p>
+          </section>
+
+          <section class="settings-section" data-section="behavior" hidden>
+            <label class="field">
+              <span>单个任务最多拆多少步（1–20）</span>
+              <input id="f-max-steps" type="number" min="1" max="20" />
+            </label>
+            <p class="hint">
+              步骤越多，纲领越细，但每一步都要单独过验收。建议 3–8 步。
+            </p>
+          </section>
+
+          <section class="settings-section" data-section="integrations" hidden>
+            <div class="settings-actions">
+              <button class="btn ghost" id="settings-open-market" type="button">打开插件市场</button>
+              <button class="btn ghost" id="settings-open-git" type="button">打开 Git 面板</button>
+              <button class="btn ghost" id="settings-open-stats" type="button">查看运行统计</button>
+            </div>
+            <p class="hint">
+              Git 面板用于提交 / 推送 / 每日自动提交；插件市场安装声明式插件（不执行任意代码）。
+            </p>
+          </section>
+          </div>
           <div class="modal-status" id="settings-status"></div>
         </div>
         <div class="modal-foot">

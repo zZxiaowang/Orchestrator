@@ -1384,6 +1384,72 @@ textarea:focus {
   gap: 12px;
 }
 
+/* ── 设置分区：左侧小导航 + 右侧该区字段（不再一条长滚动）── */
+.settings-body {
+  flex-direction: row;
+  gap: 0;
+  padding: 0;
+  min-height: 380px;
+}
+
+.settings-nav {
+  flex: 0 0 148px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 8px;
+  border-right: 1px solid var(--border-soft);
+  background: var(--panel-2);
+}
+
+.settings-nav-item {
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12.5px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.settings-nav-item:hover {
+  background: #eef0f2;
+  color: var(--text);
+}
+
+.settings-nav-item.active {
+  background: #eaeefb;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.settings-sections {
+  flex: 1;
+  min-width: 0;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.settings-section[hidden] {
+  display: none;
+}
+
+.settings-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;

@@ -549,8 +549,53 @@ async function main() {
       check("存在已完成步骤的运行记录", false, "列表为空，请先在演示模式下跑一次");
     }
 
-    // 3a2) 自开发相关：命令白名单可配置 + 步骤卡片能回滚
-    // 3a1) 右侧明细面板默认收起（主区占满），按需滑出
+    // 3a1) 设置弹窗：分区导航（不再是一条长滚动）
+    await cdp.clickSelector("#settings-btn");
+    await sleep(400);
+    const sections = await cdp.evaluate(`(() => {
+      const items = Array.from(document.querySelectorAll("#settings-nav .settings-nav-item"));
+      const visible = Array.from(document.querySelectorAll(".settings-section"))
+        .filter((el) => !el.hidden)
+        .map((el) => el.dataset.section);
+      return {
+        nav: items.map((el) => el.textContent.trim()),
+        active: document.querySelector("#settings-nav .settings-nav-item.active")?.dataset.section,
+        visible,
+      };
+    })()`);
+    check(
+      "设置弹窗有分区导航，默认只显示「模型与路由」",
+      sections.nav.length === 4 &&
+        sections.active === "model" &&
+        JSON.stringify(sections.visible) === JSON.stringify(["model"]),
+      JSON.stringify(sections),
+    );
+    const switchToCommand = await cdp.clickSelector('#settings-nav [data-section="command"]');
+    await sleep(300);
+    const commandSection = await cdp.evaluate(`(() => {
+      const visible = Array.from(document.querySelectorAll(".settings-section"))
+        .filter((el) => !el.hidden)
+        .map((el) => el.dataset.section);
+      const box = document.getElementById("f-command-allowlist");
+      const modelField = document.getElementById("f-provider-name");
+      return {
+        visible,
+        allowlistShown: Boolean(box) && box.getBoundingClientRect().height > 0,
+        modelShown: Boolean(modelField) && modelField.getBoundingClientRect().height > 0,
+      };
+    })()`);
+    check(
+      "切到「命令与安全」只显示该区字段",
+      switchToCommand.hit &&
+        JSON.stringify(commandSection.visible) === JSON.stringify(["command"]) &&
+        commandSection.allowlistShown &&
+        !commandSection.modelShown,
+      JSON.stringify(commandSection),
+    );
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(250);
+
+    // 3a2) 右侧明细面板默认收起（主区占满），按需滑出
     const panelClosed = await cdp.evaluate(`(() => {
       const panel = document.querySelector(".inspector").getBoundingClientRect();
       const main = document.querySelector(".main").getBoundingClientRect();
@@ -599,6 +644,9 @@ async function main() {
 
     await cdp.clickSelector("#settings-btn");
     await sleep(400);
+    // 白名单在「命令与安全」分区里
+    await cdp.clickSelector('#settings-nav [data-section="command"]');
+    await sleep(250);
     const allowlistFilled = await cdp.evaluate(`(() => {
       const el = document.getElementById("f-command-allowlist");
       if (!el) return null;
@@ -623,6 +671,8 @@ async function main() {
     // 3a3) 自开发预设：一键把白名单配成本项目质量门
     await cdp.clickSelector("#settings-btn");
     await sleep(300);
+    await cdp.clickSelector('#settings-nav [data-section="command"]');
+    await sleep(250);
     const presetClicked = await cdp.clickSelector("#dev-preset-btn");
     await sleep(700);
     const presetState = await cdp.evaluate(`(() => {
