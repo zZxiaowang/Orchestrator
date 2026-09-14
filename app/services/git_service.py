@@ -24,6 +24,19 @@ from app.core.errors import AppError
 TASK_NAME = "Orchestrator-DailyAutoCommit"
 GIT_TIMEOUT = 60
 
+#: Windows：让子进程不创建可见控制台窗口。
+#: 桌面版是**无控制台**进程，若不给这个标志，每调一次 git 都会弹一个黑窗——
+#: "提交 git 要不断开窗口"就是这么来的（面板刷新一次要跑 3 条 git 命令 = 闪 3 次）。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _no_window_kwargs() -> dict[str, object]:
+    """隐藏子进程窗口；非 Windows 返回空字典，行为完全不变。"""
+
+    if os.name != "nt" or not _NO_WINDOW:
+        return {}
+    return {"creationflags": _NO_WINDOW}
+
 
 class GitError(AppError):
     """Git 命令失败。"""
@@ -80,6 +93,7 @@ class GitService:
                 encoding="utf-8",
                 errors="replace",
                 timeout=GIT_TIMEOUT,
+                **_no_window_kwargs(),
             )
         except FileNotFoundError as exc:
             raise GitError("未找到 git 命令，请先安装 Git for Windows。") from exc
@@ -414,7 +428,11 @@ class GitService:
         return Path(__file__).resolve().parents[2] / "scripts" / "auto-commit.cmd"
 
     def startup_launcher(self) -> Path:
-        """启动文件夹里的启动项（登录时自动运行，无需管理员权限）。"""
+        """启动文件夹里的启动项（登录时自动运行，无需管理员权限）。
+
+        用 ``.vbs`` 而不是 ``.cmd``：wscript 执行脚本时不创建控制台窗口，
+        而 cmd 每次登录都会弹一个黑窗——「为什么提交 git 要不断开窗口」的另一半原因。
+        """
         appdata = os.getenv("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return (
             Path(appdata)
@@ -423,8 +441,13 @@ class GitService:
             / "Start Menu"
             / "Programs"
             / "Startup"
-            / "Orchestrator-AutoCommit.cmd"
+            / "Orchestrator-AutoCommit.vbs"
         )
+
+    def legacy_startup_launcher(self) -> Path:
+        """旧版本留下的 .cmd 启动项（会弹黑窗），启用/停用时都要清掉。"""
+
+        return self.startup_launcher().with_suffix(".cmd")
 
     def auto_commit_status(self) -> dict[str, object]:
         launcher = self.startup_launcher()
@@ -451,21 +474,27 @@ class GitService:
         launcher = self.startup_launcher()
         launcher.parent.mkdir(parents=True, exist_ok=True)
         mode = "push" if push else "local"
-        launcher.write_text(
-            "@echo off\r\n"
-            "REM 由编排器生成：登录 Windows 时自动提交 Git（删除本文件即关闭）\r\n"
-            f'call "{script}" {mode}\r\n',
-            encoding="utf-8",
+        # 内容保持纯 ASCII：启动项会被系统按 ANSI 读取，中文注释可能变成乱码命令。
+        # 0 = 运行时不显示窗口，False = 不等待结束（登录过程不被阻塞）。
+        # 写字节而不是 write_text：文本模式会把 \r\n 变成 \r\r\n（Windows）。
+        launcher.write_bytes(
+            (
+                'Set sh = CreateObject("WScript.Shell")\r\n'
+                f'sh.Run """{script}"" {mode}", 0, False\r\n'
+            ).encode("ascii")
         )
+        legacy = self.legacy_startup_launcher()
+        if legacy.is_file():
+            legacy.unlink()
         status = self.auto_commit_status()
         if not status["enabled"]:
             raise GitError(f"写入启动项失败：{launcher}")
         return status
 
     def disable_auto_commit(self) -> dict[str, object]:
-        launcher = self.startup_launcher()
-        if launcher.is_file():
-            launcher.unlink()
+        for launcher in (self.startup_launcher(), self.legacy_startup_launcher()):
+            if launcher.is_file():
+                launcher.unlink()
         return self.auto_commit_status()
 
     def run_auto_commit_now(self) -> dict[str, object]:
@@ -479,6 +508,7 @@ class GitService:
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            **_no_window_kwargs(),
         )
         output = (result.stdout or "").strip() + (
             ("\n" + result.stderr.strip()) if result.stderr else ""

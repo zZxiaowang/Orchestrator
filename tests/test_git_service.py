@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -128,3 +129,66 @@ def test_auto_commit_script_commits_changes(tmp_path: Path):
 
     second = service.run_auto_commit_now()
     assert "无改动，跳过提交" in second["output"]
+
+
+def test_every_spawn_hides_the_console_window(tmp_path: Path, monkeypatch):
+    """桌面版没有控制台：任何 git/自动提交子进程都必须隐藏窗口。
+
+    否则每次面板刷新（3 条 git 命令）都会弹黑窗——用户看到的就是
+    「提交个 git 为什么要不断开窗口」。
+    """
+
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    (repo / "a.txt").write_text("x\n", encoding="utf-8")
+
+    seen: list[dict] = []
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        seen.append(dict(kwargs))
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr("app.services.git_service.subprocess.run", spy)
+    service.status()
+    service.run_auto_commit_now()
+
+    assert seen, "本用例应当至少触发一次子进程"
+    if os.name == "nt":
+        expected = subprocess.CREATE_NO_WINDOW
+        assert all(item.get("creationflags") == expected for item in seen), [
+            item.get("creationflags") for item in seen
+        ]
+    else:
+        assert all("creationflags" not in item for item in seen)
+
+
+def test_auto_commit_launcher_does_not_open_a_window(tmp_path: Path, monkeypatch):
+    """启动项必须是"静默运行"的形式，否则每次登录都弹黑窗。"""
+
+    repo = _init_repo(tmp_path / "repo")
+    service = GitService(repo)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+    status = service.enable_auto_commit(push=False)
+    launcher = service.startup_launcher()
+    assert status["enabled"] is True
+    assert launcher.suffix == ".vbs", "启动项应当是 .vbs（wscript 不创建控制台窗口）"
+
+    content = launcher.read_bytes()
+    assert content.decode("ascii")  # 纯 ASCII：系统按 ANSI 读启动项，中文会变乱码命令
+    text = content.decode("ascii")
+    assert 'CreateObject("WScript.Shell")' in text
+    assert ", 0, False" in text  # 0 = 不显示窗口，False = 不等待
+    assert str(service.auto_commit_script()) in text
+    assert b"\r\r\n" not in content, "文本模式写文件会把 \\r\\n 变成 \\r\\r\\n"
+
+    # 旧版本留下的 .cmd 启动项会被清掉（它每次登录都弹窗）
+    legacy = service.legacy_startup_launcher()
+    legacy.write_text("@echo off\r\n", encoding="ascii")
+    service.enable_auto_commit(push=True)
+    assert not legacy.is_file()
+    assert " push" in launcher.read_text(encoding="ascii")
+
+    assert service.disable_auto_commit()["enabled"] is False
+    assert not launcher.is_file()
