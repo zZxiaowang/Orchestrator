@@ -68,6 +68,15 @@ class SystemRestartRequest(BaseModel):
     confirm: bool = Field(False, description="必须显式确认：这个动作会结束当前程序")
 
 
+#: 自开发预设：本项目的质量门。命令按前缀匹配，所以带参数的写法也能命中。
+DEV_QUALITY_GATES: tuple[str, ...] = (
+    "python -m pytest",
+    "python -m ruff",
+    "node scripts/ui_check.mjs",
+    "powershell -File scripts/package.ps1",
+)
+
+
 class MarketSourceRequest(BaseModel):
     manifest_url: str = Field(..., min_length=8, description="目录清单的 HTTPS 地址")
 
@@ -258,6 +267,37 @@ async def system_restart(payload: SystemRestartRequest, request: Request) -> dic
     # 给这次 HTTP 响应留出返回时间，然后结束自己；新实例由辅助脚本拉起
     threading.Timer(1.5, lambda: os._exit(0)).start()
     return result
+
+
+@router.get("/system/info")
+async def system_info() -> dict[str, Any]:
+    """运行形态信息：仓库根、数据目录、是否打包版——界面据此做"开发模式"。"""
+
+    from app.core.config import DATA_DIR, is_frozen, project_root
+
+    root = project_root()
+    return {
+        "project_root": str(root),
+        "data_dir": str(DATA_DIR),
+        "frozen": is_frozen(),
+        "is_git_repo": (root / ".git").exists(),
+        "quality_gates": list(DEV_QUALITY_GATES),
+    }
+
+
+@router.post("/system/dev-preset")
+async def apply_dev_preset(request: Request) -> dict[str, Any]:
+    """一键配置"自开发"：允许执行验证命令 + 白名单填本项目质量门 + 允许自动修正。"""
+
+    store = _store(request)
+    settings = store.update(
+        {
+            "allow_command_execution": True,
+            "command_allowlist": list(DEV_QUALITY_GATES),
+            "step_command_rounds": 2,
+        }
+    )
+    return settings_payload(settings, store)
 
 
 @router.post("/client-log", status_code=202)

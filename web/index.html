@@ -97,6 +97,10 @@
               <span>落地目录</span>
               <input id="target-dir" placeholder="留空 = 在运行目录内新建工作区" />
             </label>
+            <label class="checkbox">
+              <input type="checkbox" id="dev-mode" />
+              <span>开发模式（改本仓库源码：自动填目录 + 质量门白名单）</span>
+            </label>
           </div>
         </footer>
       </main>
@@ -219,6 +223,9 @@
               placeholder="python -m pytest&#10;python -m ruff&#10;node scripts/ui_check.mjs"
             ></textarea>
           </label>
+          <button class="btn ghost" id="dev-preset-btn" type="button">
+            一键配置自开发（白名单 = 本项目质量门）
+          </button>
           <label class="field">
             <span>验证命令失败后，允许自动修正的轮数（0 = 不自动修）</span>
             <input id="f-command-rounds" type="number" min="0" max="5" />

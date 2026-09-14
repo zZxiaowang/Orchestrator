@@ -152,6 +152,8 @@ const api = {
   revertStep: (id, stepId) => request("POST", `/api/v1/runs/${id}/steps/${stepId}/revert`, {}),
   restart: (rebuild) =>
     request("POST", "/api/v1/system/restart", { rebuild: Boolean(rebuild), confirm: true }),
+  systemInfo: () => request("GET", "/api/v1/system/info"),
+  devPreset: () => request("POST", "/api/v1/system/dev-preset", {}),
   marketCapabilities: () => request("GET", "/api/v1/market/capabilities"),
   marketSources: () => request("GET", "/api/v1/market/sources"),
   addMarketSource: (manifestUrl) =>
@@ -265,6 +267,8 @@ function bindEvents() {
   on("route-modal", "click", (event) => {
     if (event.target.id === "route-modal") closeRouteModal();
   });
+  on("dev-preset-btn", "click", applyDevPreset);
+  on("dev-mode", "change", (event) => applyDevMode(event.target.checked));
   on("settings-save", "click", saveSettings);
   on("settings-test", "click", testConnection);
   on("provider-new", "click", newProvider);
@@ -1602,6 +1606,47 @@ function openSettings() {
 
 function closeSettings() {
   document.getElementById("settings-modal").hidden = true;
+}
+
+/** 一键配置自开发：白名单 = 本项目质量门，并打开命令执行。 */
+async function applyDevPreset() {
+  const status = document.getElementById("settings-status");
+  try {
+    const payload = await api.devPreset();
+    applySettingsPayload(payload);
+    document.getElementById("f-allow-cmd").checked = Boolean(payload.allow_command_execution);
+    document.getElementById("f-command-allowlist").value = (payload.command_allowlist || []).join(
+      "\n"
+    );
+    document.getElementById("f-command-rounds").value = payload.step_command_rounds ?? 2;
+    status.style.color = "var(--ok)";
+    status.textContent = `已配置自开发：白名单 ${(payload.command_allowlist || []).length} 条。`;
+  } catch (error) {
+    status.style.color = "var(--danger)";
+    status.textContent = error.message;
+  }
+}
+
+/** 开发模式：把落地目录指向本仓库，避免每次手填。 */
+async function applyDevMode(checked) {
+  const field = document.getElementById("target-dir");
+  if (!checked) {
+    field.value = "";
+    showToast("已退出开发模式。");
+    return;
+  }
+  try {
+    const info = await api.systemInfo();
+    field.value = info.project_root || "";
+    showToast(
+      `开发模式：改动会直接落在 ${info.project_root}${
+        info.is_git_repo ? "（已检测到 git，可一键回滚）" : "（该目录不是 git 仓库，回滚只能用备份）"
+      }`
+    );
+  } catch (error) {
+    document.getElementById("dev-mode").checked = false;
+    showToast(error.message);
+  }
 }
 
 /* ── 分段路由（右上角标签点开的弹窗）── */

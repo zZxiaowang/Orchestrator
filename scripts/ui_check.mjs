@@ -573,6 +573,26 @@ async function main() {
     await cdp.clickSelector("#settings-cancel");
     await sleep(250);
 
+    // 3a3) 自开发预设：一键把白名单配成本项目质量门
+    await cdp.clickSelector("#settings-btn");
+    await sleep(300);
+    const presetClicked = await cdp.clickSelector("#dev-preset-btn");
+    await sleep(700);
+    const presetState = await cdp.evaluate(`(() => {
+      const box = document.getElementById("f-command-allowlist");
+      return {
+        lines: (box?.value || "").split("\\n").filter(Boolean).length,
+        enabled: document.getElementById("f-allow-cmd")?.checked === true,
+      };
+    })()`);
+    check(
+      "一键配置自开发（质量门白名单）",
+      presetClicked.hit && presetState.lines >= 3 && presetState.enabled,
+      JSON.stringify(presetState),
+    );
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(250);
+
     const revertLabels = await cdp.evaluate(
       `Array.from(document.querySelectorAll(".step-actions button")).map((el) => el.textContent.trim())`,
     );
