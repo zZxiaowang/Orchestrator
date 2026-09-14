@@ -122,7 +122,9 @@ class FakeRelay:
                 },
             )
 
-        content = self._architect_text() if "资深架构师" in system else self._executor_text(body)
+        content = (
+            self._architect_text(body) if "资深架构师" in system else self._executor_text(body)
+        )
 
         if body.get("stream"):
             self.stream_calls += 1
@@ -139,7 +141,26 @@ class FakeRelay:
             },
         )
 
-    def _architect_text(self) -> str:
+    def _architect_text(self, body: dict[str, Any] | None = None) -> str:
+        # 续聊（多轮）走的是同一段架构提示词，用最后一条用户消息里的标记区分：
+        # 这时只应该返回**新增**步骤，而不是重发整份纲领。
+        if body is not None and "请只输出**新增**的步骤" in body["messages"][-1]["content"]:
+            addition = {
+                "goal": "追加：继续改进",
+                "summary": "只输出新增步骤。",
+                "steps": [
+                    {
+                        "id": 1,
+                        "title": "追加步骤",
+                        "goal": "按追加要求再改一处",
+                        "deliverables": ["steps/step-3.md"],
+                        "acceptance": ["文件存在"],
+                        "depends_on": [],
+                    }
+                ],
+            }
+            payload = json.dumps(addition, ensure_ascii=False)
+            return f"```json\n{payload}\n```" if self.fence_plan else payload
         plan = plan_payload()
         if self.plan_checks is not None:
             plan["steps"][0]["checks"] = self.plan_checks

@@ -66,6 +66,26 @@ def _architect_text() -> str:
     return f"```json\n{json.dumps(PLAN, ensure_ascii=False, indent=2)}\n```"
 
 
+def _continue_text() -> str:
+    """续聊只返回**新增**步骤（与真实架构段的约定一致）。"""
+
+    addition = {
+        "goal": "追加：继续改进",
+        "summary": "只输出新增步骤。",
+        "steps": [
+            {
+                "id": 1,
+                "title": "追加步骤",
+                "goal": "按追加要求再补一份产出",
+                "deliverables": ["steps/step-4.md"],
+                "acceptance": ["文件存在"],
+                "depends_on": [],
+            }
+        ],
+    }
+    return f"```json\n{json.dumps(addition, ensure_ascii=False, indent=2)}\n```"
+
+
 def _executor_text(body: dict[str, Any]) -> str:
     user = body["messages"][-1]["content"]
     match = re.search(r"第\s*(\d+)\s*步", user)
@@ -94,7 +114,11 @@ def _executor_text(body: dict[str, Any]) -> str:
 async def chat_completions(request: Request):
     body = await request.json()
     system = body["messages"][0]["content"]
-    content = _architect_text() if "资深架构师" in system else _executor_text(body)
+    is_architect = "资深架构师" in system
+    if is_architect and "请只输出**新增**的步骤" in body["messages"][-1]["content"]:
+        content = _continue_text()
+    else:
+        content = _architect_text() if is_architect else _executor_text(body)
     model = body.get("model", "fake-model")
 
     if not body.get("stream"):

@@ -52,6 +52,8 @@
 | 32 | git 提交老是弹黑窗 | ✅ 所有 git 子进程加 `CREATE_NO_WINDOW`；开机启动项改成静默 `.vbs` |
 | 33 | 它应该能自己跑验证、按报错改（自开发闭环 P1/P2） | ✅ 受控命令执行（白名单+超时+截断）+ 失败回灌同一步继续修（`app/services/commands.py`） |
 | 34 | 改错了要能退回去 | ✅ 步骤级 git 锚点 + 「回滚这一步」（只还原该步碰过的文件，`app/services/gitguard.py`） |
+| 35 | 跑完想接着说下一步（对话式自开发） | ✅ 多轮续聊：`POST /runs/{id}/continue`，只追加新步骤、只执行新步骤，旧步骤/事件序号不动 |
+| 36 | 改完自己的源码要能生效 | ✅ 重新打包并重启（`POST /api/v1/system/restart` + 外部辅助脚本 `scripts/restart.ps1`） |
 
 ## 三、数据与文件位置（重要）
 
@@ -126,7 +128,7 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **241 项**通过；ruff check/format 全绿；界面自检 **47 项全通过** |
+| 质量门 | pytest **249 项**通过；ruff check/format 全绿；界面自检 **50 项全通过** |
 | 桌面自检 | 渲染 PASS、点击链路 PASS、Git 面板 29 按钮 PASS |
 | 推送 | 已配置 `http.https://github.com/.proxy = http://127.0.0.1:10809`（**只对 github.com 生效**） |
 

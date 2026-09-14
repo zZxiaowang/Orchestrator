@@ -136,6 +136,8 @@ const api = {
   createRun: (body) => request("POST", "/api/v1/runs", body),
   approve: (id, feedback) => request("POST", `/api/v1/runs/${id}/approve`, { feedback: feedback || "" }),
   resume: (id, body) => request("POST", `/api/v1/runs/${id}/resume`, body),
+  continueRun: (id, instruction) =>
+    request("POST", `/api/v1/runs/${id}/continue`, { instruction }),
   cancel: (id) => request("POST", `/api/v1/runs/${id}/cancel`, {}),
   tree: (id) => request("GET", `/api/v1/runs/${id}/tree`),
   file: (id, path) => request("GET", `/api/v1/runs/${id}/file?path=${encodeURIComponent(path)}`),
@@ -148,6 +150,8 @@ const api = {
   testProvider: (id) => request("POST", `/api/v1/providers/${id}/test`, {}),
   routes: (body) => request("PUT", "/api/v1/routes", body),
   revertStep: (id, stepId) => request("POST", `/api/v1/runs/${id}/steps/${stepId}/revert`, {}),
+  restart: (rebuild) =>
+    request("POST", "/api/v1/system/restart", { rebuild: Boolean(rebuild), confirm: true }),
   marketCapabilities: () => request("GET", "/api/v1/market/capabilities"),
   marketSources: () => request("GET", "/api/v1/market/sources"),
   addMarketSource: (manifestUrl) =>
@@ -822,6 +826,12 @@ function renderTimeline() {
 
   for (const step of run.steps || []) nodes.push(renderStepCard(step));
 
+  // 多轮续聊：跑完之后还能接着说"下一步做什么"，追加步骤而不重跑已完成的部分
+  const canContinue =
+    (run.steps || []).length > 0 &&
+    ["done", "blocked", "failed", "paused"].includes(run.status);
+  if (canContinue) nodes.push(renderContinueCard(run));
+
   if (run.error) {
     nodes.push(h("div", { class: "error-box", text: `运行失败：${run.error.message || JSON.stringify(run.error)}` }));
   }
@@ -1006,6 +1016,54 @@ function renderApprovalCard() {
 }
 
 /** 被阻塞时的恢复卡片：补信息/指定目录后可只重跑那一步。 */
+function renderContinueCard(run) {
+  const input = h("textarea", {
+    class: "feedback",
+    id: "continue-input",
+    placeholder:
+      "接着说下一步要做什么，例如：「把这个改动跑一遍测试，没过就修到过」或「再补一份验收清单」",
+  });
+  const button = h("button", {
+    class: "btn primary",
+    id: "continue-btn",
+    type: "button",
+    text: "继续这项任务",
+  });
+  button.addEventListener(
+    "click",
+    safe(async () => {
+      const instruction = input.value.trim();
+      if (!instruction) {
+        showToast("先写下要继续做什么。");
+        return;
+      }
+      button.disabled = true;
+      try {
+        state.buffers = {};
+        const payload = await api.continueRun(run.id, instruction);
+        state.run = payload.run;
+        connectStream(run.id, state.lastSeq);
+        render();
+      } catch (error) {
+        showToast(error.message);
+        button.disabled = false;
+      }
+    })
+  );
+  return h(
+    "div",
+    { class: "card approval" },
+    h(
+      "div",
+      { class: "card-head" },
+      h("div", { class: "avatar", text: "＋" }),
+      h("strong", { text: "继续说下一步" }),
+      h("span", { class: "muted", text: "只追加新步骤，已完成的部分不重跑" })
+    ),
+    h("div", { class: "card-body" }, input, h("div", { class: "approval-actions" }, button))
+  );
+}
+
 function renderResumeCard(run) {
   const blocked = (run.steps || []).find((step) => step.status === "blocked");
   const note = h("textarea", {
@@ -2491,6 +2549,25 @@ async function runGitAction(action, label) {
 
 /* ── 命令面板（Ctrl+K，Codex 式）── */
 
+/** 重新打包并重启：改完自己的源码后，让改动真的生效。 */
+async function rebuildAndRestart() {
+  const ok = await appConfirm({
+    title: "重新打包并重启",
+    message:
+      "会先重新打包（包含运行测试与静态检查），再结束当前程序并启动新版本。\n" +
+      "当前窗口几秒后会关闭；正在跑的运行会被标记为「已暂停」，可在新实例里继续。",
+    confirmText: "开始",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const result = await api.restart(true);
+    showToast(result.detail || "正在重新打包并重启…");
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
 function paletteCommands() {
   const commands = [
     { id: "new-run", label: "新建任务", hint: "清空输入，开始一个新任务", run: startNewRun },
@@ -2506,6 +2583,12 @@ function paletteCommands() {
       run: () => document.getElementById("sidebar-toggle")?.click(),
     },
     { id: "check-version", label: "查看版本与更新方式", hint: "构建号", run: showVersionInfo },
+    {
+      id: "rebuild-restart",
+      label: "重新打包并重启",
+      hint: "改完源码后用：打包 → 重启 → 中断的运行可继续",
+      run: rebuildAndRestart,
+    },
     { id: "shortcuts", label: "查看快捷键", hint: "Ctrl+/", run: showShortcutHelp },
   ];
   if (state.run) {

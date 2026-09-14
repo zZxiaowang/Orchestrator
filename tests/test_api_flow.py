@@ -840,3 +840,54 @@ def test_revert_is_refused_while_running(tmp_path: Path):
 
         response = client.post(f"/api/v1/runs/{run_id}/steps/1/revert")
         assert response.status_code == 409
+
+
+def test_continue_appends_steps_without_rewriting_done_ones(tmp_path: Path):
+    """多轮续聊：跑完之后追加新要求 → 只新增步骤，旧步骤与事件序号都不受影响。"""
+
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "为示例项目建立骨架"}).json()["run"][
+            "id"
+        ]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+        assert run["status"] == "done"
+
+        before = client.get(f"/api/v1/runs/{run_id}").json()
+        seq_before = before["event_seq"]
+        old_steps = [(s["id"], s["status"], len(s["files"])) for s in before["run"]["steps"]]
+        calls_before = relay.executor_calls
+
+        started = client.post(
+            f"/api/v1/runs/{run_id}/continue", json={"instruction": "再补一份验收清单"}
+        ).json()
+        assert started["action"] == "continue"
+
+        run = wait_for_status(client, run_id, {"awaiting_approval"})
+        assert len(run["steps"]) == 3
+        # 旧步骤原封不动（id、状态、改动文件都没变）
+        assert [(s["id"], s["status"], len(s["files"])) for s in run["steps"][:2]] == old_steps
+        assert run["steps"][2]["id"] == 3
+        assert run["steps"][2]["status"] == "pending"
+        assert len(run["plan"]["steps"]) == 3, "纲领里应当能看到原计划 + 追加步骤"
+
+        # 确认后只跑新增的那一步，旧步骤不重跑
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+        assert run["status"] == "done", run.get("error")
+        assert relay.executor_calls == calls_before + 1
+        assert all(step["status"] == "done" for step in run["steps"])
+
+        after = client.get(f"/api/v1/runs/{run_id}").json()
+        assert after["event_seq"] > seq_before, "续聊不能重排事件序号"
+
+
+def test_continue_requires_an_instruction(tmp_path: Path):
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        response = client.post(f"/api/v1/runs/{run_id}/continue", json={"instruction": "   "})
+        assert response.status_code == 400

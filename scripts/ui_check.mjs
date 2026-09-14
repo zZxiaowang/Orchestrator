@@ -582,6 +582,34 @@ async function main() {
       JSON.stringify(revertLabels),
     );
 
+    // 3c2) 多轮续聊：跑完之后接着说下一步 → 追加步骤（不重跑旧的）
+    const beforeContinue = await cdp.evaluate(
+      `document.querySelectorAll(".card.step").length`,
+    );
+    await cdp.evaluate(`(() => {
+      const el = document.getElementById("continue-input");
+      if (el) el.value = "再补一份验收清单";
+      return Boolean(el);
+    })()`);
+    const continueClicked = await cdp.clickSelector("#continue-btn");
+    let continueState = null;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      continueState = await cdp.evaluate(`({
+        steps: document.querySelectorAll(".card.step").length,
+        status: document.getElementById("status-pill").textContent.trim(),
+      })`);
+      if (continueState.steps > beforeContinue && continueState.status.includes("确认")) break;
+      await sleep(300);
+    }
+    check(
+      "跑完之后可以继续对话（追加步骤）",
+      continueClicked.hit &&
+        continueState &&
+        continueState.steps === beforeContinue + 1 &&
+        continueState.status.includes("确认"),
+      JSON.stringify({ before: beforeContinue, ...continueState }),
+    );
+
     // 3b) 滚轮必须真的能滚动（flex 子项被压扁会导致"内容裁掉且滚不动"）
     for (const [label, selector] of [
       ["时间线", ".timeline"],

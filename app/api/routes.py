@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,6 +57,15 @@ class ResumeRequest(BaseModel):
 class RetryStepRequest(BaseModel):
     note: str = Field("", description="这次重做要额外交代什么")
     stop_after: bool = Field(True, description="只跑这一步就停下")
+
+
+class ContinueRequest(BaseModel):
+    instruction: str = Field("", description="继续这项任务要做什么（追加要求）")
+
+
+class SystemRestartRequest(BaseModel):
+    rebuild: bool = Field(True, description="重启前是否重新打包（源码改动才会生效）")
+    confirm: bool = Field(False, description="必须显式确认：这个动作会结束当前程序")
 
 
 class MarketSourceRequest(BaseModel):
@@ -208,6 +219,45 @@ async def health(request: Request) -> dict[str, Any]:
         "missing_endpoints": [e.role for e in missing],
         "problems": problems,
     }
+
+
+@router.post("/system/restart", status_code=202)
+async def system_restart(payload: SystemRestartRequest, request: Request) -> dict[str, Any]:
+    """重新打包并重启（改完自己的源码后用）。
+
+    这是一个**会结束当前进程**的动作，所以必须显式 ``confirm=true``；
+    实际的重启由外部辅助脚本完成（等本进程退出 → 打包 → 拉起新实例）。
+    """
+
+    if not payload.confirm:
+        raise AppError(
+            "这会结束当前程序，请带上 confirm=true 再调用。",
+            code="need_confirm",
+        )
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        raise AppError("测试环境不允许重启。", code="restart_unsupported")
+
+    from app.core.config import DATA_DIR, get_settings, is_frozen, project_root
+    from app.services.restart import helper_available, perform_restart
+
+    root = project_root()
+    if not helper_available(root):
+        raise AppError(
+            f"找不到重启辅助脚本：{root}\\scripts\\restart.ps1（更新到最新版本后再试）",
+            code="restart_unsupported",
+        )
+    settings = get_settings()
+    result = perform_restart(
+        data_dir=DATA_DIR,
+        project_root=root,
+        rebuild=payload.rebuild,
+        host=settings.host,
+        port=settings.port,
+    )
+    result["frozen"] = is_frozen()
+    # 给这次 HTTP 响应留出返回时间，然后结束自己；新实例由辅助脚本拉起
+    threading.Timer(1.5, lambda: os._exit(0)).start()
+    return result
 
 
 @router.post("/client-log", status_code=202)
@@ -496,6 +546,14 @@ async def resume_run(run_id: str, payload: ResumeRequest, request: Request) -> d
         stop_after_step=payload.stop_after_step,
     )
     return {"run": run.model_dump(mode="json"), "action": "resume"}
+
+
+@router.post("/runs/{run_id}/continue")
+async def continue_run(run_id: str, payload: ContinueRequest, request: Request) -> dict[str, Any]:
+    """多轮续聊：在已结束的运行上追加新要求，规划新增步骤后仍需确认再执行。"""
+
+    run = _orchestrator(request).continue_run(run_id, payload.instruction)
+    return {"run": run.model_dump(mode="json"), "action": "continue"}
 
 
 @router.post("/runs/{run_id}/steps/{step_id}/retry")

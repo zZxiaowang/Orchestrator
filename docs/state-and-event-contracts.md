@@ -14,14 +14,15 @@
 | `awaiting_approval` | 纲领待人工确认 | `executing`、`planning`、`failed`、`cancelled` | 用户确认 / 用户要求重做纲领 / 出错 / 取消 |
 | `executing` | 执行段按步骤落地 | `done`、`blocked`、`failed`、`cancelled` | 全部步骤完成 / 某步阻塞 / 出错 / 取消 |
 | `blocked` | 执行段明确声明缺信息，暂停在阻塞步骤 | `executing`、`failed`、`cancelled` | 用户补充信息并继续 / 出错 / 取消 |
-| `done` | 终态：全部步骤成功或跳过 | —（续聊见第 7 节） | — |
+| `done` | 全部步骤成功或跳过；**可以续聊**（追加新步骤，见第 5.3 节） | `planning`（续聊） | 用户追加要求 |
 | `failed` | 终态：出错并保留上下文 | `executing`（显式重试） | 用户重试 |
 | `cancelled` | 终态：用户主动取消 | — | — |
 | `queued`（预留） | P2：已创建但未获得执行资源 | `planning`、`cancelled` | 调度器放行 / 取消 |
 
 禁止的转换（必须由测试守住）：
 - `planning` → `executing`：必须先经过 `awaiting_approval`。
-- `done` → 任何状态（P1 续聊引入前）。
+- `done` → 除 `planning`（续聊）以外的任何状态；续聊是**唯一**允许的例外，
+  且必须保留既有步骤、文件改动与事件序号不变。
 - `cancelled` → 任何状态。
 - 任何状态 → `queued`（P2 中仅允许从 `planning` 之前/创建时进入）。
 
@@ -156,6 +157,34 @@
 2. 没有检查项时，`verification` 为空，界面必须显示「未验证」，不得当成已验证；
 3. 检查抛异常按「未通过」记录，不得让整步崩溃；
 4. 检查路径一律走 `Workspace.resolve`，与文件落地共用同一套越界防护。
+
+## 5.3 多轮续聊与打包重启（2026-09-14 新增）
+
+### 续聊（continue）
+
+`POST /api/v1/runs/{run_id}/continue` + `{instruction}`：在**已结束**的运行上追加要求。
+
+不变量：
+
+1. **不重写历史**：既有 `RunStep`（id / 状态 / 文件改动 / 验收结果）一律不动；
+   新步骤的 id 从「现有最大 id + 1」开始连续编号；
+2. **不重排事件**：`seq` 继续递增，客户端可用原有 `since` 继续增量订阅；
+3. **仍需确认**：续聊只把新步骤规划出来（`planning → awaiting_approval`），
+   用户确认后才执行，且**只执行新增步骤**（已 `done` 的步骤会被跳过）；
+4. 运行中（`planning` / `executing`）不允许续聊，返回 409；
+5. 纲领（`run.plan.steps`）追加新步骤，因此 `plan.md` 始终是"原计划 + 追加"的完整路线图。
+
+### 打包重启
+
+`POST /api/v1/system/restart` + `{rebuild, confirm}`：重新打包（可选）并重启自己。
+
+1. 必须显式 `confirm=true`；测试环境（`PYTEST_CURRENT_TEST`）一律拒绝；
+2. 实现方式：本进程只**写请求文件 + 拉起外部辅助脚本**（`scripts/restart.ps1`），
+   随后自行退出；等待退出、打包、拉起新实例全部由辅助脚本完成
+   （因为 Windows 会锁住正在运行的 exe，且"杀掉自己"之后的代码不会执行）；
+3. 中断的运行由新实例启动时的 `recover_interrupted()` 收敛成 `paused`，
+   数据不丢，用户可点「继续执行」；
+4. 全程日志写在 `data/logs/restart.log`。
 
 ## 6. 敏感字段与审计约束
 

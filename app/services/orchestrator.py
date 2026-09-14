@@ -33,7 +33,12 @@ from app.schemas.run import (
     StepStatus,
 )
 from app.schemas.step import StepOutput
-from app.services.architect import build_architect_messages, run_architect, run_chat
+from app.services.architect import (
+    build_architect_messages,
+    build_continue_messages,
+    run_architect,
+    run_chat,
+)
 from app.services.commands import failure_block, run_allowed
 from app.services.context import StepContextBuilder, clip, clip_head_tail
 from app.services.events import EventBus
@@ -253,6 +258,140 @@ class Orchestrator:
             self._fail(run, AppError(f"架构段异常：{exc}", code="architect_error"))
 
     # ── 执行段 ──
+
+    def continue_run(self, run_id: str, instruction: str) -> Run:
+        """多轮续聊：在已结束的运行上追加新要求，**不重写**已完成的步骤。
+
+        典型用法就是"自开发"的对话迭代：跑完一轮 → 看结果 → 说"这里再改一下"。
+        新步骤由架构段规划，仍然要过人工确认门，然后只执行新增的步骤。
+        """
+
+        text = (instruction or "").strip()
+        if not text:
+            raise AppError("请先写下要继续做什么。", code="invalid_request")
+        run = self.store.load(run_id)
+        if run.status in (RunStatus.PLANNING, RunStatus.EXECUTING):
+            raise AppError(
+                "运行还在进行中，等它跑完或先点「停止」再继续。",
+                code="run_busy",
+            )
+        if not run.steps:
+            raise AppError("这次运行还没有纲领，直接新开一个任务吧。", code="plan_missing")
+
+        run.messages.append(RunMessage(role="user", phase="context", content=text))
+        run.user_notes.append(text)
+        run.error = None
+        run.status = RunStatus.PLANNING
+        # 续聊默认一路跑完新步骤，除非用户又在界面上指定了停靠点
+        run.stop_after_step = None
+        self.store.save(run)
+        self.bus.publish(
+            run_id,
+            "status",
+            status=run.status.value,
+            message="根据你的补充规划新增步骤…",
+        )
+        self._cancelled.discard(run_id)
+        self._tasks[run_id] = asyncio.create_task(self._plan_continuation(run_id, text))
+        return self.store.load(run_id)
+
+    async def _plan_continuation(self, run_id: str, instruction: str) -> None:
+        run = self.store.load(run_id)
+        settings = self._settings_provider()
+        endpoint = settings.resolve_architect()
+        try:
+            self._require_endpoint(endpoint)
+            client = self._client(endpoint, settings)
+            stats = CallStats()
+            context = self._build_context(run, settings)
+            messages = build_continue_messages(
+                run.task,
+                max_steps=settings.max_plan_steps,
+                done_log=self._completed_digest(run),
+                instruction=instruction,
+                context=context,
+            )
+            try:
+                plan, raw = await run_architect(
+                    client,
+                    messages,
+                    model=endpoint.model,
+                    stats=stats,
+                    on_token=lambda text: self.bus.publish(
+                        run_id, "token", phase="architect", model=endpoint.model, text=text
+                    ),
+                )
+            finally:
+                self._record_metrics(
+                    run,
+                    stats,
+                    endpoint,
+                    phase=PHASE_ARCHITECT,
+                    context_chars=message_chars(messages),
+                )
+
+            additions = plan.steps[: settings.max_plan_steps]
+            offset = len(run.steps)
+            for index, step in enumerate(additions, start=1):
+                new_id = offset + index
+                # 追加到纲领：plan.md 里能看到"原计划 + 本轮追加"的完整路线图
+                if run.plan is not None:
+                    run.plan.steps.append(
+                        step.model_copy(
+                            update={
+                                "id": new_id,
+                                "depends_on": [d + offset for d in step.depends_on],
+                            }
+                        )
+                    )
+                run.steps.append(
+                    RunStep(
+                        id=new_id,
+                        title=step.title,
+                        goal=step.goal,
+                        deliverables=list(step.deliverables),
+                        acceptance=list(step.acceptance),
+                        checks=list(step.checks),
+                    )
+                )
+            run.messages.append(
+                RunMessage(role="assistant", phase="architect", model=endpoint.model, content=raw)
+            )
+            run.status = RunStatus.AWAITING_APPROVAL
+            self.store.save(run)
+            self._write_plan_doc(run)
+            self.bus.publish(
+                run_id,
+                "plan",
+                plan=run.plan.model_dump(mode="json") if run.plan else {},
+                steps=[item.model_dump(mode="json") for item in run.steps],
+                raw=raw,
+                message=f"已追加 {len(additions)} 个新步骤，确认后执行。",
+            )
+            self.bus.publish(run_id, "status", status=run.status.value)
+        except AppError as exc:
+            self._fail(run, exc)
+        except asyncio.CancelledError:  # pragma: no cover - 主动取消
+            raise
+        except Exception as exc:  # noqa: BLE001 - 兜底，避免后台任务静默失败
+            self._fail(run, AppError(f"续聊规划异常：{exc}", code="architect_error"))
+
+    @staticmethod
+    def _completed_digest(run: Run) -> str:
+        """已完成步骤的摘要，交给架构段避免重复规划。"""
+
+        lines: list[str] = []
+        for step in run.steps:
+            if step.status == StepStatus.DONE:
+                summary = step.handoff or step.summary or "已完成"
+                lines.append(
+                    f"- 第 {step.id} 步「{step.title}」：{' '.join(summary.split())[:200]}"
+                )
+            elif step.status in (StepStatus.BLOCKED, StepStatus.FAILED):
+                lines.append(
+                    f"- 第 {step.id} 步「{step.title}」：{step.status.value}（{step.error[:120]}）"
+                )
+        return "\n".join(lines)
 
     async def _answer_chat(
         self,

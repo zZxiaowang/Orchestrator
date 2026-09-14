@@ -134,6 +134,57 @@ def build_architect_messages(
     return messages
 
 
+def build_continue_messages(
+    task: str,
+    *,
+    max_steps: int,
+    done_log: str,
+    instruction: str,
+    context: str | None = None,
+) -> list[dict[str, Any]]:
+    """多轮续聊：在**已完成的运行**上追加新步骤，而不是重写整份纲领。
+
+    关键在于告诉架构段"哪些事已经做完了"，否则它会重复规划（并浪费执行段的额度）。
+    """
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": ARCHITECT_SYSTEM.replace("__MAX_STEPS__", str(max_steps)),
+        }
+    ]
+    if context:
+        messages.append(
+            {
+                "role": "user",
+                "content": f"以下是当前项目/工作区的客观情况，作为架构约束参考：\n{context}",
+            }
+        )
+    messages.append({"role": "user", "content": f"原始需求：\n{task}"})
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "这条任务此前已经执行过的步骤（**不要重复它们**）：\n"
+                f"{done_log or '（还没有完成的步骤）'}"
+            ),
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "用户现在追加了新的要求：\n"
+                f"{instruction}\n\n"
+                "请只输出**新增**的步骤（steps 里的 id 从 1 开始重新编号，系统会接着排），"
+                "不要重复已经完成的步骤，也不要重写既有决策；"
+                "仍然只输出那一个 JSON 对象。"
+            ),
+        }
+    )
+    return messages
+
+
 async def run_architect(
     client: RelayClient,
     messages: Sequence[dict[str, Any]],
