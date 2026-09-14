@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +54,20 @@ class GitService:
     def __init__(self, repo: Path, *, task_name: str = TASK_NAME) -> None:
         self.repo = Path(repo).resolve()
         self.task_name = task_name
+        self._cache: dict[str, tuple[float, object]] = {}
+
+    def _cached(self, key: str, ttl: float, factory):
+        """短缓存：面板一次操作会触发多次读取，避免重复拉 git 子进程（Windows 上很贵）。"""
+        now = time.monotonic()
+        hit = self._cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+        value = factory()
+        self._cache[key] = (now, value)
+        return value
+
+    def invalidate(self) -> None:
+        self._cache.clear()
 
     # ── 基础 ──
 
@@ -86,19 +101,34 @@ class GitService:
         if not self.is_repo():
             return {"is_repo": False, "repo": str(self.repo)}
 
-        branch = self._run("branch", "--show-current").stdout.strip() or "（detached）"
-        remote = self._run("remote", "get-url", "origin", check=False).stdout.strip()
-        upstream = self._run(
-            "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False
-        ).stdout.strip()
-
+        # 一次 status --branch 同时拿到：分支、上游、ahead/behind、文件列表
+        raw = self._run("status", "--porcelain", "-z", "--branch", check=False).stdout
+        branch = "（detached）"
+        upstream = ""
         ahead = behind = 0
-        if upstream:
-            counts = self._run(
-                "rev-list", "--left-right", "--count", f"{upstream}...HEAD", check=False
-            ).stdout.split()
-            if len(counts) == 2:
-                behind, ahead = int(counts[0]), int(counts[1])
+        entries: list[str] = []
+        for item in (part for part in raw.split("\0") if part):
+            if item.startswith("## "):
+                header = item[3:]
+                if "..." in header:
+                    branch, _, rest = header.partition("...")
+                    upstream = rest.split(" ")[0]
+                else:
+                    branch = header.split(" ")[0]
+                match = re.search(r"ahead (\d+)", header)
+                if match:
+                    ahead = int(match.group(1))
+                match = re.search(r"behind (\d+)", header)
+                if match:
+                    behind = int(match.group(1))
+            else:
+                entries.append(item)
+
+        remote = self._cached(
+            "remote",
+            5.0,
+            lambda: self._run("remote", "get-url", "origin", check=False).stdout.strip(),
+        )
 
         files = [
             {
@@ -108,7 +138,7 @@ class GitService:
                 "staged": item.staged,
                 "label": item.label,
             }
-            for item in self.changed_files()
+            for item in self._parse_status_entries(entries)
         ]
         return {
             "is_repo": True,
@@ -125,9 +155,12 @@ class GitService:
 
     def changed_files(self) -> list[ChangedFile]:
         raw = self._run("status", "--porcelain", "-z", check=False).stdout
-        if not raw:
+        return self._parse_status_entries([item for item in raw.split("\0") if item])
+
+    @staticmethod
+    def _parse_status_entries(parts: list[str]) -> list[ChangedFile]:
+        if not parts:
             return []
-        parts = [item for item in raw.split("\0") if item]
         files: list[ChangedFile] = []
         index = 0
         while index < len(parts):
@@ -335,22 +368,27 @@ class GitService:
             return ""
 
     def proxy_status(self) -> dict[str, object]:
-        scoped = self._run(
-            "config", "--global", "--get", self.PROXY_KEY, check=False
-        ).stdout.strip()
-        generic = self._run("config", "--global", "--get", "http.proxy", check=False).stdout.strip()
-        system = self.system_proxy()
-        return {
-            "git_proxy": scoped or generic,
-            "scoped": bool(scoped),
-            "generic": generic,
-            "system_proxy": system,
-            "active": bool(scoped or generic),
-            "suggestion": ""
-            if (scoped or generic)
-            else (f"系统开着代理 {system}，但 git 不走它——建议一键配置。" if system else ""),
-            "target": "https://github.com/",
-        }
+        def build() -> dict[str, object]:
+            scoped = self._run(
+                "config", "--global", "--get", self.PROXY_KEY, check=False
+            ).stdout.strip()
+            generic = self._run(
+                "config", "--global", "--get", "http.proxy", check=False
+            ).stdout.strip()
+            system = self.system_proxy()
+            return {
+                "git_proxy": scoped or generic,
+                "scoped": bool(scoped),
+                "generic": generic,
+                "system_proxy": system,
+                "active": bool(scoped or generic),
+                "suggestion": ""
+                if (scoped or generic)
+                else (f"系统开着代理 {system}，但 git 不走它——建议一键配置。" if system else ""),
+                "target": "https://github.com/",
+            }
+
+        return self._cached("proxy", 10.0, build)  # type: ignore[return-value]
 
     def set_proxy(self, proxy_url: str) -> dict[str, object]:
         value = (proxy_url or "").strip()
@@ -364,10 +402,12 @@ class GitService:
         self._run("config", "--global", self.PROXY_KEY, value)
         # 之前手动设过全局代理时，一并清掉，避免两处配置打架
         self._run("config", "--global", "--unset", "http.proxy", check=False)
+        self.invalidate()
         return self.proxy_status()
 
     def clear_proxy(self) -> dict[str, object]:
         self._run("config", "--global", "--unset", self.PROXY_KEY, check=False)
+        self.invalidate()
         return self.proxy_status()
 
     def auto_commit_script(self) -> Path:
