@@ -258,6 +258,46 @@
       </div>
     </div>
 
+    <!-- 分段路由：点右上角「架构 → 执行」标签或 ✎ 打开 -->
+    <div class="modal-backdrop" id="route-modal" hidden>
+      <div class="modal route-modal">
+        <div class="modal-head">
+          <h2>分段路由：架构段 → 执行段</h2>
+          <button class="icon-btn" id="route-close" type="button">✕</button>
+        </div>
+        <div class="modal-body">
+          <p class="muted-small">
+            两段可以各用一套配置与模型（例如架构走中转的 GPT、执行走个人 Key 的
+            DeepSeek）。选「跟随当前配置」表示与侧栏当前配置一致。
+          </p>
+          <div class="field-grid">
+            <label class="field">
+              <span>架构段配置</span>
+              <select id="route-architect-provider"></select>
+            </label>
+            <label class="field">
+              <span>架构段模型</span>
+              <input id="route-architect-model" placeholder="例如 gpt-5.6-sol" />
+            </label>
+            <label class="field">
+              <span>执行段配置</span>
+              <select id="route-editor-provider"></select>
+            </label>
+            <label class="field">
+              <span>执行段模型</span>
+              <input id="route-editor-model" placeholder="例如 deepseek-v4-flash" />
+            </label>
+          </div>
+          <div class="modal-status" id="route-status"></div>
+        </div>
+        <div class="modal-foot">
+          <button class="btn ghost" id="route-follow" type="button">两段都跟随当前配置</button>
+          <button class="btn ghost" id="route-cancel" type="button">取消</button>
+          <button class="btn primary" id="route-save" type="button">保存</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 命令面板（Ctrl+K，Codex 式） -->
     <div class="modal-backdrop" id="palette-modal" hidden>
       <div class="modal palette-modal">

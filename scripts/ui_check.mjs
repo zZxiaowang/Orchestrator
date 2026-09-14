@@ -627,6 +627,32 @@ async function main() {
     );
     check("纲领/步骤卡片提供复制按钮", copyButtons > 0, `copy-btn=${copyButtons}`);
 
+    // 3f) 右上角「架构 → 执行」标签：点开就能改分段路由
+    const chipClicked = await cdp.clickSelector("#route-chips button.chip.architect");
+    const routeOpened = await cdp.evaluate(
+      `!document.getElementById("route-modal").hidden`,
+    );
+    await cdp.evaluate(`(() => {
+      const el = document.getElementById("route-editor-model");
+      el.value = "deepseek-v4-uitest";
+      return el.value;
+    })()`);
+    const routeSaved = await cdp.clickSelector("#route-save");
+    await sleep(500);
+    const chipsText = await cdp.evaluate(
+      `document.getElementById("route-chips").innerText.replace(/\\s+/g, " ")`,
+    );
+    check(
+      "右上角架构→执行标签可点击修改",
+      chipClicked.hit && routeOpened && routeSaved.hit && chipsText.includes("deepseek-v4-uitest"),
+      JSON.stringify({ opened: routeOpened, chips: chipsText }),
+    );
+
+    // 还原成"两段都跟随当前配置"，避免自检改坏演示配置
+    await cdp.clickSelector("#route-edit");
+    await cdp.clickSelector("#route-follow");
+    await sleep(400);
+
     // 4) 右侧标签页切换
     for (const tab of ["changes", "files", "docs", "plan"]) {
       const clicked = await cdp.clickSelector(`.tab[data-tab="${tab}"]`);

@@ -253,6 +253,13 @@ function bindEvents() {
   on("settings-btn", "click", openSettings);
   on("settings-close", "click", closeSettings);
   on("settings-cancel", "click", closeSettings);
+  on("route-close", "click", closeRouteModal);
+  on("route-cancel", "click", closeRouteModal);
+  on("route-save", "click", saveRouteModal);
+  on("route-follow", "click", followCurrentProvider);
+  on("route-modal", "click", (event) => {
+    if (event.target.id === "route-modal") closeRouteModal();
+  });
   on("settings-save", "click", saveSettings);
   on("settings-test", "click", testConnection);
   on("provider-new", "click", newProvider);
@@ -349,7 +356,7 @@ function handleGlobalKeydown(event) {
       closePalette();
       return;
     }
-    for (const id of ["settings-modal", "market-modal", "confirm-modal"]) {
+    for (const id of ["settings-modal", "market-modal", "route-modal", "confirm-modal"]) {
       const modal = document.getElementById(id);
       if (modal && !modal.hidden) {
         modal.hidden = true;
@@ -698,17 +705,29 @@ function updateRouteChips() {
   const split = Boolean(routes.architect?.provider_id || routes.editor?.provider_id);
   const architectLabel = `架构 ${architect.model}${architect.host ? ` @ ${architect.host}` : ""}`;
   const editorLabel = `执行 ${editor.model}${editor.host ? ` @ ${editor.host}` : ""}`;
+  // 两个标签本身就是入口：点它就能改"哪一段用哪套配置、哪个模型"，
+  // 不必再去设置弹窗里翻分段模式。
+  const chip = (role, label, configured) => {
+    const node = h("button", {
+      class: `chip ${role}${configured ? "" : " missing"}`,
+      type: "button",
+      title: `${label} · 点击修改分段路由`,
+      text: `${label}${configured ? "" : " · 未配置"}`,
+    });
+    node.addEventListener("click", safe(openRouteModal));
+    return node;
+  };
   dom.routeChips.replaceChildren(
-    h("span", {
-      class: `chip architect${architect.configured ? "" : " missing"}`,
-      text: `${architectLabel}${architect.configured ? "" : " · 未配置"}`,
-      title: architectLabel,
-    }),
+    chip("architect", architectLabel, architect.configured),
     h("span", { class: "muted", text: "→" }),
-    h("span", {
-      class: `chip editor${editor.configured ? "" : " missing"}`,
-      text: `${editorLabel}${editor.configured ? "" : " · 未配置"}`,
-      title: editorLabel,
+    chip("editor", editorLabel, editor.configured),
+    h("button", {
+      class: "icon-btn route-edit",
+      id: "route-edit",
+      type: "button",
+      title: "修改分段路由（两段各用哪套配置 / 模型）",
+      text: "✎",
+      onclick: safe(openRouteModal),
     })
   );
   if (!architect.configured || !editor.configured) {
@@ -1450,6 +1469,92 @@ function openSettings() {
 
 function closeSettings() {
   document.getElementById("settings-modal").hidden = true;
+}
+
+/* ── 分段路由（右上角标签点开的弹窗）── */
+
+async function openRouteModal() {
+  const modal = document.getElementById("route-modal");
+  if (!modal) return;
+  document.getElementById("route-status").textContent = "";
+  // 配置列表可能还没加载（刚启动就点右上角），补一次再填表单
+  if (!state.providers.length) {
+    try {
+      applySettingsPayload(await api.settings());
+    } catch (error) {
+      reportClientError("route", error, { step: "load settings" });
+    }
+  }
+  fillRouteSelects();
+  const routes = state.settings?.routes || {};
+  const architect = routes.architect || {};
+  const editor = routes.editor || {};
+  document.getElementById("route-architect-provider").value = architect.provider_id || "";
+  document.getElementById("route-architect-model").value = architect.model || "";
+  document.getElementById("route-editor-provider").value = editor.provider_id || "";
+  document.getElementById("route-editor-model").value = editor.model || "";
+  modal.hidden = false;
+}
+
+function closeRouteModal() {
+  document.getElementById("route-modal").hidden = true;
+}
+
+/** 两个下拉：空值 = "跟随当前配置"。 */
+function fillRouteSelects() {
+  for (const elementId of ["route-architect-provider", "route-editor-provider"]) {
+    const select = document.getElementById(elementId);
+    const previous = select.value;
+    select.replaceChildren(
+      h("option", { value: "", text: "（跟随当前配置）" }),
+      ...state.providers.map((profile) => h("option", { value: profile.id, text: profile.name }))
+    );
+    select.value = previous;
+  }
+}
+
+async function saveRouteModal() {
+  const status = document.getElementById("route-status");
+  const saveBtn = document.getElementById("route-save");
+  saveBtn.disabled = true;
+  status.textContent = "";
+  try {
+    const payload = await api.routes({
+      architect: {
+        provider_id: document.getElementById("route-architect-provider").value,
+        model: document.getElementById("route-architect-model").value.trim(),
+      },
+      editor: {
+        provider_id: document.getElementById("route-editor-provider").value,
+        model: document.getElementById("route-editor-model").value.trim(),
+      },
+    });
+    applySettingsPayload(payload);
+    updateRouteChips();
+    closeRouteModal();
+    showToast("分段路由已更新。");
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    saveBtn.disabled = false;
+  }
+}
+
+/** 一键回到"两段都跟随当前配置"。 */
+async function followCurrentProvider() {
+  const status = document.getElementById("route-status");
+  try {
+    const payload = await api.routes({
+      architect: { provider_id: "", model: "" },
+      editor: { provider_id: "", model: "" },
+    });
+    applySettingsPayload(payload);
+    updateRouteChips();
+    closeRouteModal();
+    showToast("两段都跟随当前配置。");
+  } catch (error) {
+    status.textContent = error.message;
+  }
 }
 
 /* ── 配置（Provider）：中转 / 个人 Key 直连，可多套切换 ── */

@@ -682,6 +682,31 @@ pre,
   padding: 2px 9px;
   background: var(--panel-2);
   white-space: nowrap;
+  /* 右上角的路由标签本身就是按钮：点开就能改分段路由 */
+  font: inherit;
+  color: inherit;
+  line-height: 1.5;
+}
+
+button.chip {
+  cursor: pointer;
+}
+
+button.chip:hover {
+  background: #fff;
+  border-color: rgba(9, 105, 218, 0.45);
+  box-shadow: 0 1px 3px rgba(31, 35, 40, 0.08);
+}
+
+button.chip:focus-visible {
+  outline: 2px solid rgba(9, 105, 218, 0.45);
+  outline-offset: 1px;
+}
+
+.route-edit {
+  width: 22px;
+  height: 22px;
+  font-size: 12px;
 }
 
 .chip.architect {
