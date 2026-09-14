@@ -294,6 +294,40 @@ def _schedule_selftest(window, url: str, *, seconds: float) -> None:
             )
             logger.info("[自检] 点击链路：%s", "PASS" if clicks_ok else "FAIL")
 
+            # Git 面板是异步渲染的：点击后要等一会儿再数按钮
+            with suppress(Exception):
+                window.evaluate_js("document.getElementById('git-btn').click()")
+            git_state = {}
+            # 面板内容要等几次接口返回才渲染完（打包版首次请求更慢），这里轮询
+            deadline_git = time.time() + 12
+            while time.time() < deadline_git:
+                with suppress(Exception):
+                    git_state = (
+                        window.evaluate_js(
+                            "({ opened: !document.getElementById('git-modal').hidden,"
+                            " buttons: document.querySelectorAll('#git-body button').length,"
+                            " hasProxy: document.body.innerText.includes('网络代理'),"
+                            " hasBranch: document.body.innerText.includes('分支'),"
+                            " hasAuto: document.body.innerText.includes('每日开机自动提交') })"
+                        )
+                        or {}
+                    )
+                if (git_state.get("buttons") or 0) >= 10:
+                    break
+                time.sleep(0.4)
+            logger.info("[自检] Git 面板：%s", git_state)
+            git_ok = (
+                git_state.get("opened") is True
+                and (git_state.get("buttons") or 0) >= 10
+                and git_state.get("hasProxy") is True
+                and git_state.get("hasBranch") is True
+                and git_state.get("hasAuto") is True
+            )
+            logger.info("[自检] Git 面板按钮齐全：%s", "PASS" if git_ok else "FAIL")
+            with suppress(Exception):
+                window.evaluate_js("document.getElementById('git-close').click()")
+            clicks_ok = clicks_ok and git_ok
+
         time.sleep(max(0.0, seconds))
         with suppress(Exception):
             window.destroy()

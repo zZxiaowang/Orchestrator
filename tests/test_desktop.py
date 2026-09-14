@@ -63,6 +63,14 @@ class _FakeWindow:
 
     def evaluate_js(self, script: str) -> bool:
         """假窗口：模拟"界面已渲染"，让自检逻辑能跑完。"""
+        if "hasProxy" in script:
+            return {
+                "opened": True,
+                "buttons": 20,
+                "hasProxy": True,
+                "hasBranch": True,
+                "hasAuto": True,
+            }
         return "document.querySelector('.app')" in script
 
 

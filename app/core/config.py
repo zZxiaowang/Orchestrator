@@ -760,6 +760,21 @@ def get_settings() -> Settings:
     return settings_store.get()
 
 
+def project_root() -> Path:
+    """项目根目录（Git 面板默认操作的仓库）。
+
+    * 源码运行：就是项目目录；
+    * 打包运行：``_MEIPASS`` 只是临时解压目录，不是仓库；此时取**数据目录的上一级**
+      （便携布局 ``<项目>\\dist\\Orchestrator.exe`` + ``<项目>\\data`` → ``<项目>``）。
+    """
+    if not is_frozen():
+        return ORCHESTRATOR_ROOT
+    candidate = DATA_DIR.parent
+    if (candidate / ".git").exists():
+        return candidate
+    return CONFIG_ROOT
+
+
 def _validate_base_url(value: str, field: str) -> None:
     """留空表示"未配置"；一旦填写，就必须是完整的 http/https 地址。
 

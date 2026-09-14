@@ -142,10 +142,10 @@ def _catalog(request: Request) -> CatalogStore:
 
 def _git(request: Request) -> GitService:
     """Git 面板操作的仓库：默认就是本项目目录（可用 GIT_DIR 覆盖）。"""
-    from app.core.config import ORCHESTRATOR_ROOT
+    from app.core.config import project_root
 
     settings = _settings(request)
-    repo = Path(settings.git_dir).expanduser() if settings.git_dir else ORCHESTRATOR_ROOT
+    repo = Path(settings.git_dir).expanduser() if settings.git_dir else project_root()
     return GitService(repo)
 
 
