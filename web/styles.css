@@ -681,6 +681,13 @@ body[data-panel="open"] .app {
   color: var(--muted);
 }
 
+/* 运行操作条：当前这步能做什么，集中一处 */
+.run-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .chip {
   border: 1px solid var(--border);
   border-radius: 999px;
@@ -1027,6 +1034,13 @@ textarea.feedback {
   justify-content: center;
   margin: 18px 0;
   flex-wrap: wrap;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 4px 0 10px;
 }
 
 .flow-node {
@@ -1450,6 +1464,119 @@ textarea:focus {
   flex-wrap: wrap;
 }
 
+/* ── Git 面板：文件行 + 折叠菜单（替代"每个文件 3 个按钮"的按钮墙）── */
+.git-files {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-file {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.git-file-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+}
+
+.git-file-head .file-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.git-file-head .file-path:hover {
+  color: var(--accent);
+}
+
+.git-file-menu {
+  position: relative;
+}
+
+.git-file-menu > summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted);
+  padding: 0 6px;
+  border-radius: 6px;
+  user-select: none;
+}
+
+.git-file-menu > summary::-webkit-details-marker {
+  display: none;
+}
+
+.git-file-menu[open] > summary {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.git-file-menu-body {
+  position: absolute;
+  right: 0;
+  top: 22px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  min-width: 116px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(31, 35, 40, 0.12);
+}
+
+.git-menu-item {
+  text-align: left;
+  border: 0;
+  background: transparent;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.git-menu-item:hover {
+  background: var(--panel-2);
+}
+
+.git-menu-item.danger {
+  color: var(--danger);
+}
+
+/* Git 面板里的低频区块（代理 / 分支 / 每日自动提交）默认折叠 */
+.git-section {
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: var(--panel);
+}
+
+.git-section > summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--muted);
+  user-select: none;
+}
+
+.git-section[open] > summary {
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.git-section > *:not(summary) {
+  margin-top: 6px;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1534,6 +1661,16 @@ textarea:focus {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border-soft);
   background: var(--panel);
+}
+
+/* 看板现在住在明细面板里：占满面板高度，去掉主区那套边框与高度限制 */
+.inspector-body .dashboard {
+  max-height: none;
+  height: 100%;
+  padding: 0;
+  border-bottom: none;
+  background: transparent;
+  gap: 10px;
 }
 
 .dashboard > * {

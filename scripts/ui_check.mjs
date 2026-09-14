@@ -699,6 +699,92 @@ async function main() {
       JSON.stringify(revertLabels),
     );
 
+    // 3e) 运行操作条 + 首次使用引导
+    const actions = await cdp.evaluate(`(() => {
+      const host = document.getElementById("run-actions");
+      return {
+        exists: Boolean(host),
+        labels: host ? Array.from(host.querySelectorAll("button")).map((el) => el.textContent.trim()) : [],
+      };
+    })()`);
+    check(
+      "顶栏有运行操作条（当前能做什么集中一处）",
+      actions.exists && actions.labels.some((text) => text.includes("打包重启")),
+      JSON.stringify(actions),
+    );
+
+    const emptyState = await cdp.evaluate(`(() => {
+      // 临时进入空状态，看未配置时的引导（改完立即恢复）
+      const saved = state.run;
+      state.run = null;
+      render();
+      const text = document.querySelector(".empty")?.innerText || "";
+      const hasButtons = document.querySelectorAll(".empty-actions button").length;
+      state.run = saved;
+      render();
+      return { hasButtons, text: text.replace(/\\s+/g, " ").slice(0, 80) };
+    })()`);
+    check(
+      "空状态给出下一步（配置引导 / 或功能介绍）",
+      emptyState.text.length > 10,
+      JSON.stringify(emptyState),
+    );
+
+    // 3d) Git 面板：主操作齐全，但不再有"按钮墙"
+    await cdp.clickSelector("#git-btn");
+    await sleep(1500);
+    const gitPanel = await cdp.evaluate(`(() => {
+      // Chrome 用 content-visibility 折叠 <details>，offsetParent 仍非空，
+      // 所以要沿着祖先链判断"是否落在某个关闭的 details 里"。
+      const visible = Array.from(document.querySelectorAll("#git-body button")).filter((el) => {
+        for (let node = el.parentElement; node; node = node.parentElement) {
+          if (node.tagName === "DETAILS" && !node.open &&
+              !node.querySelector(":scope > summary")?.contains(el)) {
+            return false;
+          }
+        }
+        return el.getBoundingClientRect().height > 0;
+      });
+      const rows = document.querySelectorAll(".git-file").length;
+      const boxes = document.querySelectorAll(".git-section").length;
+      const closed = Array.from(document.querySelectorAll(".git-section")).filter((el) => !el.open).length;
+      const summaryText = Array.from(document.querySelectorAll("#git-body summary")).map((el) => el.textContent.trim());
+      return {
+        visibleButtons: visible.length,
+        labels: visible.map((el) => el.textContent.trim()).slice(0, 12),
+        fileRows: rows,
+        sections: boxes,
+        collapsed: closed,
+        summaries: summaryText,
+      };
+    })()`);
+    check(
+      "Git 面板不再有按钮墙（可见按钮 ≤ 12，低频块默认折叠）",
+      gitPanel.visibleButtons <= 12 &&
+        gitPanel.sections >= 3 &&
+        gitPanel.collapsed === gitPanel.sections &&
+        gitPanel.summaries.some((text) => text.includes("网络代理")) &&
+        gitPanel.summaries.some((text) => text.includes("每日开机自动提交")),
+      JSON.stringify(gitPanel),
+    );
+    const gitFileMenu = await cdp.evaluate(`(() => {
+      const row = document.querySelector(".git-file");
+      if (!row) return null;
+      const details = row.querySelector(".git-file-menu");
+      details.open = true;
+      const items = Array.from(details.querySelectorAll("button")).map((el) => el.textContent.trim());
+      details.open = false;
+      return { items };
+    })()`);
+    check(
+      "文件级操作收进「⋯」菜单（看差异 / 暂存 / 丢弃）",
+      Boolean(gitFileMenu) &&
+        ["看差异", "丢弃改动"].every((label) => gitFileMenu.items.includes(label)),
+      JSON.stringify(gitFileMenu),
+    );
+    await cdp.clickSelector("#git-close");
+    await sleep(300);
+
     // 3c2) 多轮续聊：跑完之后接着说下一步 → 追加步骤（不重跑旧的）
     const beforeContinue = await cdp.evaluate(
       `document.querySelectorAll(".card.step").length`,
@@ -923,7 +1009,13 @@ async function main() {
     const bg = await cdp.evaluate(`getComputedStyle(document.body).backgroundColor`);
     check("页面为浅色背景", bg === "rgb(255, 255, 255)", bg);
 
-    // 8) 运行统计看板：总览 / 明细 / 中文状态（第 4 步交付）
+    // 8) 运行统计看板：现在在明细面板的「统计」标签里（按需渲染）
+    if ((await cdp.evaluate(`document.body.dataset.panel`)) !== "open") {
+      await cdp.clickSelector("#inspector-toggle");
+      await sleep(400);
+    }
+    await cdp.clickSelector('#inspector-tabs [data-tab="stats"]');
+    await sleep(500);
     let dashboardReady = false;
     for (let attempt = 0; attempt < 20; attempt += 1) {
       dashboardReady = await cdp.evaluate(`(() => {

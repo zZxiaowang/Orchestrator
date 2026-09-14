@@ -305,20 +305,33 @@ def _schedule_selftest(window, url: str, *, seconds: float) -> None:
                     git_state = (
                         window.evaluate_js(
                             "({ opened: !document.getElementById('git-modal').hidden,"
-                            " buttons: document.querySelectorAll('#git-body button').length,"
-                            " hasProxy: document.body.innerText.includes('网络代理'),"
-                            " hasBranch: document.body.innerText.includes('分支'),"
-                            " hasAuto: document.body.innerText.includes('每日开机自动提交') })"
+                            # 只数**真正能看到**的按钮：折叠 <details> 里的不算按钮墙
+                            # （Chrome 用 content-visibility 折叠，offsetParent 判断不了，
+                            #  这里沿祖先链找关闭的 details）
+                            " buttons: Array.from(document.querySelectorAll('#git-body button')).filter((el) => {"
+                            "   for (let n = el.parentElement; n; n = n.parentElement) {"
+                            "     if (n.tagName === 'DETAILS' && !n.open &&"
+                            "         !n.querySelector(':scope > summary')?.contains(el)) return false;"
+                            "   }"
+                            "   return el.getBoundingClientRect().height > 0; }).length,"
+                            " fileRows: document.querySelectorAll('.git-file').length,"
+                            # 用 textContent：这三块默认折叠在 <details> 里，
+                            # innerText 只看渲染内容，会误判成"缺失"
+                            " hasProxy: document.body.textContent.includes('网络代理'),"
+                            " hasBranch: document.body.textContent.includes('分支'),"
+                            " hasAuto: document.body.textContent.includes('每日开机自动提交') })"
                         )
                         or {}
                     )
-                if (git_state.get("buttons") or 0) >= 10:
+                # 主操作（刷新/拉取/推送/提交 + 批量操作）应当齐备；
+                # 按钮数不再随文件数暴涨——这是"按钮墙"的回归防线
+                if (git_state.get("buttons") or 0) >= 3 and (git_state.get("buttons") or 0) <= 12:
                     break
                 time.sleep(0.4)
             logger.info("[自检] Git 面板：%s", git_state)
             git_ok = (
                 git_state.get("opened") is True
-                and (git_state.get("buttons") or 0) >= 10
+                and 3 <= (git_state.get("buttons") or 0) <= 12
                 and git_state.get("hasProxy") is True
                 and git_state.get("hasBranch") is True
                 and git_state.get("hasAuto") is True

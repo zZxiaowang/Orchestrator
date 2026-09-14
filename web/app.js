@@ -7,6 +7,9 @@ const STORAGE_KEY = "orchestrator.lastRun";
 const SIDEBAR_KEY = "orchestrator.sidebarWide";
 const PANEL_KEY = "orchestrator.panelOpen";
 
+//: 统计看板的刷新入口：宿主元素在「统计」标签里按需创建，所以不能只在加载时抓一次
+let dashboardRefresh = null;
+
 /* ── 前端错误留证：点不动的问题必须能在后端查到 ── */
 
 function reportClientError(kind, error, context = {}) {
@@ -729,9 +732,71 @@ function render() {
   renderRunList();
   updateStatus();
   updateRouteChips();
+  renderRunActions();
   renderTimeline();
   renderInspector();
   updateComposer();
+  // 看板宿主在明细面板里：整体重绘后补一次刷新（宿主可能是刚创建出来的）
+  if (typeof dashboardRefresh === "function") dashboardRefresh();
+}
+
+/**
+ * 运行操作条：把"这个运行现在能做什么"收在一处。
+
+ * 以前确认在纲领卡片里、重试/回滚在步骤卡片里、继续在时间线底部，
+ * 用户得先找到那张卡片才知道能做什么。
+ */
+function renderRunActions() {
+  const host = document.getElementById("run-actions");
+  if (!host) return;
+  const run = state.run;
+  const status = run ? run.status : "";
+  const nodes = [];
+  const button = (label, cls, handler, title = "") => {
+    const node = h("button", { class: `btn ${cls} small`, type: "button", text: label, title });
+    node.addEventListener("click", safe(handler));
+    return node;
+  };
+
+  if (status === "awaiting_approval") {
+    nodes.push(
+      button("确认并开始执行", "primary", async () => {
+        await api.approve(run.id, "");
+        state.run.status = "executing";
+        render();
+      })
+    );
+  }
+  if (status === "planning" || status === "executing") {
+    nodes.push(button("停止", "ghost", () => api.cancel(run.id)));
+  }
+  if (run && ["done", "blocked", "failed", "paused"].includes(status)) {
+    nodes.push(
+      button("继续说下一步", "ghost", () => {
+        const input = document.getElementById("continue-input");
+        if (input) {
+          input.scrollIntoView({ block: "center" });
+          input.focus();
+        }
+      })
+    );
+  }
+  const hasBlocked = (run?.steps || []).some((step) => step.status === "blocked");
+  if (status === "blocked" || (status === "failed" && hasBlocked)) {
+    nodes.push(
+      button("补充信息并继续", "ghost", () => {
+        const box = document.querySelector(".approval textarea.feedback");
+        if (box) {
+          box.scrollIntoView({ block: "center" });
+          box.focus();
+        }
+      })
+    );
+  }
+  nodes.push(
+    button("⟳ 打包重启", "ghost", rebuildAndRestart, "改完源码后重新打包并重启，让改动生效")
+  );
+  host.replaceChildren(...nodes);
 }
 
 function updateStatus() {
@@ -902,6 +967,40 @@ function renderTimeline() {
 }
 
 function renderEmptyState() {
+  const architectReady = Boolean(state.settings?.architect?.configured);
+  const editorReady = Boolean(state.settings?.editor?.configured);
+  // 首次使用：别先讲一堆功能，直接告诉用户"现在做哪三步"
+  if (state.settings && !(architectReady && editorReady)) {
+    const missing = !architectReady && !editorReady ? "中转地址与 Key" : "缺少的那一段配置";
+    const openButton = h("button", { class: "btn primary", type: "button", text: "去配置" });
+    openButton.addEventListener("click", safe(() => openSettings("model")));
+    const testButton = h("button", { class: "btn ghost", type: "button", text: "测试连接" });
+    testButton.addEventListener(
+      "click",
+      safe(() => {
+        openSettings("model");
+        setTimeout(() => document.getElementById("settings-test")?.click(), 400);
+      })
+    );
+    return h(
+      "div",
+      { class: "empty" },
+      h("h2", { text: "还差一步：先配好模型端点" }),
+      h("p", { text: `当前缺少：${missing}。填好后就能开始第一个任务。` }),
+      h(
+        "div",
+        { class: "empty-flow" },
+        h("div", { class: "flow-node" }, h("b", { text: "① 填地址与 Key" }), "中转网关或官方直连都行"),
+        h("div", { class: "flow-node" }, h("b", { text: "② 测一下连接" }), "确认 Key 有效、模型可用"),
+        h("div", { class: "flow-node" }, h("b", { text: "③ 描述目标" }), "架构出纲领，确认后执行")
+      ),
+      h("div", { class: "empty-actions" }, openButton, testButton),
+      h("p", {
+        class: "muted",
+        text: "配置只保存在本机 data/settings.json，接口不回传明文 Key。",
+      })
+    );
+  }
   return h(
     "div",
     { class: "empty" },
@@ -1423,7 +1522,19 @@ function renderInspector() {
   if (state.tab === "plan") return renderPlanInspector(run);
   if (state.tab === "changes") return renderChangesInspector(run);
   if (state.tab === "files") return renderFilesInspector(run);
+  if (state.tab === "stats") return renderStatsInspector();
   return renderDocsInspector(run);
+}
+
+/** 「统计」标签：看板从主区挪到这里，只在打开时渲染。 */
+function renderStatsInspector() {
+  let host = document.getElementById("run-dashboard");
+  if (!host || !dom.inspectorBody.contains(host)) {
+    // 复用已有的宿主，避免每次重绘都把看板内容清空再重建
+    host = h("div", { class: "dashboard", id: "run-dashboard" });
+    dom.inspectorBody.replaceChildren(host);
+  }
+  if (typeof dashboardRefresh === "function") dashboardRefresh();
 }
 
 function renderPlanInspector(run) {
@@ -2363,10 +2474,10 @@ async function renderGitPanel() {
       })
     );
     nodes.push(
-      h("h3", { class: "section-label", text: "网络代理" }),
       h(
-        "div",
-        { class: "check-item" },
+        "details",
+        { class: "git-section" },
+        h("summary", { text: "网络代理" }),
         h("div", {
           class: "muted-small",
           text: proxy.active
@@ -2416,7 +2527,14 @@ async function renderGitPanel() {
     h("div", { class: "market-toolbar" }, branchSelect, switchButton),
     h("div", { class: "market-toolbar" }, newBranchInput, createButton)
   );
-  nodes.push(h("h3", { class: "section-label", text: "分支" }), branchBox);
+  nodes.push(
+    h(
+      "details",
+      { class: "git-section" },
+      h("summary", { text: `分支（当前 ${history.branches.current}）` }),
+      branchBox
+    )
+  );
 
   // 变更列表
   const selected = new Set();
@@ -2459,48 +2577,54 @@ async function renderGitPanel() {
       await renderGitPanel();
     }));
     batch.append(stageAll, unstageAll, stageSelected, discardSelected);
-    nodes.push(batch);
+    // 批量操作收进折叠块：默认视图只留主操作，避免一屏全是按钮
+    nodes.push(
+      h(
+        "details",
+        { class: "git-section" },
+        h("summary", { text: `批量操作（暂存 / 丢弃，共 ${status.files.length} 个改动）` }),
+        batch
+      )
+    );
 
-    const list = h("div", { class: "checklist" });
+    // 文件列表：一行一个文件，行内只留一个「⋯」菜单——
+    // 以前每个文件铺 3 个按钮，改动一多就是几十个按钮的墙。
+    const list = h("div", { class: "git-files" });
     for (const file of status.files) {
       const check = h("input", { type: "checkbox" });
       check.addEventListener("change", () => {
         if (check.checked) selected.add(file.path);
         else selected.delete(file.path);
       });
-      const row = h(
-        "div",
-        { class: "check-item", dataset: { file: file.path } },
-        h(
-          "div",
-          { class: "check-title" },
-          check,
-          h("span", { class: "badge", text: file.label }),
-          h("span", { class: "file-path", text: file.path }),
-          h("span", { class: "muted-small", text: file.staged ? "已暂存" : "未暂存" })
-        )
-      );
-      const diffButton = h("button", { class: "copy-btn", text: "看差异" });
-      diffButton.addEventListener(
-        "click",
-        safe(async (event) => {
-          event.stopPropagation();
-          const payload = await api.gitDiff(file.path);
-          const pre = h("div", { class: "diff" });
-          for (const line of (payload.diff || "（无差异）").split("\n")) {
-            let cls = "diff-line";
-            if (line.startsWith("@@")) cls += " hunk";
-            else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
-            else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
-            pre.append(h("div", { class: cls, text: line }));
-          }
-          row.querySelector(".diff")?.remove();
-          row.append(pre);
-        })
-      );
-      row.querySelector(".check-title").append(diffButton);
+      const diff = h("div", { class: "diff", hidden: true });
+      const fillDiff = async () => {
+        if (diff.childElementCount) return;
+        const payload = await api.gitDiff(file.path);
+        for (const line of (payload.diff || "（无差异）").split("\n")) {
+          let cls = "diff-line";
+          if (line.startsWith("@@")) cls += " hunk";
+          else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+          else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+          diff.append(h("div", { class: cls, text: line }));
+        }
+      };
+      const toggleDiff = safe(async (event) => {
+        event?.stopPropagation();
+        if (!diff.hidden) {
+          diff.hidden = true;
+          return;
+        }
+        await fillDiff();
+        diff.hidden = false;
+      });
 
-      const stageToggle = h("button", { class: "copy-btn", text: file.staged ? "取消暂存" : "暂存" });
+      const seeDiff = h("button", { class: "git-menu-item", type: "button", text: "看差异" });
+      seeDiff.addEventListener("click", toggleDiff);
+      const stageToggle = h("button", {
+        class: "git-menu-item",
+        type: "button",
+        text: file.staged ? "取消暂存" : "暂存",
+      });
       stageToggle.addEventListener(
         "click",
         safe(async (event) => {
@@ -2510,7 +2634,7 @@ async function renderGitPanel() {
           await renderGitPanel();
         })
       );
-      const discardOne = h("button", { class: "copy-btn", text: "丢弃" });
+      const discardOne = h("button", { class: "git-menu-item danger", type: "button", text: "丢弃改动" });
       discardOne.addEventListener(
         "click",
         safe(async (event) => {
@@ -2527,8 +2651,23 @@ async function renderGitPanel() {
           await renderGitPanel();
         })
       );
-      row.querySelector(".check-title").append(stageToggle, discardOne);
-      list.append(row);
+
+      const head = h(
+        "div",
+        { class: "git-file-head" },
+        check,
+        h("span", { class: "badge", text: file.label }),
+        h("span", { class: "file-path", title: "点击展开差异", text: file.path }),
+        h("span", { class: "muted-small", text: file.staged ? "已暂存" : "未暂存" }),
+        h(
+          "details",
+          { class: "git-file-menu" },
+          h("summary", { title: "更多操作", text: "⋯" }),
+          h("div", { class: "git-file-menu-body" }, seeDiff, stageToggle, discardOne)
+        )
+      );
+      head.querySelector(".file-path").addEventListener("click", toggleDiff);
+      list.append(h("div", { class: "git-file", dataset: { file: file.path } }, head, diff));
     }
     nodes.push(list);
   }
@@ -2612,10 +2751,10 @@ async function renderGitPanel() {
     })
   );
   nodes.push(
-    h("h3", { class: "section-label", text: "每日开机自动提交" }),
     h(
-      "div",
-      { class: "check-item" },
+      "details",
+      { class: "git-section" },
+      h("summary", { text: "每日开机自动提交" }),
       h(
         "label",
         { class: "checkbox" },
@@ -2644,29 +2783,31 @@ async function renderGitPanel() {
             { class: "check-title" },
             h("span", { class: "badge", text: commit.hash }),
             h("span", { text: commit.subject }),
-            (() => {
-              const button = h("button", { class: "copy-btn", text: "看改动" });
-              button.addEventListener(
-                "click",
-                safe(async (event) => {
-                  event.stopPropagation();
-                  const payload = await api.gitShow(commit.hash);
-                  const block = h("div", { class: "diff" });
-                  for (const line of (payload.diff || "（无差异）").split("\n")) {
-                    let cls = "diff-line";
-                    if (line.startsWith("@@")) cls += " hunk";
-                    else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
-                    else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
-                    block.append(h("div", { class: cls, text: line }));
-                  }
-                  row.querySelector(".diff")?.remove();
-                  row.append(block);
-                })
-              );
-              return button;
-            })()
+            h("span", { class: "muted-small", text: "点击查看改动" })
           ),
           h("div", { class: "check-goal", text: `${commit.author} · ${commit.date}` })
+        );
+          // 整行可点：以前每条提交都带一个按钮，10 条历史就是 10 个按钮
+          row.classList.add("git-commit-row");
+          row.addEventListener(
+            "click",
+            safe(async () => {
+              const existing = row.querySelector(".diff");
+              if (existing) {
+                existing.remove();
+                return;
+              }
+              const payload = await api.gitShow(commit.hash);
+              const block = h("div", { class: "diff" });
+              for (const line of (payload.diff || "（无差异）").split("\n")) {
+                let cls = "diff-line";
+                if (line.startsWith("@@")) cls += " hunk";
+                else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+                else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+                block.append(h("div", { class: cls, text: line }));
+              }
+              row.append(block);
+            })
           );
           return row;
         })()
@@ -3279,9 +3420,6 @@ function showToast(message) {
    timeline 的 DOM 变更作为兜底触发。断线重连后 app.js 会重新拉取运行，
    看板随之恢复为最终数据。 */
 (function installRunDashboard() {
-  const host = document.getElementById("run-dashboard");
-  if (!host) return;
-
   const STATUS_TEXT = {
     planning: "规划中",
     awaiting_approval: "待确认",
@@ -3317,6 +3455,8 @@ function showToast(message) {
   let expanded = false;
   let signature = "";
   let pending = null;
+  //: 上次渲染用的宿主元素；宿主被重建时缓存签名必须失效，否则会渲染成空白
+  let lastHost = null;
 
   const numOf = (value) =>
     typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -3495,6 +3635,8 @@ function showToast(message) {
 
   function toggleDetail() {
     expanded = !expanded;
+    const host = document.getElementById("run-dashboard");
+    if (!host) return;
     const detail = host.querySelector(".dash-detail");
     if (detail) detail.hidden = !expanded;
     const button = host.querySelector(".dash-toggle");
@@ -3556,6 +3698,13 @@ function showToast(message) {
   }
 
   function render() {
+    // 宿主现在在「统计」标签里，是按需渲染的：每次都重新取，取不到就什么都不做
+    const host = document.getElementById("run-dashboard");
+    if (!host) return;
+    if (host !== lastHost) {
+      lastHost = host;
+      signature = "";
+    }
     const run = state.run;
     if (!run || typeof run !== "object") {
       host.hidden = true;
@@ -3603,6 +3752,9 @@ function showToast(message) {
       render();
     }, 120);
   }
+
+  // 暴露给 renderInspector / render 触发（宿主是动态创建的，不能只在加载时抓一次）
+  dashboardRefresh = schedule;
 
   // 主驱动：SSE 事件与 REST 首帧都会给 state.run 赋值
   let currentRun = state.run;

@@ -66,7 +66,9 @@ class _FakeWindow:
         if "hasProxy" in script:
             return {
                 "opened": True,
-                "buttons": 20,
+                # 新的 Git 面板：默认只留主操作（按钮不再随文件数暴涨）
+                "buttons": 5,
+                "fileRows": 3,
                 "hasProxy": True,
                 "hasBranch": True,
                 "hasAuto": True,
