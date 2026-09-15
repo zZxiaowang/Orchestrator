@@ -55,6 +55,10 @@ class FakeRelay:
         #: 命令执行闭环："" / "fix-after-failure"（先失败，拿到报错后修好）/ "always-fail"
         self.command_flow = ""
         self.python = sys.executable
+        #: 客观验收补轮：第一轮故意漏掉这个标记，收到"客观验收未通过"回灌后补上
+        self.verify_marker = ""
+        #: 补轮时是否真的补上（False = 模拟"补不上"，用于验证轮次用尽后 blocked）
+        self.verify_marker_repair = True
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -210,6 +214,12 @@ class FakeRelay:
             "commands": [{"cmd": "echo ok", "why": "验证环境"}],
             "notes": [f"第 {step_id} 步完成"],
         }
+        if self.verify_marker and self.verify_marker_repair and "客观验收未通过" in user:
+            # 收到验收失败回灌后，把要求的标记补进文件
+            payload["files"][0]["content"] = (
+                f"# 第 {step_id} 步\n\n由执行段生成。\n\n契约字段：{self.verify_marker}\n"
+            )
+            payload["summary"] = f"第 {step_id} 步：按验收要求补齐后完成。"
         if self.command_flow:
             # 第二轮（用户消息里带着"系统已经执行过这些命令"）才给出能通过的命令，
             # 用来验证"跑失败 → 回灌报错 → 继续修 → 复验通过"这条闭环。

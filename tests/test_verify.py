@@ -104,6 +104,30 @@ def test_file_contains_checks_actual_content(tmp_path: Path):
     assert empty.ok is False and "text" in empty.detail
 
 
+def test_file_contains_is_lenient_about_identifier_style(tmp_path: Path):
+    """回归：file_contains 对标识符要宽容（project_id ≡ projectId）。
+
+    真实教训：纲领要求文档含 ``project_id``，执行段写的是 ``:projectId``，
+    严格子串匹配把对的产出判成没写，运行被卡住。
+    """
+
+    workspace = _workspace(tmp_path)
+    (workspace.root / "contract.md").write_text(
+        "路由：`#/projects/:projectId` 由 projectId 标识项目\n", encoding="utf-8"
+    )
+    loose, strict, missing = run_checks(
+        workspace,
+        [
+            StepCheck(type="file_contains", path="contract.md", text="project_id"),
+            StepCheck(type="file_contains", path="contract.md", text="projectId"),
+            StepCheck(type="file_contains", path="contract.md", text="project_number"),
+        ],
+    )
+    assert loose.ok is True and "宽松" in loose.detail
+    assert strict.ok is True and strict.detail == ""  # 完全相同就是严格命中
+    assert missing.ok is False
+
+
 def test_py_compile_catches_syntax_error_without_executing(tmp_path: Path):
     workspace = _workspace(tmp_path)
     (workspace.root / "good.py").write_text("VALUE = 1\n", encoding="utf-8")

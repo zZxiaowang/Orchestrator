@@ -666,17 +666,9 @@ class Orchestrator:
         # 客观验收：纲领声明的检查 + 从交付物派生的「文件存在」检查。
         # 这是"模型说完成"与"确实完成"之间的唯一分界线。
         checks = effective_checks(step.checks, step.deliverables)
-        results = run_checks(workspace, checks) if checks else []
-        step.verification = results
-        verdict = summarize(results)
-        if results:
-            self.bus.publish(
-                run.id,
-                "verify",
-                step_id=step.id,
-                results=[item.model_dump(mode="json") for item in results],
-                summary=verdict,
-            )
+        results, verdict, verify_rounds = await self._verify_with_repair(
+            run, step, workspace, checks, client, endpoint, settings, messages, raw, stats
+        )
 
         if output.blocked:
             step.status = StepStatus.BLOCKED
@@ -705,7 +697,7 @@ class Orchestrator:
         elif verdict["failed"]:
             # 产出了东西、但没通过客观验收：不能算完成，但这是"补信息重跑一次"的情形
             step.status = StepStatus.BLOCKED
-            step.error = f"客观验收未通过：{failure_text(results)}"
+            step.error = f"客观验收未通过（已自动补 {verify_rounds} 轮）：{failure_text(results)}"
         else:
             step.status = StepStatus.DONE
 
@@ -1198,6 +1190,99 @@ class Orchestrator:
                 step_id=step.id,
                 file=changed.model_dump(mode="json"),
             )
+
+    async def _verify_with_repair(
+        self,
+        run: Run,
+        step: RunStep,
+        workspace: Workspace,
+        checks: list,
+        client: RelayClient,
+        endpoint: Endpoint,
+        settings: Settings,
+        messages: list[dict[str, str]],
+        raw: str,
+        stats: CallStats,
+    ) -> tuple[list, dict, int]:
+        """跑客观验收；没过就先给执行段一轮"补"的机会，再判生死。
+
+        真实教训：纲领要求文档里出现 ``project_id``，执行段写的是 ``:projectId``——
+        东西是对的，只是写法不一致。以前这种情况直接把运行卡住，用户只能手动继续；
+        现在把失败项连同**文件里的真实片段**回灌给它，让它自己补齐。
+        """
+
+        rounds = 0
+        results: list = []
+        verdict = summarize(results)
+        while True:
+            results = run_checks(workspace, checks) if checks else []
+            step.verification = results
+            verdict = summarize(results)
+            if results:
+                self.bus.publish(
+                    run.id,
+                    "verify",
+                    step_id=step.id,
+                    results=[item.model_dump(mode="json") for item in results],
+                    summary=verdict,
+                )
+            if not checks or verdict["failed"] == 0:
+                return results, verdict, rounds
+            if rounds >= max(0, settings.step_verify_rounds):
+                return results, verdict, rounds
+            rounds += 1
+            self.bus.publish(
+                run.id,
+                "status",
+                status=run.status.value,
+                message=f"第 {step.id} 步：客观验收未通过，正在补齐（第 {rounds} 轮）…",
+            )
+            retry_messages = [
+                *messages,
+                {"role": "assistant", "content": raw},
+                {
+                    "role": "user",
+                    "content": self._verify_repair_block(workspace, results)
+                    + f"\n\n请针对上面的失败项补齐第 {step.id} 步的产出，"
+                    "仍然只输出那一个 JSON 对象：需要改的文件放 files。",
+                },
+            ]
+            output, raw = await self._call_executor(
+                run, step, client, endpoint, retry_messages, stats=stats
+            )
+            if output.commands:
+                step.commands = [
+                    {"cmd": item.cmd, "why": item.why}
+                    for item in output.commands
+                    if item.cmd.strip()
+                ]
+            if output.summary.strip():
+                step.summary = output.summary
+            if output.handoff.strip():
+                step.handoff = output.handoff
+            if output.notes:
+                step.notes = list(output.notes)
+            self._apply_edits(run, step, workspace, output)
+            self.store.save(run)
+
+    @staticmethod
+    def _verify_repair_block(workspace: Workspace, results: list) -> str:
+        """把失败项 + 文件里的真实片段拼成回灌内容（模型据此补齐最省事）。"""
+
+        failed = [item for item in results if not item.ok]
+        chunks = ["## 客观验收未通过（这些是系统实际检查的结果）"]
+        for item in failed[:4]:
+            chunks.append(
+                f"### {item.label or item.path}\n- 检查：{item.type}\n- 结果：{item.detail or '未通过'}"
+            )
+            if item.type == "file_contains" and item.path:
+                try:
+                    content = workspace.read(item.path)
+                except AppError:
+                    continue
+                excerpt = clip_head_tail(content, 1200, path=item.path)
+                chunks.append(f"文件 `{item.path}` 当前内容（节选）：\n```\n{excerpt}\n```")
+        return "\n\n".join(chunks)
 
     async def _run_step_commands(
         self,

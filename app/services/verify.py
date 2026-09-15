@@ -189,8 +189,12 @@ def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
             base.detail = "检查项缺少要查找的内容（text）"
             return base
         content = _read(target)
-        base.ok = check.text in content
-        base.detail = "" if base.ok else f"文件里没有找到：{' '.join(check.text.split())[:60]}"
+        base.ok, loose = _contains(content, check.text)
+        if base.ok:
+            # 严格匹配失败、宽松匹配通过时要说清楚，别让人以为写错了
+            base.detail = "宽松匹配（忽略大小写与 _ - 空格）" if loose else ""
+        else:
+            base.detail = f"文件里没有找到：{' '.join(check.text.split())[:60]}"
         return base
 
     if check.type == "py_compile":
@@ -218,6 +222,27 @@ def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[:MAX_INSPECT_CHARS]
+
+
+def normalize_marker(text: str) -> str:
+    """把标识符归一化：忽略大小写与 ``_`` ``-`` 空格。
+
+    真实教训：架构段要求文档里出现 ``project_id``，而执行段写的是 ``:projectId``——
+    同一个东西，严格子串匹配却判成"没写"。这类标识符不一致不该把运行卡住。
+    """
+
+    return "".join(ch for ch in text.lower() if ch not in "_- \t")
+
+
+def _contains(content: str, needle: str) -> tuple[bool, bool]:
+    """返回 ``(是否命中, 是否为宽松命中)``。先严格子串，再归一化后匹配。"""
+
+    if needle in content:
+        return True, False
+    normalized = normalize_marker(needle)
+    if normalized and normalized in normalize_marker(content):
+        return True, True
+    return False, False
 
 
 def _glob(workspace: Workspace, pattern: str) -> list[str]:

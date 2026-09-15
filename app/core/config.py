@@ -122,6 +122,7 @@ OVERRIDABLE_FIELDS = (
     "command_allowlist",
     "command_timeout_seconds",
     "step_command_rounds",
+    "step_verify_rounds",
     "request_timeout_seconds",
     "context_budget_chars",
     "file_context_max_chars",
@@ -199,6 +200,8 @@ class Settings(BaseSettings):
     command_timeout_seconds: float = 120.0
     #: 命令失败后，允许在**同一步**内回灌报错让执行段继续修的轮数
     step_command_rounds: int = 2
+    #: 客观验收未通过时，允许在同一步内回灌结果让执行段继续补的轮数
+    step_verify_rounds: int = 2
     #: 执行段可读的工作区文件树条目上限，避免上下文爆炸
     context_tree_limit: int = 120
     #: 单步上下文字符预算（超出后按优先级裁剪，而不是让模型自己压缩）

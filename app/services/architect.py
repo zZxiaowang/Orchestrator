@@ -51,7 +51,9 @@ ARCHITECT_SYSTEM = """你是一名资深架构师，负责把需求转成**纲�
   `file_exists`（path：文件必须存在）、
   `dir_exists`（path：目录必须存在）、
   `glob`（path：通配符，至少匹配一个文件）、
-  `file_contains`（path + text：文件里必须出现该原文片段）、
+  `file_contains`（path + text：文件里必须出现该原文片段；**text 要短且稳定**，
+  用中文关键词或函数名即可，例如「普通对话」「def main」；系统对 `project_id` 与
+  `projectId` 这类标识符写法差异是宽容的，但**不要**拿一整句话当检查项）、
   `py_compile`（path：该 .py 文件必须能编译通过）、
   `json_valid`（path：该文件必须是合法 JSON）。
   系统还会自动为 deliverables 里形如路径的产出补一条 file_exists，所以**不需要**重复写它。

@@ -891,3 +891,57 @@ def test_continue_requires_an_instruction(tmp_path: Path):
         wait_for_status(client, run_id, {"awaiting_approval"})
         response = client.post(f"/api/v1/runs/{run_id}/continue", json={"instruction": "   "})
         assert response.status_code == 400
+
+
+def test_failed_objective_check_triggers_repair_round(tmp_path: Path):
+    """验收没过先自动补一轮，而不是直接把运行卡住。
+
+    真实教训：纲领要求文档含 `project_id`、执行段写 `:projectId`（宽容匹配已能过），
+    更硬的情况（如必须出现某个 token）应该由执行段在**同一步**里补上。
+    """
+
+    relay = FakeRelay()
+    relay.verify_marker = "MUST_HAVE_TOKEN"
+    relay.plan_checks = [
+        {"type": "file_contains", "path": "steps/step-1.md", "text": "MUST_HAVE_TOKEN"}
+    ]
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        step = run["steps"][0]
+        assert step["status"] == "done"
+        assert all(item["ok"] for item in step["verification"])
+
+        # 第二轮请求里带着"客观验收未通过"的回灌（以及失败项说明）
+        followups = [
+            item
+            for item in relay.requests
+            if "客观验收未通过" in item["body"]["messages"][-1]["content"]
+        ]
+        assert followups, "应当有一轮「客观验收未通过」的回灌"
+        assert "MUST_HAVE_TOKEN" in followups[-1]["body"]["messages"][-1]["content"]
+
+
+def test_objective_check_blocks_after_rounds_exhausted(tmp_path: Path):
+    """补不回来就不许标完成：轮次用尽后 blocked，并注明补了几轮。"""
+
+    relay = FakeRelay()
+    relay.verify_marker = "NEVER_APPEARS"  # 回灌后仍然补不上
+    relay.verify_marker_repair = False
+    relay.plan_checks = [
+        {"type": "file_contains", "path": "steps/step-1.md", "text": "NEVER_APPEARS"}
+    ]
+    with build_client(tmp_path, relay, settings_overrides={"step_verify_rounds": 1}) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "blocked", run
+        step = run["steps"][0]
+        assert step["status"] == "blocked"
+        assert "已自动补 1 轮" in step["error"]
