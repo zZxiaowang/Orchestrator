@@ -1025,7 +1025,7 @@ async function main() {
     const cleared = await cdp.evaluate(`document.getElementById("run-title").textContent`);
     check("点击新任务回到空状态", newRun.hit && cleared.includes("新任务"), `标题=${cleared}`);
 
-    // 6) 键盘可用性：输入、Ctrl+A 全选、覆盖输入、Ctrl+Enter 提交
+    // 6) 键盘可用性：输入、Ctrl+A 全选、覆盖输入、Enter 提交、Shift+Enter 换行
     await cdp.evaluate(`document.getElementById("task-input").focus()`);
     await cdp.send("Input.insertText", { text: "第一段文字" });
     const typed = await cdp.evaluate(`document.getElementById("task-input").value`);
@@ -1038,11 +1038,34 @@ async function main() {
       `${typed} → ${afterSelectAll}`,
     );
 
+    // Shift+Enter 只换行、不提交（Enter 发送之后的配套；否则没法写多行需求）。
+    // 换行是浏览器的默认行为，所以除了 keyDown/keyUp 还要补一条 char 事件，
+    // 否则 CDP 只派发了按键、不会真的插入换行（第一次就是这么误判的）。
+    const enter = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+    await cdp.send("Input.dispatchKeyEvent", { type: "rawKeyDown", modifiers: 8, ...enter });
+    await cdp.send("Input.dispatchKeyEvent", {
+      type: "char",
+      modifiers: 8,
+      text: "\r",
+      unmodifiedText: "\r",
+      ...enter,
+    });
+    await cdp.send("Input.dispatchKeyEvent", { type: "keyUp", modifiers: 8, ...enter });
+    await sleep(200);
+    const afterShiftEnter = await cdp.evaluate(`(() => ({
+      value: document.getElementById("task-input").value,
+      title: document.getElementById("run-title").textContent,
+    }))()`);
+    check(
+      "Shift+Enter 只换行、不提交",
+      afterShiftEnter.value.endsWith("\n") && afterShiftEnter.title.includes("新任务"),
+      JSON.stringify({ value: afterShiftEnter.value, title: afterShiftEnter.title }),
+    );
+
     const send = await cdp.pressKey({
       key: "Enter",
       code: "Enter",
       virtualKeyCode: 13,
-      modifiers: 2,
     }).then(() => ({ hit: true }));
     await sleep(3000);
     const afterSend = await cdp.evaluate(
@@ -1051,7 +1074,21 @@ async function main() {
                  steps: document.querySelectorAll(".step").length,
                  checkItems: document.querySelectorAll(".check-item").length }))()`,
     );
-    check("Ctrl+Enter 能提交并产出纲领", send.hit && afterSend.checkItems > 0, JSON.stringify(afterSend));
+    check("Enter 能提交并产出纲领", send.hit && afterSend.checkItems > 0, JSON.stringify(afterSend));
+
+    // 折叠只针对「已完成」：待执行的步骤必须保持展开（否则纲领一出来就被藏起来了）
+    const pendingOpen = await cdp.evaluate(`(() => {
+      const rows = Array.from(document.querySelectorAll(".card.step"));
+      return {
+        total: rows.length,
+        collapsed: rows.filter((card) => card.querySelector(".card-body").hidden).length,
+      };
+    })()`);
+    check(
+      "待执行的步骤不会被折叠",
+      pendingOpen.total > 0 && pendingOpen.collapsed === 0,
+      JSON.stringify(pendingOpen),
+    );
 
     const buildTag = await cdp.evaluate(`document.querySelector(".build-tag")?.textContent || ""`);
     check(
@@ -1164,6 +1201,39 @@ async function main() {
       "步骤卡片内联显示耗时与 token",
       approved && finished.includes("已完成") && stepSpend.includes("tokens") && stepSpend.includes("上下文"),
       JSON.stringify({ approved, finished, head: stepSpend.slice(0, 140) }),
+    );
+
+    // 执行长任务时，已完成步骤的明细应当默认收起（只留标题那一行摘要），点标题能展开回去
+    const collapse = await cdp.evaluate(`(() => {
+      const card = document.querySelector('.card.step[data-status="done"]');
+      if (!card) return { missing: true };
+      const head = card.querySelector(".card-head");
+      const body = card.querySelector(".card-body");
+      const arrow = () => card.querySelector(".step-caret")?.textContent.trim() || "";
+      const state = () => ({
+        hidden: Boolean(body.hidden),
+        arrow: arrow(),
+        aria: head.getAttribute("aria-expanded"),
+        rowVisible: head.getBoundingClientRect().height > 0,
+      });
+      const collapsed = state();
+      head.click();
+      const expanded = state();
+      head.click();
+      const collapsedAgain = state();
+      return { collapsed, expanded, collapsedAgain };
+    })()`);
+    check(
+      "已完成步骤默认折叠，点标题行可展开 / 再收起",
+      !collapse.missing &&
+        collapse.collapsed.hidden === true &&
+        collapse.collapsed.rowVisible === true &&
+        collapse.collapsed.arrow === "▸" &&
+        collapse.expanded.hidden === false &&
+        collapse.expanded.arrow === "▾" &&
+        collapse.expanded.aria === "true" &&
+        collapse.collapsedAgain.hidden === true,
+      JSON.stringify(collapse),
     );
 
     const composition = await cdp.evaluate(`(() => {

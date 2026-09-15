@@ -96,6 +96,10 @@ const state = {
   reconnectTimer: null,
   lastSeq: 0,
   buffers: {}, // key -> 流式文本缓冲区
+  //: 步骤卡片的展开状态，key = `${runId}:${stepId}` → { status, open }。
+  //: 已完成的步骤默认折叠：执行长任务时，视野留给"正在跑的那一步"。
+  //: 记 status 是为了"某步被重跑（done → running）"时自动重新展开，而不是沿用旧选择。
+  stepOpen: {},
   statusHint: "", // 后端给当前状态的一句话说明（例如"正在判断这是需求还是问答…"）
   tab: "plan",
   docs: [],
@@ -327,10 +331,12 @@ function bindEvents() {
     await api.cancel(state.run.id);
   });
   on("task-input", "keydown", (event) => {
-    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
-      event.preventDefault();
-      submitTask();
-    }
+    // Enter 发送，Shift+Enter 换行（Ctrl/Cmd+Enter 也保留，老习惯不用改）
+    if (event.key !== "Enter" || event.shiftKey) return;
+    // 输入法组合中的 Enter 是"选词确认"：中文输入敲到一半按回车不该把任务发出去
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    submitTask();
   });
   // 注意：这里不能直接把 openSettings 当处理器——它第一个参数是"要显示哪个分区"，
   // 直接传会把 MouseEvent 当成分区名，结果四个分区全部隐藏。
@@ -1460,6 +1466,20 @@ function stepSpend(step) {
   return parts.join(" · ");
 }
 
+/** 步骤卡片的展开状态。已完成（done）的默认折叠，其余一律展开——需要人关注的不该藏起来。 */
+function stepIsOpen(step) {
+  const remembered = state.stepOpen[`${state.run?.id || ""}:${step.id}`];
+  if (remembered && remembered.status === (step.status || "pending")) return remembered.open;
+  return (step.status || "pending") !== "done";
+}
+
+function setStepOpen(step, open) {
+  state.stepOpen[`${state.run?.id || ""}:${step.id}`] = {
+    status: step.status || "pending",
+    open,
+  };
+}
+
 function renderStepCard(step) {
   const status = step.status || "pending";
   const body = h("div", { class: "card-body" });
@@ -1604,54 +1624,97 @@ function renderStepCard(step) {
     body.append(h("div", { class: "step-actions" }, revert));
   }
 
+  // 执行长任务时，已完成的步骤把明细收起来（只留标题那一行摘要），
+  // 视野留给正在跑的那一步；点标题行随时展开回去，选择会记住。
+  const open = stepIsOpen(step);
+  body.hidden = !open;
+  const caret = h("span", { class: "step-caret", text: open ? "▾" : "▸", "aria-hidden": "true" });
+  const head = h(
+    "div",
+    {
+      class: `card-head step-head${open ? "" : " is-collapsed"}`,
+      role: "button",
+      tabindex: "0",
+      "aria-expanded": String(open),
+      title: open ? "点击收起这一步" : "点击展开这一步",
+    },
+    caret,
+    h("div", { class: "step-index", text: step.id }),
+    h("strong", { text: step.title || `第 ${step.id} 步` }),
+    h("span", {
+      class: "muted",
+      text:
+        (STEP_STATUS_TEXT[status] || status) +
+        (spent ? ` · ${spent}` : "") +
+        (step.verification?.length
+          ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
+          : "") +
+        (step.command_results?.length
+          ? ` · 命令 ${
+              step.command_results.filter((item) => !item.skipped && item.ok).length
+            }/${step.command_results.filter((item) => !item.skipped).length} 通过`
+          : ""),
+    }),
+    (step.files || []).length
+      ? (() => {
+          const link = h("button", {
+            class: "btn link step-changes",
+            type: "button",
+            text: "看变更 →",
+          });
+          link.addEventListener("click", safe(() => switchInspectorTab("changes")));
+          return link;
+        })()
+      : null,
+    copyButton(
+      () =>
+        [
+          `第 ${step.id} 步：${step.title}`,
+          step.summary,
+          ...(step.files || []).map(
+            (file) => `${file.path} (+${file.additions}/-${file.deletions})`
+          ),
+          ...(step.commands || []).map((item) => `$ ${item.cmd}`),
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      "复制"
+    )
+  );
+
+  const applyOpen = (next) => {
+    body.hidden = !next;
+    caret.textContent = next ? "▾" : "▸";
+    head.classList.toggle("is-collapsed", !next);
+    head.setAttribute("aria-expanded", String(next));
+    head.title = next ? "点击收起这一步" : "点击展开这一步";
+  };
+  const toggle = () => {
+    const next = !stepIsOpen(step);
+    setStepOpen(step, next);
+    applyOpen(next);
+  };
+  head.addEventListener(
+    "click",
+    safe((event) => {
+      // 标题行里还有「看变更 →」「复制」这类按钮，别把它们的点击当成折叠
+      if (event.target.closest("button")) return;
+      toggle();
+    })
+  );
+  head.addEventListener(
+    "keydown",
+    safe((event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggle();
+    })
+  );
+
   return h(
     "div",
     { class: "card step", dataset: { step: step.id, status } },
-    h(
-      "div",
-      { class: "card-head" },
-      h("div", { class: "step-index", text: step.id }),
-      h("strong", { text: step.title || `第 ${step.id} 步` }),
-      h("span", {
-        class: "muted",
-        text:
-          (STEP_STATUS_TEXT[status] || status) +
-          (spent ? ` · ${spent}` : "") +
-          (step.verification?.length
-            ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
-            : "") +
-          (step.command_results?.length
-            ? ` · 命令 ${
-                step.command_results.filter((item) => !item.skipped && item.ok).length
-              }/${step.command_results.filter((item) => !item.skipped).length} 通过`
-            : ""),
-      }),
-      (step.files || []).length
-        ? (() => {
-            const link = h("button", {
-              class: "btn link step-changes",
-              type: "button",
-              text: "看变更 →",
-            });
-            link.addEventListener("click", safe(() => switchInspectorTab("changes")));
-            return link;
-          })()
-        : null,
-      copyButton(
-        () =>
-          [
-            `第 ${step.id} 步：${step.title}`,
-            step.summary,
-            ...(step.files || []).map(
-              (file) => `${file.path} (+${file.additions}/-${file.deletions})`
-            ),
-            ...(step.commands || []).map((item) => `$ ${item.cmd}`),
-          ]
-            .filter(Boolean)
-            .join("\n"),
-        "复制"
-      )
-    ),
+    head,
     body
   );
 }
@@ -1859,7 +1922,7 @@ function updateComposer() {
     dom.composerHint.textContent =
       "执行段被阻塞：在时间线顶部补充信息（或指定目录）即可只重跑那一步。";
   } else {
-    dom.composerHint.textContent = "Ctrl+Enter 发送 · 将开启一个新的架构→执行流程";
+    dom.composerHint.textContent = "Enter 发送 · Shift+Enter 换行 · 将开启一个新的架构→执行流程";
   }
 }
 
@@ -3595,7 +3658,7 @@ function showShortcutHelp() {
   const lines = [
     "Ctrl+K　命令面板（新建任务 / 打开市场 / 切换配置 / 跳转任务）",
     "Ctrl+/　本帮助",
-    "Ctrl+Enter　发送任务",
+    "Enter　发送任务（Shift+Enter 换行）",
     "Esc　关闭最上层的弹窗",
     "侧栏 ▤　显示 / 隐藏已归档任务",
     "任务项悬停　★ 置顶、✎ 重命名、▣ 归档",
