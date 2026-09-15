@@ -54,6 +54,18 @@
 | 34 | 改错了要能退回去 | ✅ 步骤级 git 锚点 + 「回滚这一步」（只还原该步碰过的文件，`app/services/gitguard.py`） |
 | 35 | 跑完想接着说下一步（对话式自开发） | ✅ 多轮续聊：`POST /runs/{id}/continue`，只追加新步骤、只执行新步骤，旧步骤/事件序号不动 |
 | 36 | 改完自己的源码要能生效 | ✅ 重新打包并重启（`POST /api/v1/system/restart` + 外部辅助脚本 `scripts/restart.ps1`） |
+| 37 | 要 Orchestrator 自己对话自开发，不再靠 Codex 代写 | ✅ 自开发闭环设计与落地（`docs/self-dev-design.md`）：受控命令执行 + 逐步客观验收 + 多轮续聊 |
+| 38 | 再加"打包重启"功能 | ✅ 面板「重新打包并重启」；打包版真的能重启了（`a9180be`：三个真因） |
+| 39 | 要能结合 git 使用 | ✅ 步骤级 git 锚点 + 「回滚这一步」+ Git 面板（详见 `app/services/gitguard.py`） |
+| 40 | UI 反人性，按 Codex「侧栏 + 主区」重构 | ✅ A~D 四步重构（`8a59fea`→`389bd7a`）：明细按需滑出、设置拆四分区、统计看板进抽屉、Git 面板去按钮墙、首次引导 |
+| 41 | 右上角「架构 / 执行」点进去是两套模型设置 | ✅ 合并为同一份 `routes` 配置，按段编辑，两个入口指向同一处 |
+| 42 | 自行切分上下文（不要每次全量）；每步要有自己的 token 与用时 | ✅ P1~P4（`3582d71`）：分层上下文裁剪 + 每步耗时/token/上下文/调用轮次，看板可见 |
+| 43 | 中转 502（Cloudflare 回源失败） | ✅ 主备自动切换 + 失败重试 + 备用配置设置入口（`276f8ef`、`ad9780a`、`f8f320e`） |
+| 44 | 运行失败：list index out of range | ✅ 交接日志在「条目少但都很长」时崩溃（`b490eab`） |
+| 45 | 运行失败：验收要 `project_id`，文件里写的是 `projectId` | ✅ 标识符写法宽容 + 验收失败先自动补一轮（`eb5c564`） |
+| 46 | "重启并没有重启" | ✅ `a9180be`：修掉三个真因（Job Object / 进程占用 / 端口） |
+| 47 | 任务执行中界面多次卡死 | ✅ `b8b3dbd`：主因是逐 token 强制重排；突发 3000 token 卡死 **43.6 秒 → 2 毫秒**（见四、当前状态） |
+| 48 | 项目边界与导航信息架构（架构/执行只为项目服务、项目间隔离） | ✅ `be9d07b`：一级导航只留「普通对话 / 项目」，其余降为项目内模块；项目工作区与数据隔离（第 2/5 步交付物） |
 
 ## 三、数据与文件位置（重要）
 
@@ -65,8 +77,9 @@
 | 远端 | `https://github.com/zZxiaowang/Orchestrator.git` |
 | 后端源码 | `D:\orchestrator\app\`（`core/` `schemas/` `services/` `api/`） |
 | 前端界面（无构建） | `D:\orchestrator\web\`（`index.html` `styles.css` `app.js`） |
-| 测试 | `D:\orchestrator\tests\`（166 项 pytest） |
-| 架构/契约文档 | `D:\orchestrator\docs\`（含本文件、`next-phase-architecture.md` 等） |
+| 测试 | `D:\orchestrator\tests\`（**452 项** pytest） |
+| 架构/契约文档 | `D:\orchestrator\docs\`（本文件、`next-phase-architecture.md`、`self-dev-design.md` 等） |
+| 项目边界与导航契约 | `docs\project-context-contract.md`、`docs\project-navigation-contract.md`、`docs\project-and-chat-information-architecture.md`、`docs\sidebar-project-information-architecture.md`、`docs\navigation-migration-notes.md` |
 
 ### 2. 运行时数据（**全部在 `D:\orchestrator\data`**）
 
@@ -111,6 +124,8 @@
 | 打包版旧数据目录（**已不使用**） | `D:\orchestrator\dist\data\`（可删） |
 | 界面自检脚本 | `D:\orchestrator\scripts\ui_check.mjs`、冒烟 `scripts\smoke_check.py` |
 | 界面自检截图 | `D:\orchestrator\.logs\ui-light.png` |
+| 界面负载 / 卡死探针（本次排查用，**在 Codex 会话工作区，不在仓库内**） | `work\ui_freeze_probe.mjs`（注入 token 风暴）、`work\real_run_probe.mjs`（真实链路）、`work\demo_server.ps1`（起演示实例）、`work\slow_relay.ps1`（调速假中转） |
+| 假中转调速开关 | `FAKE_RELAY_CHUNK_DELAY`、`FAKE_RELAY_CHUNK_SIZE`（默认 0.02 秒 / 40 字符，行为不变） |
 
 ### 6. 配置优先级
 
@@ -128,22 +143,30 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **249 项**通过；ruff check/format 全绿；界面自检 **50 项全通过** |
-| 桌面自检 | 渲染 PASS、点击链路 PASS、Git 面板 29 按钮 PASS |
+| 质量门 | pytest **452 项**通过；ruff check/format 全绿；界面自检 **64 项全通过** |
+| 桌面自检 | 打包版 `--selftest` 5 项 PASS / 0 FAIL（渲染、点击链路、Git 面板等） |
+| 打包产物 | `dist\Orchestrator.exe` 约 20.8 MB（2026-09-15 23:44 构建，已确认内含最新前端） |
+| 最近提交 | `b8b3dbd`（修界面卡死）、`be9d07b`（项目边界与导航 IA）—— 已推送 `origin/main` |
+| 界面卡死实测 | 突发 3000 个 token：主线程被占住 **43630 毫秒 → 2 毫秒**；4 秒快速流的运行列表 DOM 变更 **177822 个节点 → 0**；流式文本逐字符一致（41270/41270） |
 | 推送 | 已配置 `http.https://github.com/.proxy = http://127.0.0.1:10809`（**只对 github.com 生效**） |
 
 ## 五、待办（下一步可做）
 
-1. **契约收敛收尾**：`app/services/metrics_sink.py` 是旧的 `{architect, steps}` 字典形态，
+1. **`--server --port` 被静默忽略**（2026-09-15 实测）：`dist\Orchestrator.exe --server --port 8791`
+   实际仍监听配置里的 8787。窗口形态正常，只有服务器形态不认命令行端口。
+2. **自开发流程缺一级「能编译 / 能导入」的验收**：`app/services/navigation_migration.py` 曾因
+   少写两个引号（第 108 行三引号）导致 8 个测试文件全部收集失败（SyntaxError），
+   而执行段当时的验收只检查「文件里含指定文字」。建议给写代码类步骤默认加
+   `python -c "import <module>"` / `py_compile` 这级客观验收。
+3. **把卡死探针收进仓库并接进质量门**：现在探针只在 Codex 会话工作区，
+   建议搬到 `scripts\`（例如 `scripts\ui_perf_probe.mjs`），防止「逐 token 写 DOM」这类回归。
+4. **契约收敛收尾**：`app/services/metrics_sink.py` 是旧的 `{architect, steps}` 字典形态，
    与权威契约 `Run.metrics: list[PhaseMetrics]`（已接线生效）并存。它的单测仍在跑，
    但已经没有任何主链路依赖——建议整体删除或改为 PhaseMetrics 形态，避免下一个人又接错线。
-2. **主备路由接线（P0-3）**：`app/core/fallback.py` 的 `FailoverRunner` 已实现但主链路未用，
-   `Orchestrator._client()` 仍是裸 `RelayClient`。
-3. **计划质量门（P0-4）**：纲领生成后检查步骤粒度 / 依赖 / 验收标准是否可判定，
+5. **计划质量门（P0-4）**：纲领生成后检查步骤粒度 / 依赖 / 验收标准是否可判定，
    对空工作区下的「盘点现有代码」类步骤给出明确告警。
-4. 编排器「下一阶段迭代」的 **P1 / P2**：受控命令执行（含白名单与逐条审批）、大仓库检索、多轮续聊、并发队列、分发常驻。
-5. 账号密码安全问题：**改密码**，推送用 PAT。
-6. 可选：exe 图标、Inno Setup/NSIS 安装包；Git 面板「暂存/丢弃」的批量选择体验优化。
+6. 账号密码安全问题：**改密码**，推送用 PAT。
+7. 可选：exe 图标、Inno Setup/NSIS 安装包；Git 面板「暂存/丢弃」的批量选择体验优化。
 
 ## 六、新窗口开场提示词（可直接粘贴）
 
@@ -158,7 +181,10 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 - 数据全在 D:\orchestrator\data（settings.json 含我的中转 Key，已被 .gitignore 排除，别提交）
 - 源码实例跑在 127.0.0.1:8787；界面自检只允许打演示实例 8788（脚本有安全闸）
 - git 走代理 http://127.0.0.1:10809，仅对 github.com 生效
-- 质量门：pytest + ruff 必须全绿；改前端后跑 scripts/ui_check.mjs 与 dist 打包自检
+- 质量门：pytest（现 452 项）+ ruff 必须全绿；改前端后跑 scripts/ui_check.mjs（现 64 项）与
+  dist 打包自检（.\\dist\\Orchestrator.exe --selftest 3）
+- 最近两个提交：b8b3dbd 修界面卡死（突发 token 43.6 秒 → 2 毫秒）、be9d07b 项目边界与导航 IA
+- 已知待修：--server 模式忽略 --port；写代码类步骤缺「能编译/能导入」的客观验收
 
 本次要做的任务：<在这里写你这次要做什么>
 ```

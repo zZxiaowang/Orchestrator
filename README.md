@@ -50,7 +50,7 @@
 用 Chrome DevTools 协议发**真实鼠标点击**（能发现"被遮罩挡住点不到"这类问题）：
 
 ```powershell
-node scripts/ui_check.mjs          # 24 项检查：可点击性、弹窗、配置切换、滚轮、快捷键、提交任务
+node scripts/ui_check.mjs          # 64 项检查：可点击性、弹窗、配置切换、滚轮、快捷键、提交任务
 ```
 
 需要本机装有 Chrome 或 Edge；截图默认落在 `.logs/ui-light.png`。
@@ -329,9 +329,9 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 24 passed
+python -m pytest -q             # 452 passed
 python -m ruff check .          # All checks passed
-python -m ruff format --check . # 30 files already formatted
+python -m ruff format --check . # 95 files already formatted
 ```
 
 测试全部走本地假中转，不消耗真实额度，因此**不需要 Key 就能跑**。
@@ -413,6 +413,23 @@ footArea
   折叠态**保留展开按钮**（否则就成了单向门）；状态记忆在 localStorage。
 - 位置调整：设置入口从顶栏移到底部（与 dsh 一致），顶栏只保留标题、路由徽章。
 
+## 导航与项目边界（一级入口只有两个）
+
+一级导航只表达"用户要做什么"：**普通对话** 与 **项目**。
+架构 / 计划 / 执行 / 验证 / 日志 / 设置 不再是一级入口，而是**项目内部的二级模块**
+（普通对话上下文里访问不到它们，接口会明确拒绝，而不是静默落到默认项目）。
+
+约定与迁移：
+
+* 项目用稳定 ID `project_id` 标识；前缀只出现在 `context_id`（`project:<projectId>` / `chat:<sessionId>`）。
+* 项目与工作区一一绑定，**项目之间不共享根目录与运行数据**。
+* 缺项目定位时不静默落到默认项目，而是返回「需要选择项目」引导；
+  旧链接按「保留 / 重定向 / 需要选项目 / 已下线（410）」四种结论处理。
+
+细节见 `docs\project-context-contract.md`、`docs\project-navigation-contract.md`、
+`docs\navigation-migration-notes.md`；接口在 `GET /api/v1/navigation/sidebar`、
+`GET /api/v1/navigation/project-modules/{module}`、`GET /api/v1/projects/{id}/modules/{module}`。
+
 ## 打包成 EXE（Windows）
 
 ### 桌面客户端（默认形态，不是浏览器页面）
@@ -491,6 +508,19 @@ $env:ARCHITECT_MODEL='gpt-5.6-sol'; $env:EDITOR_MODEL='deepseek-v4-flash'
 
 另外，确认类弹窗（删除配置、卸载插件、"要改现有代码吗"）全部改成**页内对话框**，
 不再依赖 WebView 原生的 `confirm`（部分 WebView 里它可能不返回，导致整条点击链路卡住）。
+
+### 为什么长任务会把界面卡死（已修）
+
+流式输出曾经是**每个 token 写一次 DOM**：`textContent = 完整缓冲区` 之后紧跟
+`scrollTop = scrollHeight`，而这两个属性会强制浏览器同步重排——文档越大越贵（实测平均
+14.5 毫秒/次），单个 token 就吃掉一整帧。断线重连按 `since` 重放、上游积压后一次性送达时，
+这些事件会挤在同一瞬间，界面被整段占死。
+
+实测（注入 3000 个 token）：修复前主线程被占住 **43.6 秒**，修复后 **2 毫秒**；
+4 秒快速流里运行列表的 DOM 变更从 **177822 个节点** 降到 **0**。
+
+现在的做法：流式文本**按帧合并写入**（同一帧多个 token 只写一次）、`scheduleRender`
+**120 毫秒合并**、运行列表与时间线用**数据签名缓存**（数据没变就不碰 DOM）。
 
 ### 前端错误可追溯
 
