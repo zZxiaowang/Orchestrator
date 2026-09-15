@@ -38,6 +38,12 @@ while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 400
 }
 if (Get-Process -Id $spec.pid -ErrorAction SilentlyContinue) {
+    # The app may have withdrawn the request (it gives up if we reported too late).
+    # In that case it is still running on purpose: abort instead of killing it.
+    if (-not (Test-Path $Request)) {
+        Write-Log "request withdrawn by the app; aborting without killing it" $log
+        exit 0
+    }
     Write-Log "target process still alive; stopping it" $log
     Stop-Process -Id $spec.pid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 1
@@ -60,10 +66,17 @@ try {
     foreach ($item in $spec.env.PSObject.Properties) {
         [Environment]::SetEnvironmentVariable($item.Name, [string]$item.Value, "Process")
     }
+    # NOTE: -ArgumentList rejects an empty array ("parameter is null or empty"),
+    # and the packaged desktop build has no arguments at all.
     $launchArgs = @()
-    if ($spec.launch_args) { $launchArgs = @($spec.launch_args) }
-    Start-Process -FilePath $spec.launch_file -ArgumentList $launchArgs `
-        -WorkingDirectory $spec.cwd -WindowStyle Hidden
+    if ($spec.launch_args) { $launchArgs = @($spec.launch_args) | Where-Object { $_ -ne $null } }
+    if ($launchArgs.Count -gt 0) {
+        Start-Process -FilePath $spec.launch_file -ArgumentList $launchArgs `
+            -WorkingDirectory $spec.cwd -WindowStyle Hidden
+    }
+    else {
+        Start-Process -FilePath $spec.launch_file -WorkingDirectory $spec.cwd -WindowStyle Hidden
+    }
     Write-Log "launched: $($spec.launch_file) $($launchArgs -join ' ')" $log
 }
 catch {

@@ -8,7 +8,16 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from app.services.restart import build_request, helper_available, request_path, write_request
+from app.services.restart import (
+    build_request,
+    helper_available,
+    helper_command,
+    helper_signal_count,
+    helper_signaled,
+    request_path,
+    wait_for_helper,
+    write_request,
+)
 from tests.conftest import FakeRelay
 from tests.test_api_flow import build_client
 
@@ -86,3 +95,50 @@ def test_restart_is_refused_under_pytest(tmp_path: Path):
         response = client.post("/api/v1/system/restart", json={"rebuild": True, "confirm": True})
         assert response.status_code == 400
         assert "测试环境" in response.json()["error"]["message"]
+
+
+def test_helper_signal_detection(tmp_path: Path):
+    """辅助脚本"报到"的判断：只有它真的写了第一行日志，才允许主进程退出。"""
+
+    log = tmp_path / "restart.log"
+    assert helper_signaled(log) is False  # 文件还不存在
+    log.write_text("[t] 别的东西\n", encoding="utf-8")
+    assert helper_signaled(log) is False
+    log.write_text("[t] 别的东西\n[t] restart requested: pid=1 rebuild=True\n", encoding="utf-8")
+    assert helper_signaled(log) is True
+    assert helper_signal_count(log) == 1
+    # 只认"这次之后"新增的报到：旧记录不算数
+    assert helper_signaled(log, minimum=2) is False
+    log.write_text(
+        "[t] 别的东西\n[t] restart requested: pid=1\n[t] restart requested: pid=2\n",
+        encoding="utf-8",
+    )
+    assert helper_signaled(log, minimum=2) is True
+
+
+def test_signal_detection_survives_multibyte_log_lines(tmp_path: Path):
+    """回归：日志里有中文（字节数 ≠ 字符数）时，旧实现按字节偏移切字符串会误判。"""
+
+    log = tmp_path / "restart.log"
+    log.write_text(
+        "[t] launch failed: 无法对参数执行参数验证\n[t] restart requested: pid=1\n",
+        encoding="utf-8",
+    )
+    assert helper_signal_count(log) == 1
+    assert helper_signaled(log, minimum=1) is True
+
+
+def test_wait_for_helper_times_out_without_signal(tmp_path: Path):
+    log = tmp_path / "restart.log"
+    log.write_text("nothing here\n", encoding="utf-8")
+    assert wait_for_helper(log, timeout=0.6) is False
+
+
+def test_helper_command_is_shell_free_and_quotes_paths(tmp_path: Path):
+    """启动命令是参数列表（不经过 shell），路径原样传递。"""
+
+    command = helper_command(tmp_path / "proj", tmp_path / "req.json")
+    assert command[0] == "powershell"
+    assert "-File" in command and "-Request" in command
+    assert command[command.index("-File") + 1].endswith("restart.ps1")
+    assert command[command.index("-Request") + 1].endswith("req.json")
