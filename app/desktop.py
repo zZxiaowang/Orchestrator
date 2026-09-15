@@ -303,7 +303,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.server:
         from app.main import main as server_main
 
-        server_main()
+        # 命令行上的 --host / --port 在服务器形态下同样要生效。
+        # 真实教训：`Orchestrator.exe --server --port 8791` 以前被静默忽略，
+        # 实际仍监听配置里的 8787，用户以为换端口成功了其实没有。
+        server_main(host=args.host or None, port=args.port or None)
         return 0
 
     data_dir = config_module.DATA_DIR  # 惰性读取：便于测试/打包注入

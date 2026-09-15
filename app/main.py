@@ -166,11 +166,15 @@ def _asset_version(static_dir) -> str:
 app = create_app()
 
 
-def main() -> None:
+def main(host: str | None = None, port: int | None = None) -> None:
     """命令行 / 打包后的入口。
 
     打包（PyInstaller）时必须直接传 app 对象而不是 "app.main:app" 字符串：
     字符串形式会触发"按模块名重新导入"，在冻结环境里容易走到错误的模块路径。
+
+    ``host`` / ``port`` 留空 = 用配置里的值（``HOST`` / ``PORT``，默认 127.0.0.1:8787）。
+    桌面入口（``Orchestrator.exe --server --port 8791``）会显式把它们传进来：
+    **命令行参数必须真的生效**——以前这一步被漏掉，``--port`` 会静默失效。
     """
     import threading
     import webbrowser
@@ -181,7 +185,9 @@ def main() -> None:
 
     _force_utf8_console()
     settings = get_settings()
-    url = f"http://{settings.host}:{settings.port}"
+    bind_host = (host or "").strip() or settings.host
+    bind_port = int(port) if port else settings.port
+    url = f"http://{bind_host}:{bind_port}"
     # 打包成"无控制台"的桌面版时 sys.stdout 为 None，print 会抛异常，统一兜底
     for line in (
         "=" * 62,
@@ -199,8 +205,8 @@ def main() -> None:
 
     config = uvicorn.Config(
         app,
-        host=settings.host,
-        port=settings.port,
+        host=bind_host,
+        port=bind_port,
         log_level=settings.log_level.lower(),
         log_config=None,  # 用我们的日志配置，避免打包后找不到 logging 配置文件
     )
