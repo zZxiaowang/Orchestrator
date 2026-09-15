@@ -59,6 +59,9 @@ class FakeRelay:
         self.verify_marker = ""
         #: 补轮时是否真的补上（False = 模拟"补不上"，用于验证轮次用尽后 blocked）
         self.verify_marker_repair = True
+        #: 写代码类步骤：让执行段额外产出一个 .py 文件（用于「能编译 / 能导入」验收测试）
+        self.python_file = ""
+        self.python_source = "VALUE = 1\n"
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -214,6 +217,10 @@ class FakeRelay:
             "commands": [{"cmd": "echo ok", "why": "验证环境"}],
             "notes": [f"第 {step_id} 步完成"],
         }
+        if self.python_file:
+            payload["files"].append(
+                {"path": self.python_file, "action": "create", "content": self.python_source}
+            )
         if self.verify_marker and self.verify_marker_repair and "客观验收未通过" in user:
             # 收到验收失败回灌后，把要求的标记补进文件
             payload["files"][0]["content"] = (

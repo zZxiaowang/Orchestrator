@@ -665,6 +665,108 @@ def test_step_is_blocked_when_objective_checks_fail(tmp_path: Path):
         assert "客观验收" in docs["report.md"]
 
 
+def test_step_writing_uncompilable_python_cannot_be_marked_done(tmp_path: Path):
+    """回归：写代码类步骤必须过「能编译」这一关。
+
+    真实教训：`app/services/navigation_migration.py` 少写了两个引号（三引号没收尾），
+    8 个测试文件的收集全部因 SyntaxError 挂掉，而当时的客观验收只查「文件里含指定文字」，
+    这一步照样被标成完成。现在系统会为这一步**真的写出来的 .py** 自动补上编译检查。
+    """
+
+    relay = FakeRelay()
+    relay.python_file = "app/services/broken.py"
+    relay.python_source = "def broken(:\n    pass\n"
+    with build_client(tmp_path, relay, settings_overrides={"step_verify_rounds": 0}) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "写一个模块"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "blocked", run
+        step = run["steps"][0]
+        assert step["status"] == "blocked"
+        assert "客观验收未通过" in step["error"]
+
+        compile_checks = [item for item in step["verification"] if item["type"] == "py_compile"]
+        assert [item["path"] for item in compile_checks] == ["app/services/broken.py"]
+        assert compile_checks[0]["ok"] is False
+        assert "语法错误" in compile_checks[0]["detail"]
+
+        docs = {
+            doc["name"]: doc["content"]
+            for doc in client.get(f"/api/v1/runs/{run_id}/docs").json()["docs"]
+        }
+        assert "能编译" in docs["report.md"]
+
+
+def test_compile_check_is_added_without_the_plan_asking_for_it(tmp_path: Path):
+    """能编译的代码正常通过；这条检查是系统自动补的，纲领里并没有声明它。"""
+
+    relay = FakeRelay()
+    relay.python_file = "src/module_ok.py"
+    relay.python_source = "VALUE = 1\n\n\ndef twice(x):\n    return x * 2\n"
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "写一个模块"}).json()["run"]["id"]
+        run = wait_for_status(client, run_id, {"awaiting_approval"})
+        assert all(
+            item["type"] != "py_compile" for step in run["plan"]["steps"] for item in step["checks"]
+        )
+
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        step = run["steps"][0]
+        assert all(item["ok"] for item in step["verification"])
+        assert any(
+            item["type"] == "py_compile" and item["path"] == "src/module_ok.py"
+            for item in step["verification"]
+        )
+        assert (tmp_path / "runs" / run_id / "workspace" / "src" / "module_ok.py").is_file()
+
+
+def test_declared_import_check_degrades_until_execution_is_allowed(tmp_path: Path):
+    """「能导入」这一级：开关没开时如实降级为语法编译，开了才真的导入一次。"""
+
+    relay = FakeRelay()
+    relay.python_file = "src/module_ok.py"
+    relay.python_source = "VALUE = 1\n"
+    relay.plan_checks = [{"type": "py_import", "path": "src/module_ok.py"}]
+
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "写一个模块"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        import_check = next(
+            item for item in run["steps"][0]["verification"] if item["type"] == "py_import"
+        )
+        assert import_check["ok"] is True
+        assert "没有真正导入" in import_check["detail"]
+
+    # 打开「允许执行验证命令」后，同一个检查会真的跑一次导入
+    relay_live = FakeRelay()
+    relay_live.python_file = "src/module_ok.py"
+    relay_live.python_source = "VALUE = 1\n"
+    relay_live.plan_checks = [{"type": "py_import", "path": "src/module_ok.py"}]
+    with build_client(
+        tmp_path, relay_live, settings_overrides={"allow_command_execution": True}
+    ) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "写一个模块"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        assert run["status"] == "done", run.get("error")
+        import_check = next(
+            item for item in run["steps"][0]["verification"] if item["type"] == "py_import"
+        )
+        assert import_check["ok"] is True
+        assert "导入成功" in import_check["detail"]
+
+
 def test_verification_passes_are_recorded_not_just_failures(tmp_path: Path):
     """通过也要留痕：否则界面上无法区分「验收通过」和「压根没验」。"""
 

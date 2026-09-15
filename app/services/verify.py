@@ -4,8 +4,10 @@
 
 * 只做**无副作用、不执行任意代码**的判定：文件/目录是否存在、内容是否包含某片段、
   Python 能否编译（``compile()`` 只编译不执行）、JSON 是否合法、通配是否匹配。
-* 命令类验收（pytest、构建脚本等）会真的执行外部程序，必须配合白名单与用户逐条确认，
-  属于 P1「受控命令执行」，本轮**不实现**，也不假装支持。
+* ``py_import`` 是唯一**会执行代码**的检查（在工作区内真的导入一次模块），
+  因此它复用「允许执行验证命令」这个开关：开关关着时降级为语法编译检查，
+  并在结果里写明"没有真正导入"，不假装验过。
+* 需要跑测试 / 构建脚本的验收走 ``commands``（白名单 + 超时 + 回灌报错），不在这一层。
 * 检查全部走 ``Workspace.resolve``，因此和文件落地共用同一套越界防护。
 
 验收不通过时，步骤**不得**标记为完成；编排器会把它标成 ``blocked`` 并把失败原因摊开，
@@ -15,6 +17,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from fnmatch import fnmatch
 from pathlib import Path
@@ -34,6 +39,23 @@ MAX_INSPECT_CHARS = 2_000_000
 
 #: 一步最多自动跑多少条检查，防止纲领里塞进几十条把执行拖慢
 MAX_CHECKS_PER_STEP = 8
+
+#: 给"本步真的写过的 .py 文件"预留的「能编译」名额。
+#: 为什么要预留：纲领自己声明的检查排在前面，一旦把名额占满，语法错误这类
+#: 最该拦住的问题反而永远排不上——而这一步恰好是"写代码类步骤"的最低门槛。
+SYNTAX_CHECKS_RESERVE = 2
+
+#: 一步最多补多少条语法检查（写了 20 个 .py 也不必验 20 次）
+MAX_SYNTAX_CHECKS = 6
+
+#: 导入检查的超时（秒）：导入会执行模块顶层代码，必须有上限
+IMPORT_TIMEOUT_SECONDS = 30.0
+
+#: 导入检查跑的脚本：只接受一个模块名，不接受任意代码
+_IMPORT_SCRIPT = "import importlib, sys; importlib.import_module(sys.argv[1])"
+
+#: 隐藏子进程窗口（Windows）：桌面版没有控制台，否则每跑一次检查都会弹黑窗
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def parse_checks(raw: Any) -> list[StepCheck]:
@@ -88,34 +110,84 @@ def derive_checks(deliverables: Iterable[str]) -> list[StepCheck]:
     return checks
 
 
+def derive_syntax_checks(
+    paths: Iterable[str], *, limit: int = MAX_SYNTAX_CHECKS
+) -> list[StepCheck]:
+    """从"这一步真的写过/改过的文件"派生「能编译」检查。
+
+    真实教训：``app/services/navigation_migration.py`` 少写了两个引号（三引号没收尾），
+    8 个测试文件的收集全部因为 SyntaxError 挂掉；而当时的客观验收只检查
+    "文件里含指定文字"，于是这一步照样被标成了完成。
+
+    **能编译**是写代码类步骤的最低门槛，而且用 ``compile()`` 判定不需要执行任何代码、
+    没有副作用，所以由系统默认补上，不等纲领自己想起来写。
+    """
+
+    checks: list[StepCheck] = []
+    seen: set[str] = set()
+    for raw in paths or []:
+        path = safe_relative(str(raw or "").strip())
+        if not path or not path.lower().endswith(".py"):
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        checks.append(StepCheck(type="py_compile", path=path, label=f"能编译：{path}"))
+        if len(checks) >= max(1, limit):
+            break
+    return checks
+
+
+def _check_key(check: StepCheck) -> tuple[str, str, str]:
+    return (check.type, check.path.replace("\\", "/").lower(), check.text)
+
+
 def effective_checks(
     declared: Sequence[StepCheck] | None,
     deliverables: Iterable[str],
     *,
+    changed_paths: Iterable[str] = (),
     limit: int = MAX_CHECKS_PER_STEP,
 ) -> list[StepCheck]:
-    """本步真正要跑的检查 = 纲领声明的 + 从交付物派生的（去重、限量）。"""
+    """本步真正要跑的检查 = 纲领声明的 + 交付物派生的 + 本步改动派生的（去重、限量）。
+
+    ``changed_paths`` 是本步实际写过的文件：其中的 ``.py`` 会补一条「能编译」检查，
+    并**预留名额**，避免被纲领自己声明的检查挤掉。
+    """
 
     merged: list[StepCheck] = []
     seen: set[tuple[str, str, str]] = set()
     for check in [*list(declared or []), *derive_checks(deliverables)]:
-        key = (check.type, check.path.replace("\\", "/").lower(), check.text)
+        key = _check_key(check)
         if key in seen:
             continue
         seen.add(key)
         merged.append(check)
-        if len(merged) >= limit:
-            break
-    return merged
+
+    syntax = [
+        check for check in derive_syntax_checks(changed_paths) if _check_key(check) not in seen
+    ]
+    room = max(1, limit - min(len(syntax), SYNTAX_CHECKS_RESERVE)) if syntax else limit
+    return [*merged[:room], *syntax][: max(1, limit)]
 
 
-def run_checks(workspace: Workspace, checks: Sequence[StepCheck]) -> list[CheckResult]:
-    """逐条执行检查；任何一条抛异常都被收敛成「不通过 + 原因」，不会中断整步。"""
+def run_checks(
+    workspace: Workspace,
+    checks: Sequence[StepCheck],
+    *,
+    allow_import: bool = False,
+) -> list[CheckResult]:
+    """逐条执行检查；任何一条抛异常都被收敛成「不通过 + 原因」，不会中断整步。
+
+    ``allow_import`` 决定 ``py_import``（会真的执行工作区里的代码）能不能跑：
+    与「允许执行验证命令」共用同一个开关，默认关闭时它降级为语法编译检查。
+    """
 
     results: list[CheckResult] = []
     for check in checks:
         try:
-            results.append(_run_one(workspace, check))
+            results.append(_run_one(workspace, check, allow_import=allow_import))
         except Exception as exc:  # noqa: BLE001 - 检查本身出错也不能让执行段崩掉
             results.append(
                 CheckResult(
@@ -156,7 +228,7 @@ def failure_text(results: Sequence[CheckResult], *, limit: int = 4) -> str:
     return "；".join(parts)
 
 
-def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
+def _run_one(workspace: Workspace, check: StepCheck, *, allow_import: bool = False) -> CheckResult:
     label = check.label or _default_label(check)
     base = CheckResult(type=check.type, path=check.path, text=check.text, label=label)
 
@@ -184,6 +256,10 @@ def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
         base.detail = "" if base.ok else "目录不存在"
         return base
 
+    if check.type == "py_import":
+        base.ok, base.detail = _run_import(workspace, target, check.path, allow_import=allow_import)
+        return base
+
     if not target.is_file():
         base.detail = "文件不存在"
         return base
@@ -202,13 +278,7 @@ def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
         return base
 
     if check.type == "py_compile":
-        source = _read(target)
-        try:
-            compile(source, target.name, "exec")
-        except SyntaxError as exc:
-            base.detail = f"语法错误：第 {exc.lineno} 行 {exc.msg}"
-            return base
-        base.ok = True
+        base.ok, base.detail = _compile_source(target)
         return base
 
     if check.type == "json_valid":
@@ -226,6 +296,92 @@ def _run_one(workspace: Workspace, check: StepCheck) -> CheckResult:
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[:MAX_INSPECT_CHARS]
+
+
+def _compile_source(path: Path) -> tuple[bool, str]:
+    """只编译、不执行：语法错误是"写代码类步骤"最便宜的拦截面。"""
+
+    try:
+        compile(_read(path), path.name, "exec")
+    except SyntaxError as exc:
+        return False, f"语法错误：第 {exc.lineno} 行 {exc.msg}"
+    except ValueError as exc:  # 例如源码里含空字节
+        return False, f"无法编译：{' '.join(str(exc).split())[:80]}"
+    return True, ""
+
+
+def module_name_of(path: str) -> str:
+    """把工作区相对路径换算成可导入的模块名；换算不出来时返回空串。
+
+    ``app/services/verify.py`` → ``app.services.verify``；
+    ``app/services/__init__.py`` → ``app.services``；
+    ``my-tool/foo.py`` → 空串（带连号的目录不是合法的 Python 包名）。
+    """
+
+    text = str(path or "").strip().replace("\\", "/").strip("/")
+    if text.lower().endswith(".py"):
+        text = text[:-3]
+    if text.endswith("/__init__"):
+        text = text[: -len("/__init__")]
+    parts = [part for part in text.split("/") if part]
+    if not parts or any(not part.isidentifier() for part in parts):
+        return ""
+    return ".".join(parts)
+
+
+def _run_import(
+    workspace: Workspace, target: Path, path: str, *, allow_import: bool
+) -> tuple[bool, str]:
+    """判定"这个模块能不能被导入"。
+
+    导入会执行模块顶层代码，因此默认**不跑**：没开「允许执行验证命令」时降级为语法
+    编译检查，并在结果里写明"没有真正导入"，免得看起来验过了其实没验。
+    """
+
+    if not target.is_file():
+        return False, "文件不存在"
+    if target.suffix.lower() != ".py":
+        return False, "py_import 只支持 .py 文件（包请指向其中的 __init__.py）"
+
+    module = module_name_of(path)
+    if not module:
+        return False, f"无法从路径推断模块名（每层目录都要是合法标识符）：{path}"
+
+    if not allow_import:
+        ok, reason = _compile_source(target)
+        if not ok:
+            return False, reason
+        return True, "未开启「允许执行验证命令」：只做了语法编译，没有真正导入"
+
+    argv = [sys.executable, "-c", _IMPORT_SCRIPT, module]
+    try:
+        completed = subprocess.run(  # noqa: S603 - 参数列表执行，不经过 shell
+            argv,
+            cwd=str(workspace.root),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=IMPORT_TIMEOUT_SECONDS,
+            env={**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"},
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"导入超时（>{int(IMPORT_TIMEOUT_SECONDS)} 秒），已终止"
+    except OSError as exc:
+        return False, f"无法执行导入检查：{' '.join(str(exc).split())[:80]}"
+
+    if completed.returncode == 0:
+        return True, f"导入成功：import {module}"
+    detail = _last_error_line((completed.stderr or "") + (completed.stdout or ""))
+    return False, f"导入失败：{detail}"
+
+
+def _last_error_line(output: str, *, limit: int = 160) -> str:
+    """从 traceback 里取最后一行有内容的那句（就是异常类型与消息）。"""
+
+    lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+    return (lines[-1] if lines else "导入过程没有输出，退出码非 0")[:limit]
 
 
 def normalize_marker(text: str) -> str:
@@ -269,6 +425,8 @@ def _default_label(check: StepCheck) -> str:
         return f"{check.path} 含指定内容"
     if check.type == "py_compile":
         return f"{check.path} 语法可编译"
+    if check.type == "py_import":
+        return f"{check.path} 可被导入"
     if check.type == "json_valid":
         return f"{check.path} 是合法 JSON"
     return check.path

@@ -30,6 +30,7 @@ from app.core.fallback import (
     mask_endpoint,
 )
 from app.core.relay import CallStats, RelayClient
+from app.schemas.plan import StepCheck
 from app.schemas.project import (
     DEFAULT_PROJECT_ID,
     ensure_same_project,
@@ -668,11 +669,20 @@ class Orchestrator:
         still_asking = bool(output.need_files) and not output.files
         no_output = not output.files and not (output.summary.strip() or output.notes)
 
-        # 客观验收：纲领声明的检查 + 从交付物派生的「文件存在」检查。
-        # 这是"模型说完成"与"确实完成"之间的唯一分界线。
-        checks = effective_checks(step.checks, step.deliverables)
+        # 客观验收：纲领声明的检查 + 从交付物派生的「文件存在」检查 +
+        # 本步写过的 .py 的「能编译」检查。这是"模型说完成"与"确实完成"之间的唯一分界线。
+        #
+        # 每轮重新派生（而不是先算一次）：验收没过时会在同一步里再补一轮，那一轮如果
+        # 新写了 .py 文件，它们同样要过「能编译」这一关。
+        def build_checks() -> list[StepCheck]:
+            return effective_checks(
+                step.checks,
+                step.deliverables,
+                changed_paths=self._changed_paths(step),
+            )
+
         results, verdict, verify_rounds = await self._verify_with_repair(
-            run, step, workspace, checks, client, endpoint, settings, messages, raw, stats
+            run, step, workspace, build_checks, client, endpoint, settings, messages, raw, stats
         )
 
         if output.blocked:
@@ -1196,12 +1206,25 @@ class Orchestrator:
                 file=changed.model_dump(mode="json"),
             )
 
+    @staticmethod
+    def _changed_paths(step: RunStep) -> list[str]:
+        """本步真正写过/改过的文件（删除与写入失败的都不算）。
+
+        它们会被拿去补「能编译」检查：写代码类步骤的最低门槛是不出语法错误。
+        """
+
+        return [
+            item.path
+            for item in step.files
+            if item.path and not item.error and item.action != "delete"
+        ]
+
     async def _verify_with_repair(
         self,
         run: Run,
         step: RunStep,
         workspace: Workspace,
-        checks: list,
+        checks_factory: Callable[[], list[StepCheck]],
         client: RelayClient,
         endpoint: Endpoint,
         settings: Settings,
@@ -1214,13 +1237,20 @@ class Orchestrator:
         真实教训：纲领要求文档里出现 ``project_id``，执行段写的是 ``:projectId``——
         东西是对的，只是写法不一致。以前这种情况直接把运行卡住，用户只能手动继续；
         现在把失败项连同**文件里的真实片段**回灌给它，让它自己补齐。
+
+        ``checks_factory`` 每轮现算：补轮里新写出来的文件也要按同一套规则过一遍。
         """
 
         rounds = 0
         results: list = []
         verdict = summarize(results)
         while True:
-            results = run_checks(workspace, checks) if checks else []
+            checks = checks_factory()
+            results = (
+                run_checks(workspace, checks, allow_import=settings.allow_command_execution)
+                if checks
+                else []
+            )
             step.verification = results
             verdict = summarize(results)
             if results:

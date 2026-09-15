@@ -9,13 +9,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-#: 允许的客观检查类型（全部不执行任意命令，见 app/services/verify.py）
+#: 允许的客观检查类型（见 app/services/verify.py）。
+#: 除 ``py_import`` 外都不执行任何代码；``py_import`` 会真的导入一次模块，
+#: 因此受「允许执行验证命令」开关约束（关着时降级为语法编译检查）。
 CHECK_TYPES: tuple[str, ...] = (
     "file_exists",
     "dir_exists",
     "glob",
     "file_contains",
     "py_compile",
+    "py_import",
     "json_valid",
 )
 
@@ -31,6 +34,10 @@ _CHECK_ALIASES = {
     "python": "py_compile",
     "py": "py_compile",
     "compile": "py_compile",
+    "import": "py_import",
+    "importable": "py_import",
+    "module_import": "py_import",
+    "python_import": "py_import",
     "json": "json_valid",
     "valid_json": "json_valid",
     "glob_match": "glob",
@@ -40,8 +47,9 @@ _CHECK_ALIASES = {
 class StepCheck(BaseModel):
     """纲领为某一步声明的**客观验收项**。
 
-    只允许 ``CHECK_TYPES`` 里的类型：它们都能在没有副作用、不执行代码的前提下判定，
-    所以可以在每步执行完立刻自动跑。命令类验收（pytest 等）需要用户审批，不在本轮范围。
+    只允许 ``CHECK_TYPES`` 里的类型：除 ``py_import`` 外都能在没有副作用、不执行代码的
+    前提下判定，所以可以在每步执行完立刻自动跑。``py_import`` 需要真的导入一次模块，
+    默认降级为语法编译；跑测试 / 构建这类验收走 ``commands``（白名单 + 回灌报错）。
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -52,6 +60,7 @@ class StepCheck(BaseModel):
         "glob",
         "file_contains",
         "py_compile",
+        "py_import",
         "json_valid",
     ] = "file_exists"
     path: str = ""

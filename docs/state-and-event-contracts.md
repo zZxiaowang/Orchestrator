@@ -138,7 +138,7 @@
 ### 步骤客观验收
 
 `PlanStep.checks` / `RunStep.checks` 是纲领声明的客观检查项，`RunStep.verification`
-是本步执行后的逐条结果（`CheckResult`）。允许的类型只有六种，全部无副作用、不执行代码：
+是本步执行后的逐条结果（`CheckResult`）。允许的类型见下；除 `py_import` 之外全部无副作用、不执行代码：
 
 | type | 判定 |
 | --- | --- |
@@ -146,11 +146,14 @@
 | `glob` | 通配至少匹配一个文件 |
 | `file_contains` | 文件包含指定原文片段（`text`） |
 | `py_compile` | 该 `.py` 文件能通过 `compile()`（只编译，不执行） |
+| `py_import` | 该 `.py` 文件能被导入：在工作区内**真的 `import` 一次**（受 `allow_command_execution` 约束；开关关着时降级为语法编译，并在 `detail` 里写明"没有真正导入"，不假装验过） |
 | `json_valid` | 文件是合法 JSON |
 
 执行路径：`app/services/verify.py`。实际跑的检查 = 纲领声明的 + 从 `deliverables`
-里形如路径的产出**派生**的 `file_exists`（去重，单步上限 8 条）。
-**命令类验收（pytest 等）不在本轮范围**，因为它需要白名单与逐条用户确认（P1）。
+里形如路径的产出**派生**的 `file_exists` + 从本步真正写过的 `.py` **派生**的 `py_compile`
+（去重；单步上限 8 条，其中最多预留 2 条给语法检查——写代码类步骤的最低门槛不该被
+纲领自己声明的检查挤掉）。需要跑测试 / 构建的验收走 `RunStep.commands`
+（白名单 + 超时 + 报错回灌），不属于这一层。
 
 不变量：
 1. 有检查项且存在未通过时，该步**不得**为 `done`——按 `blocked` 处理（补信息后可只重跑该步）；
