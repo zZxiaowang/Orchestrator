@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.schemas.plan import StepCheck
+from app.services import verify as verify_module
 from app.services.verify import (
     derive_checks,
     derive_syntax_checks,
@@ -282,6 +283,39 @@ def test_py_import_rejects_paths_that_are_not_modules(tmp_path: Path):
     assert not_identifier.ok is False and "模块名" in not_identifier.detail
     assert not_python.ok is False and ".py" in not_python.detail
     assert absent.ok is False and absent.detail == "文件不存在"
+
+
+def test_import_interpreter_prefers_own_python_but_not_in_frozen_builds(monkeypatch):
+    """打包版里 sys.executable 是 exe 自己，不能拿它跑 `-c`（会再开一个客户端窗口）。"""
+
+    import sys
+
+    assert verify_module._import_interpreter() == sys.executable
+
+    monkeypatch.setattr(verify_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        verify_module.shutil,
+        "which",
+        lambda name: "C:/python/python.exe" if name == "python" else None,
+    )
+    assert verify_module._import_interpreter() == "C:/python/python.exe"
+
+    monkeypatch.setattr(verify_module.shutil, "which", lambda name: None)
+    assert verify_module._import_interpreter() == ""
+
+
+def test_py_import_degrades_when_no_interpreter_is_available(tmp_path: Path, monkeypatch):
+    workspace = _workspace(tmp_path)
+    (workspace.root / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(verify_module.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(verify_module.shutil, "which", lambda name: None)
+
+    (result,) = run_checks(
+        workspace, [StepCheck(type="py_import", path="mod.py")], allow_import=True
+    )
+    assert result.ok is True
+    assert "没有真正导入" in result.detail
+    assert "解释器" in result.detail
 
 
 def test_json_valid_rejects_broken_json(tmp_path: Path):

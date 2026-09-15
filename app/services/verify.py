@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterable, Mapping, Sequence
@@ -329,6 +330,32 @@ def module_name_of(path: str) -> str:
     return ".".join(parts)
 
 
+def _import_interpreter() -> str:
+    """跑导入检查用的解释器；找不到返回空串。
+
+    打包版里 ``sys.executable`` 是 ``Orchestrator.exe`` **自己**——拿它加 ``-c`` 会再启动
+    一个客户端窗口，而不是执行 Python。所以冻结环境下退回 PATH 上的 python
+    （与「验证命令」同一套约定：命令也是按 PATH 解析的）。
+    """
+
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    for name in ("python", "python3", "py"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
+def _degraded_import(target: Path, reason: str) -> tuple[bool, str]:
+    """不能真跑导入时，退到语法编译，并且**如实说明**没有验到导入。"""
+
+    ok, detail = _compile_source(target)
+    if not ok:
+        return False, detail
+    return True, f"{reason}：只做了语法编译，没有真正导入"
+
+
 def _run_import(
     workspace: Workspace, target: Path, path: str, *, allow_import: bool
 ) -> tuple[bool, str]:
@@ -348,12 +375,13 @@ def _run_import(
         return False, f"无法从路径推断模块名（每层目录都要是合法标识符）：{path}"
 
     if not allow_import:
-        ok, reason = _compile_source(target)
-        if not ok:
-            return False, reason
-        return True, "未开启「允许执行验证命令」：只做了语法编译，没有真正导入"
+        return _degraded_import(target, "未开启「允许执行验证命令」")
 
-    argv = [sys.executable, "-c", _IMPORT_SCRIPT, module]
+    interpreter = _import_interpreter()
+    if not interpreter:
+        return _degraded_import(target, "没找到可用的 Python 解释器（打包版里 exe 自己不是解释器）")
+
+    argv = [interpreter, "-c", _IMPORT_SCRIPT, module]
     try:
         completed = subprocess.run(  # noqa: S603 - 参数列表执行，不经过 shell
             argv,
