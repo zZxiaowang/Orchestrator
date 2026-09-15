@@ -7,6 +7,37 @@ const STORAGE_KEY = "orchestrator.lastRun";
 const SIDEBAR_KEY = "orchestrator.sidebarWide";
 const PANEL_KEY = "orchestrator.panelOpen";
 
+/* ── 上下文模型：左侧栏只有两个一级入口 ──
+   普通对话（chat）：轻量工作区，没有项目生命周期，不产生运行、计划与步骤；
+   项目（project）：承载架构、执行、计划、步骤、验证与项目事件。
+   旧数据（后端字段或 localStorage）缺少合法上下文类型时，一律按 project 归属。 */
+const CONTEXT_CHAT = "chat";
+const CONTEXT_PROJECT = "project";
+const CONTEXT_TYPES = [CONTEXT_CHAT, CONTEXT_PROJECT];
+const DEFAULT_CONTEXT_TYPE = CONTEXT_PROJECT;
+
+//: 项目内的二级导航能力，普通对话下不渲染
+const PROJECT_SECTIONS = ["architecture", "execution", "plan", "steps", "verify", "events"];
+
+//: 上下文类型归一化：非法值 / 缺失值一律回落到默认归属
+function normalizeContextType(value) {
+  return CONTEXT_TYPES.includes(value) ? value : DEFAULT_CONTEXT_TYPE;
+}
+
+function contextIdPrefix(contextType) {
+  return `${normalizeContextType(contextType)}:`;
+}
+
+//: 仅项目上下文可派发的动作；普通对话里点击一律不发出请求
+const PROJECT_ONLY_ACTIONS = new Set([
+  "architect",
+  "execute",
+  "run-step",
+  "verify",
+  "restart",
+  "cancel",
+]);
+
 //: 统计看板的刷新入口：宿主元素在「统计」标签里按需创建，所以不能只在加载时抓一次
 let dashboardRefresh = null;
 
@@ -3887,3 +3918,428 @@ function showToast(message) {
 })();
 
 boot().catch((error) => reportClientError("boot", error));
+
+/* ── 第 2 步：左侧栏一级入口（普通对话 / 项目）与工作区恢复 ──
+   左侧栏只暴露 CONTEXT_CHAT / CONTEXT_PROJECT 两个功能入口；
+   架构 / 执行 / 计划 / 步骤 / 验证 / 事件只作为项目内的二级导航出现。
+   上下文来源优先级：URL（?ctx=、?project=）> localStorage > DEFAULT_CONTEXT_TYPE。 */
+const URL_PARAM_CONTEXT = "ctx";
+const URL_PARAM_PROJECT = "project";
+const STORE_CONTEXT_KEY = "orchestrator.contextType";
+const STORE_PROJECT_KEY = "orchestrator.projectId";
+const STORE_SECTION_KEY = "orchestrator.projectSection";
+const STORE_CHATS_KEY = "orchestrator.chats";
+const STORE_PROJECTS_KEY = "orchestrator.projects";
+
+//: 二级功能中文名；缺项时用英文标识兜底，新增 section 不会让导航崩掉
+const PROJECT_SECTION_LABELS = {
+  architecture: "架构",
+  execution: "执行",
+  plan: "计划",
+  steps: "步骤",
+  verify: "验证",
+  events: "事件",
+  context: "上下文",
+};
+
+const ProjectWorkspace = {
+  contextType: DEFAULT_CONTEXT_TYPE,
+  projectId: "",
+  section: PROJECT_SECTIONS[0],
+};
+
+function safeReadStorage(key) {
+  try {
+    return localStorage.getItem(key) || "";
+  } catch (error) {
+    return "";
+  }
+}
+
+function safeWriteStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    /* 隐私模式 / 配额溢出：忽略，内存状态仍然生效 */
+  }
+}
+
+function readUrlWorkspace() {
+  let params = null;
+  try {
+    params = new URLSearchParams(window.location.search);
+  } catch (error) {
+    params = null;
+  }
+  const rawContext = (params && params.get(URL_PARAM_CONTEXT)) || "";
+  const rawProject = (params && params.get(URL_PARAM_PROJECT)) || "";
+  // 带项目标识的地址一律恢复项目工作区
+  return {
+    contextType: rawContext ? normalizeContextType(rawContext) : rawProject ? CONTEXT_PROJECT : "",
+    projectId: rawProject,
+  };
+}
+
+function syncUrlWorkspace() {
+  if (!window.history || typeof window.history.replaceState !== "function") return;
+  let url = null;
+  try {
+    url = new URL(window.location.href);
+  } catch (error) {
+    return;
+  }
+  url.searchParams.set(URL_PARAM_CONTEXT, ProjectWorkspace.contextType);
+  if (ProjectWorkspace.contextType === CONTEXT_PROJECT && ProjectWorkspace.projectId) {
+    url.searchParams.set(URL_PARAM_PROJECT, ProjectWorkspace.projectId);
+  } else {
+    url.searchParams.delete(URL_PARAM_PROJECT);
+  }
+  window.history.replaceState(null, "", url.toString());
+}
+
+function dispatchWorkspaceEvent(name) {
+  document.dispatchEvent(
+    new CustomEvent(name, {
+      detail: {
+        contextType: ProjectWorkspace.contextType,
+        projectId: ProjectWorkspace.projectId,
+        section: ProjectWorkspace.section,
+      },
+    }),
+  );
+}
+
+function renderProjectName() {
+  const node = document.getElementById("project-name");
+  if (!node) return;
+  const id = ProjectWorkspace.projectId;
+  node.textContent = id || "默认项目";
+  node.title = id ? `当前项目：${id}` : "未指定项目 ID，当前为默认项目";
+  node.dataset.projectId = id;
+}
+
+function renderProjectNav() {
+  const host = document.getElementById("project-nav");
+  if (!host) return;
+  host.replaceChildren(
+    ...PROJECT_SECTIONS.map((section) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "project-nav-btn";
+      btn.dataset.navSection = section;
+      btn.textContent = PROJECT_SECTION_LABELS[section] || section;
+      btn.classList.toggle("active", section === ProjectWorkspace.section);
+      btn.addEventListener("click", () => selectProjectSection(section));
+      return btn;
+    }),
+  );
+}
+
+//: 二级导航切换：普通对话下不生效；项目内向既有视图做尽力而为的桥接（第 4 步收敛）
+function selectProjectSection(section) {
+  if (ProjectWorkspace.contextType !== CONTEXT_PROJECT) return;
+  if (!PROJECT_SECTIONS.includes(section)) return;
+  ProjectWorkspace.section = section;
+  safeWriteStorage(STORE_SECTION_KEY, section);
+  document.querySelectorAll("#project-nav .project-nav-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.navSection === section);
+  });
+  bridgeToProjectView(section);
+  dispatchWorkspaceEvent("orchestrator:section-change");
+}
+
+function bridgeToProjectView(section) {
+  const selectors = [`[data-view="${section}"]`, `[data-tab="${section}"]`, `[data-section="${section}"]`];
+  for (const selector of selectors) {
+    let node = null;
+    try {
+      node = document.querySelector(selector);
+    } catch (error) {
+      node = null;
+    }
+    if (!node) continue;
+    if (node.closest && node.closest("#project-nav")) continue;
+    if (typeof node.click === "function") {
+      node.click();
+      return true;
+    }
+  }
+  const label = PROJECT_SECTION_LABELS[section];
+  if (!label) return false;
+  const tabs = document.querySelectorAll('[role="tab"]');
+  for (const tab of tabs) {
+    if (tab.closest && tab.closest("#project-nav")) continue;
+    if ((tab.textContent || "").trim().startsWith(label)) {
+      tab.click();
+      return true;
+    }
+  }
+  return false;
+}
+
+function collectProjectCandidates() {
+  const out = [];
+  const seen = new Set();
+  const push = (id, label, meta) => {
+    const key = String(id || "").trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ id: key, label: label || key, meta: meta || "" });
+  };
+  const registered = Array.isArray(window.__orchestratorProjects) ? window.__orchestratorProjects : [];
+  registered.forEach((item) => {
+    if (!item) return;
+    if (typeof item === "string") push(item, item, "");
+    else push(item.id || item.projectId, item.name || item.label || item.id, item.meta || "");
+  });
+  try {
+    const stored = JSON.parse(safeReadStorage(STORE_PROJECTS_KEY) || "[]");
+    if (Array.isArray(stored)) {
+      stored.forEach((item) => {
+        if (typeof item === "string") push(item, item, "");
+        else if (item && typeof item === "object") push(item.id || item.projectId, item.name || item.id, item.meta || "");
+      });
+    }
+  } catch (error) {
+    /* 坏数据忽略 */
+  }
+  document.querySelectorAll("#run-list .run-item").forEach((item) => {
+    const id = item.dataset.id || item.dataset.runId || "";
+    const nameNode = item.querySelector(".run-name");
+    push(id, (nameNode && nameNode.textContent) || id, "运行记录");
+  });
+  return out;
+}
+
+function renderProjectOptions() {
+  const host = document.getElementById("project-options");
+  if (!host) return;
+  const candidates = collectProjectCandidates();
+  if (!candidates.length) {
+    const hint = document.createElement("div");
+    hint.className = "chat-empty";
+    hint.textContent = "暂无可选项目：在上方输入项目 ID 回车即可打开。";
+    host.replaceChildren(hint);
+    return;
+  }
+  host.replaceChildren(
+    ...candidates.map((item) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "run-item";
+      btn.dataset.projectId = item.id;
+      btn.classList.toggle("active", item.id === ProjectWorkspace.projectId);
+      const name = document.createElement("div");
+      name.className = "run-name";
+      name.textContent = item.label;
+      btn.appendChild(name);
+      if (item.meta) {
+        const meta = document.createElement("div");
+        meta.className = "run-meta";
+        meta.textContent = item.meta;
+        btn.appendChild(meta);
+      }
+      btn.addEventListener("click", () => openProject(item.id));
+      return btn;
+    }),
+  );
+}
+
+function renderChatList() {
+  const host = document.getElementById("chat-list");
+  if (!host) return;
+  let chats = [];
+  try {
+    const stored = JSON.parse(safeReadStorage(STORE_CHATS_KEY) || "[]");
+    if (Array.isArray(stored)) chats = stored.filter(Boolean);
+  } catch (error) {
+    chats = [];
+  }
+  if (!chats.length) {
+    const hint = document.createElement("div");
+    hint.className = "chat-empty";
+    hint.textContent = "普通对话是轻量工作区：不产生运行、计划、步骤与验证记录。点「＋ 新对话」开始。";
+    host.replaceChildren(hint);
+    return;
+  }
+  host.replaceChildren(
+    ...chats.map((chat) => {
+      const node = document.createElement("div");
+      node.className = "run-item";
+      if (chat.id) node.dataset.chatId = chat.id;
+      const name = document.createElement("div");
+      name.className = "run-name";
+      name.textContent = chat.title || chat.name || "未命名对话";
+      node.appendChild(name);
+      const meta = document.createElement("div");
+      meta.className = "run-meta";
+      meta.textContent = chat.updatedAt || chat.createdAt || "";
+      node.appendChild(meta);
+      return node;
+    }),
+  );
+}
+
+function applyWorkspaceContext(contextType, options = {}) {
+  const type = normalizeContextType(contextType);
+  ProjectWorkspace.contextType = type;
+  if (typeof options.projectId === "string") ProjectWorkspace.projectId = options.projectId;
+
+  const projectPane = document.getElementById("project-pane");
+  const chatPane = document.getElementById("chat-pane");
+  const navChat = document.getElementById("nav-chat");
+  const navProject = document.getElementById("nav-project");
+  if (projectPane) projectPane.hidden = type !== CONTEXT_PROJECT;
+  if (chatPane) chatPane.hidden = type !== CONTEXT_CHAT;
+  if (navChat) {
+    navChat.classList.toggle("active", type === CONTEXT_CHAT);
+    navChat.setAttribute("aria-pressed", type === CONTEXT_CHAT ? "true" : "false");
+  }
+  if (navProject) {
+    navProject.classList.toggle("active", type === CONTEXT_PROJECT);
+    navProject.setAttribute("aria-pressed", type === CONTEXT_PROJECT ? "true" : "false");
+  }
+  document.body.dataset.contextType = type;
+
+  safeWriteStorage(STORE_CONTEXT_KEY, type);
+  if (type === CONTEXT_PROJECT && ProjectWorkspace.projectId) {
+    safeWriteStorage(STORE_PROJECT_KEY, ProjectWorkspace.projectId);
+  }
+
+  renderProjectName();
+  renderProjectNav();
+  renderChatList();
+  syncUrlWorkspace();
+  dispatchWorkspaceEvent("orchestrator:context-change");
+  return type;
+}
+
+function openProject(projectId) {
+  const id = String(projectId || "").trim();
+  ProjectWorkspace.projectId = id;
+  const picker = document.getElementById("project-picker");
+  if (picker) picker.hidden = true;
+  applyWorkspaceContext(CONTEXT_PROJECT, { projectId: id });
+  dispatchWorkspaceEvent("orchestrator:project-open");
+}
+
+function bindPrimaryNav() {
+  const navChat = document.getElementById("nav-chat");
+  const navProject = document.getElementById("nav-project");
+  if (navChat) {
+    navChat.addEventListener("click", () => {
+      applyWorkspaceContext(CONTEXT_CHAT);
+    });
+  }
+  if (navProject) {
+    navProject.addEventListener("click", () => {
+      const remembered = ProjectWorkspace.projectId || safeReadStorage(STORE_PROJECT_KEY) || "";
+      applyWorkspaceContext(CONTEXT_PROJECT, { projectId: remembered });
+    });
+  }
+  const newChat = document.getElementById("new-chat-btn");
+  if (newChat) {
+    newChat.addEventListener("click", () => {
+      applyWorkspaceContext(CONTEXT_CHAT);
+      dispatchWorkspaceEvent("orchestrator:chat-new");
+    });
+  }
+  const toggle = document.getElementById("project-picker-btn");
+  const picker = document.getElementById("project-picker");
+  const input = document.getElementById("project-id-input");
+  if (toggle && picker) {
+    toggle.addEventListener("click", () => {
+      const willOpen = picker.hidden;
+      picker.hidden = !willOpen;
+      toggle.setAttribute("aria-expanded", willOpen ? "true" : "false");
+      if (willOpen) {
+        renderProjectOptions();
+        if (input) input.focus();
+      }
+    });
+  }
+  if (input) {
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      const value = input.value.trim();
+      input.value = "";
+      if (value) openProject(value);
+    });
+  }
+  const chatSearch = document.getElementById("chat-search");
+  const chatList = document.getElementById("chat-list");
+  if (chatSearch && chatList) {
+    chatSearch.addEventListener("input", () => {
+      const keyword = chatSearch.value.trim().toLowerCase();
+      chatList.querySelectorAll(".run-item").forEach((item) => {
+        const text = (item.textContent || "").toLowerCase();
+        item.hidden = Boolean(keyword) && !text.includes(keyword);
+      });
+    });
+  }
+}
+
+function initWorkspace() {
+  const fromUrl = readUrlWorkspace();
+  const storedType = safeReadStorage(STORE_CONTEXT_KEY);
+  const storedProject = safeReadStorage(STORE_PROJECT_KEY);
+  const storedSection = safeReadStorage(STORE_SECTION_KEY);
+  const contextType = fromUrl.contextType || (storedType ? normalizeContextType(storedType) : DEFAULT_CONTEXT_TYPE);
+  const projectId = fromUrl.projectId || storedProject || "";
+  ProjectWorkspace.section = PROJECT_SECTIONS.includes(storedSection) ? storedSection : PROJECT_SECTIONS[0];
+
+  bindPrimaryNav();
+  applyWorkspaceContext(contextType, { projectId });
+
+  // #run-list 由运行状态驱动、随时重排，项目候选项跟随刷新
+  const runList = document.getElementById("run-list");
+  if (runList && typeof MutationObserver === "function") {
+    const picker = document.getElementById("project-picker");
+    new MutationObserver(() => {
+      if (picker && !picker.hidden) renderProjectOptions();
+    }).observe(runList, { childList: true, subtree: true });
+  }
+}
+
+//: 给后续步骤（项目能力边界 / 兼容验证）用的统一门面
+window.OrchestratorContext = {
+  CONTEXT_CHAT,
+  CONTEXT_PROJECT,
+  CONTEXT_TYPES,
+  DEFAULT_CONTEXT_TYPE,
+  PROJECT_SECTIONS,
+  PROJECT_ONLY_ACTIONS,
+  isProject() {
+    return ProjectWorkspace.contextType === CONTEXT_PROJECT;
+  },
+  canRunAction(action) {
+    return ProjectWorkspace.contextType === CONTEXT_PROJECT && PROJECT_ONLY_ACTIONS.has(action);
+  },
+  get contextType() {
+    return ProjectWorkspace.contextType;
+  },
+  get projectId() {
+    return ProjectWorkspace.projectId;
+  },
+  get section() {
+    return ProjectWorkspace.section;
+  },
+  switchTo: applyWorkspaceContext,
+  selectSection: selectProjectSection,
+  openProject,
+  refresh: initWorkspace,
+};
+
+let workspaceInitialized = false;
+function initWorkspaceOnce() {
+  if (workspaceInitialized) return;
+  workspaceInitialized = true;
+  initWorkspace();
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initWorkspaceOnce);
+} else {
+  initWorkspaceOnce();
+}

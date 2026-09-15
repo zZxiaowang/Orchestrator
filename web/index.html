@@ -21,13 +21,55 @@
           </div>
           <button class="icon-btn" id="sidebar-toggle" title="折叠 / 展开左侧任务栏">⇤</button>
         </div>
-        <button class="btn primary block" id="new-run-btn">＋ 新任务</button>
+        <!-- 一级入口：左侧栏只暴露「普通对话」与「项目」两个功能入口 -->
+        <nav class="primary-nav" id="primary-nav" aria-label="一级入口">
+          <button class="nav-entry" type="button" id="nav-chat" data-context="chat" aria-pressed="false">
+            <span class="nav-entry-mark" aria-hidden="true">✦</span>
+            <span class="nav-entry-body">
+              <strong>普通对话</strong>
+              <span>轻量会话 · 不含项目流程</span>
+            </span>
+          </button>
+          <button class="nav-entry" type="button" id="nav-project" data-context="project" aria-pressed="false">
+            <span class="nav-entry-mark" aria-hidden="true">◈</span>
+            <span class="nav-entry-body">
+              <strong>项目</strong>
+              <span>架构 / 执行 / 计划 / 步骤 / 验证</span>
+            </span>
+          </button>
+        </nav>
+
+        <!-- 项目工作区：架构、执行、计划、步骤、验证等只在这个入口下出现 -->
+        <section class="context-pane" id="project-pane" data-project-only hidden>
+          <div class="section-label">当前项目</div>
+          <div class="project-current" id="project-current">
+            <span class="project-name" id="project-name" title="当前项目">默认项目</span>
+            <button class="icon-btn" type="button" id="project-picker-btn" title="选择 / 切换项目">▾</button>
+          </div>
+          <div class="project-picker" id="project-picker" hidden>
+            <input id="project-id-input" type="text" placeholder="输入项目 ID，回车打开…" />
+            <div class="run-list" id="project-options"></div>
+          </div>
+          <div class="section-label">项目功能</div>
+          <nav class="project-nav" id="project-nav" aria-label="项目功能"></nav>
+          <button class="btn primary block" id="new-run-btn">＋ 新任务</button>
         <div class="run-search">
           <input id="run-search" type="search" placeholder="搜索任务…" />
           <button class="icon-btn" id="run-archive-toggle" title="显示/隐藏已归档">▣</button>
         </div>
         <div class="section-label">运行记录</div>
-        <div class="run-list" id="run-list"></div>
+          <div class="run-list" id="run-list"></div>
+        </section>
+
+        <!-- 普通对话工作区：没有项目导航，也没有执行 / 验证控制 -->
+        <section class="context-pane" id="chat-pane" data-chat-only hidden>
+          <button class="btn primary block" id="new-chat-btn" type="button">＋ 新对话</button>
+          <div class="run-search">
+            <input id="chat-search" type="search" placeholder="搜索对话…" />
+          </div>
+          <div class="section-label">对话记录</div>
+          <div class="run-list" id="chat-list"></div>
+        </section>
 
         <div class="foot-area">
           <div class="sidebar-route" id="sidebar-route"></div>

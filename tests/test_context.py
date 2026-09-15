@@ -90,6 +90,8 @@ def test_long_file_is_head_tail_trimmed():
 
 
 def test_completed_log_folds_old_steps_when_too_long():
+    """步骤很多时：早期交接折成一行，最近的保留。"""
+
     steps = [
         RunStep(
             id=index,
@@ -112,6 +114,40 @@ def test_completed_log_folds_old_steps_when_too_long():
     )
     assert "已合并" in packet.completed
     assert len(packet.completed) <= 400
+
+
+def test_few_but_long_handoffs_do_not_crash():
+    """回归：已完成步骤 ≤3 条、但每条交接都很长时，曾经直接 IndexError
+    （folded = entries[:-3] 是空列表，却去取 folded[0]）——真实运行就是这样挂的。"""
+
+    long_handoff = "改了 web/app.js 与 web/styles.css 的若干处；约定：视图层不再持有状态。" * 20
+    steps = [
+        RunStep(
+            id=index,
+            title=f"步骤{index}",
+            goal="做点什么",
+            status=StepStatus.DONE,
+            summary=long_handoff,
+            handoff=long_handoff,
+        )
+        for index in range(1, 3)  # 只有 2 条已完成
+    ]
+    current = RunStep(id=3, title="当前步", goal="现在要做的事")
+    steps.append(current)
+
+    packet = StepContextBuilder(log_max_chars=600).build(
+        system="S",
+        task="T",
+        plan=_plan(),
+        step=current,
+        steps=steps,
+        tree=["a.py"],
+        read_file=lambda path: "x",
+    )
+    # 不崩，且长度受控；最近的交接要保留下来
+    assert packet.completed
+    assert len(packet.completed) <= 900
+    assert "步骤2" in packet.completed
 
 
 def test_clip_helper():

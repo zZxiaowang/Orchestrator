@@ -271,6 +271,23 @@ class StepContextBuilder:
         # 超限：保留最近 3 条完整，其余折成一行
         keep = entries[-3:]
         folded = entries[:-3]
+        if not folded:
+            # 已完成步骤本来就不多（≤3 条），但每条交接都很长：
+            # 这时没有"更早的步骤"可折叠（原来直接取 folded[0] 会 IndexError），
+            # 改成从最近往回留，直到用完预算，并注明省略了几条。
+            kept: list[str] = []
+            used = 0
+            for entry in reversed(entries):
+                if used + len(entry) + 1 > self.log_max_chars:
+                    break
+                kept.insert(0, entry)
+                used += len(entry) + 1
+            dropped = len(entries) - len(kept)
+            if not kept:
+                # 连一条完整的都放不下：至少给最近一条的截断版（它最有参考价值）
+                return clip(entries[-1], self.log_max_chars)
+            prefix = f"（更早的 {dropped} 条交接已省略）\n" if dropped else ""
+            return prefix + "\n".join(kept)
         head = f"（前 {len(folded)} 步已合并：{folded[0].split(' → ')[0]} … {folded[-1].split(' → ')[0]}）"
         text = "\n".join([head, *keep])
         return clip(text, self.log_max_chars)
