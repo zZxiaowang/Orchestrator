@@ -41,6 +41,14 @@ const PROJECT_ONLY_ACTIONS = new Set([
 //: 统计看板的刷新入口：宿主元素在「统计」标签里按需创建，所以不能只在加载时抓一次
 let dashboardRefresh = null;
 
+//: 运行列表的签名：数据没变就不重建 DOM（否则一次运行会产生上千次 DOM 变更）
+let lastRunListSignature = "";
+//: 时间线的签名：结构没变就不重建卡片
+let lastTimelineSignature = "";
+//: 流式文本的合并写入（每个动画帧最多写一次，避免逐块触发重排）
+let streamFrame = null;
+const pendingStreams = new Set();
+
 /* ── 前端错误留证：点不动的问题必须能在后端查到 ── */
 
 function reportClientError(kind, error, context = {}) {
@@ -251,10 +259,33 @@ const STEP_STATUS_TEXT = {
 function scheduleRender() {
   if (state.renderQueued) return;
   state.renderQueued = true;
-  requestAnimationFrame(() => {
+  // 以前用 requestAnimationFrame：事件密集时最多每秒重建 60 次整个界面。
+  // 改成 120ms 合并一次，人眼无感，负载降一个数量级。
+  setTimeout(() => {
     state.renderQueued = false;
     render();
-  });
+  }, 120);
+}
+
+/** 流式文本：把多个 token 事件合并到一帧里写 DOM（逐块写会触发强制重排）。 */
+function flushStreams() {
+  streamFrame = null;
+  for (const key of pendingStreams) {
+    const node = document.querySelector(`[data-stream="${key}"]`);
+    if (!node) {
+      scheduleRender();
+      continue;
+    }
+    node.textContent = state.buffers[key] || "";
+    node.scrollTop = node.scrollHeight;
+  }
+  pendingStreams.clear();
+}
+
+function queueStreamUpdate(key) {
+  pendingStreams.add(key);
+  if (streamFrame !== null) return;
+  streamFrame = requestAnimationFrame(flushStreams);
 }
 
 function streamKeyFor(event) {
@@ -494,6 +525,26 @@ async function refreshRuns() {
 }
 
 function renderRunList() {
+  // 运行列表是"全量重建"的（每条 4 个节点 + 3 个按钮）：
+  // 记录一多，每次 render() 都要重建上百条 —— 实测一次运行里产生了 1992 次 DOM 变更，
+  // 真实模型下 token 事件持续几分钟，界面就是这样被拖到卡死的。
+  // 这里先比签名：数据没变就不动 DOM。
+  const listSignature = JSON.stringify([
+    state.run ? state.run.id : "",
+    state.runQuery,
+    state.showArchived,
+    state.runs.map((item) => [
+      item.id,
+      item.status,
+      item.pinned,
+      item.archived,
+      item.steps_done,
+      item.steps_total,
+      item.files_changed,
+    ]),
+  ]);
+  if (listSignature === lastRunListSignature) return;
+  lastRunListSignature = listSignature;
   dom.runList.replaceChildren(
     ...(state.runs.length
       ? state.runs.map((item) => {
@@ -630,13 +681,9 @@ function handleEvent(event) {
     case "token": {
       const key = streamKeyFor(event);
       state.buffers[key] = (state.buffers[key] || "") + (event.data.text || "");
-      const node = document.querySelector(`[data-stream="${key}"]`);
-      if (node) {
-        node.textContent = state.buffers[key];
-        node.scrollTop = node.scrollHeight;
-      } else {
-        scheduleRender();
-      }
+      // 合并到每帧写一次：逐块写 textContent + scrollTop 会强制同步重排，
+      // 长时间流式输出会把界面拖死（这就是"界面卡死"的主因之一）。
+      queueStreamUpdate(key);
       if (event.data.phase === "executor") {
         const card = document.querySelector(`[data-step="${event.data.step_id}"]`);
         if (card) card.dataset.status = "running";
@@ -913,8 +960,29 @@ function renderTimeline() {
   const run = state.run;
   if (!run) {
     dom.timeline.replaceChildren(renderEmptyState());
+    lastTimelineSignature = "";
     return;
   }
+  // 结构签名：状态/步骤/文件/验收/命令/错误没变就不重建卡片。
+  // 流式文本由 queueStreamUpdate 就地更新，不依赖重建。
+  const signature = JSON.stringify([
+    run.id,
+    run.kind || "task",
+    run.status,
+    run.plan_revision,
+    run.error && run.error.message,
+    (run.steps || []).map((step) => [
+      step.id,
+      step.status,
+      (step.summary || "").length,
+      (step.files || []).length,
+      (step.verification || []).length,
+      (step.command_results || []).length,
+      step.retries,
+    ]),
+  ]);
+  if (signature === lastTimelineSignature) return;
+  lastTimelineSignature = signature;
 
   const nodes = [];
   nodes.push(

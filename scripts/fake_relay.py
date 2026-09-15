@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -18,6 +19,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 app = FastAPI(title="Fake Relay", version="0.1.0")
+
+#: 每个流式分片之间的间隔（秒）。默认沿用原值；调大可以复现"长时间流式"的界面压力。
+CHUNK_DELAY_SECONDS = float(os.environ.get("FAKE_RELAY_CHUNK_DELAY", "0.02") or 0.02)
+CHUNK_SIZE = int(os.environ.get("FAKE_RELAY_CHUNK_SIZE", "40") or 40)
 
 PLAN = {
     "goal": "演示：为示例项目建立可验证的骨架",
@@ -131,11 +136,11 @@ async def chat_completions(request: Request):
         )
 
     def stream():
-        for index in range(0, len(content), 40):
-            chunk = content[index : index + 40]
+        for index in range(0, len(content), CHUNK_SIZE):
+            chunk = content[index : index + CHUNK_SIZE]
             payload = json.dumps({"choices": [{"delta": {"content": chunk}}]}, ensure_ascii=False)
             yield f"data: {payload}\n\n"
-            time.sleep(0.02)
+            time.sleep(CHUNK_DELAY_SECONDS)
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
