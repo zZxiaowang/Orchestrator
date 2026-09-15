@@ -72,11 +72,16 @@
         </section>
 
         <div class="foot-area">
+          <!-- 低频信息收进折叠块：这几项以前占了 300+px，把运行列表挤到只剩几十像素 -->
+          <details class="foot-more" id="foot-more">
+            <summary>配置 · 版本</summary>
           <div class="sidebar-route" id="sidebar-route"></div>
           <label class="quick-switch">
             <span>配置</span>
             <select id="provider-quick" title="切换中转 / 个人 Key 直连"></select>
           </label>
+            <div class="build-tag">v__APP_VERSION__ · 构建 __ASSET_VERSION__</div>
+          </details>
           <!-- 槽位：插件可在 sidebar.footer.action 里追加入口 -->
           <div class="footer-actions">
             <div data-slot="sidebar.footer.action" style="display: contents">
@@ -102,7 +107,6 @@
               </button>
             </div>
           </div>
-          <div class="build-tag">v__APP_VERSION__ · 构建 __ASSET_VERSION__</div>
         </div>
       </aside>
 
@@ -285,6 +289,14 @@
                 <input id="f-architect-backup-model" placeholder="gpt-5.6-sol" />
               </label>
               <label class="field">
+                <span>架构段备用协议（留空跟随主用）</span>
+                <select id="f-architect-backup-wire">
+                  <option value="">跟随主用</option>
+                  <option value="chat_completions">chat_completions</option>
+                  <option value="responses">responses</option>
+                </select>
+              </label>
+              <label class="field">
                 <span>备用别名（显示用）</span>
                 <input id="f-architect-backup-label" placeholder="例如：备用中转" />
               </label>
@@ -299,6 +311,14 @@
               <label class="field">
                 <span>执行段备用模型（留空沿用主用）</span>
                 <input id="f-editor-backup-model" placeholder="deepseek-v4-flash" />
+              </label>
+              <label class="field">
+                <span>执行段备用协议（留空跟随主用）</span>
+                <select id="f-editor-backup-wire">
+                  <option value="">跟随主用</option>
+                  <option value="chat_completions">chat_completions</option>
+                  <option value="responses">responses</option>
+                </select>
               </label>
               <label class="field">
                 <span>备用别名（显示用）</span>

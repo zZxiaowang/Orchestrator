@@ -115,3 +115,61 @@ def test_backup_settings_round_trip_through_api(tmp_path: Path):
         again = client.put("/api/v1/settings", json={"architect_backup_model": "gpt-5.2"}).json()
         assert again["architect_backup"]["api_key_set"] is True
         assert again["architect_backup"]["model"] == "gpt-5.2"
+
+
+class FlakyPrimaryRelay(PrimaryDownRelay):
+    """主用先失败、可以一键"修好"的假中转，用来验证重试。"""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.primary_healthy = False
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host or ""
+        if host.startswith("primary") and not self.primary_healthy:
+            return super().handler(request)
+        return FakeRelay.handler(self, request)
+
+
+def test_failed_run_can_be_retried_without_rebuilding_the_task(tmp_path: Path):
+    """502 抖动：失败后点「重试」就能接着跑，不用重建任务、重看纲领。"""
+
+    relay = FlakyPrimaryRelay()
+    # 只配主用（无备用），先让规划失败
+    with build_client(
+        tmp_path, relay, settings_overrides={"relay_base_url": "https://primary.test/v1"}
+    ) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "为示例项目建立骨架"}).json()["run"][
+            "id"
+        ]
+        run = wait_for_status(client, run_id, {"failed"}, timeout=60)
+        assert run["error"]["code"] == "relay_error"
+        assert run["steps"] == []
+
+        # 网关恢复 → 重试 → 应当重新规划（同一份任务，不新建）
+        relay.primary_healthy = True
+        retried = client.post(f"/api/v1/runs/{run_id}/retry").json()
+        assert retried["action"] == "retry_run"
+        run = wait_for_status(client, run_id, {"awaiting_approval"}, timeout=30)
+        assert run["plan"] is not None
+        assert len(run["steps"]) == 2
+        assert run["error"] is None
+
+        # 确认后照常执行完
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL, timeout=30)
+        assert run["status"] == "done", run.get("error")
+
+
+def test_retry_is_refused_while_running(tmp_path: Path):
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        from app.schemas.run import RunStatus
+
+        orchestrator = client.app.state.orchestrator
+        running = orchestrator.store.load(run_id)
+        running.status = RunStatus.EXECUTING
+        orchestrator.store.save(running)
+        assert client.post(f"/api/v1/runs/{run_id}/retry").status_code == 409

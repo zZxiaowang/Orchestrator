@@ -121,10 +121,12 @@ class SettingsPatch(BaseModel):
     # 主备降级：主用失败（502/503/超时）时自动切到备用配置
     architect_backup_base_url: str | None = None
     architect_backup_api_key: str | None = None
+    architect_backup_wire_api: str | None = None
     architect_backup_model: str | None = None
     architect_backup_label: str | None = None
     editor_backup_base_url: str | None = None
     editor_backup_api_key: str | None = None
+    editor_backup_wire_api: str | None = None
     editor_backup_model: str | None = None
     editor_backup_label: str | None = None
 
@@ -217,6 +219,7 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
             "base_url": settings.architect_backup_base_url,
             "api_key_masked": _mask_key(settings.architect_backup_api_key),
             "api_key_set": bool(settings.architect_backup_api_key),
+            "wire_api": settings.architect_backup_wire_api,
             "model": settings.architect_backup_model,
             "label": settings.architect_backup_label,
         },
@@ -224,6 +227,7 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
             "base_url": settings.editor_backup_base_url,
             "api_key_masked": _mask_key(settings.editor_backup_api_key),
             "api_key_set": bool(settings.editor_backup_api_key),
+            "wire_api": settings.editor_backup_wire_api,
             "model": settings.editor_backup_model,
             "label": settings.editor_backup_label,
         },
@@ -598,6 +602,17 @@ async def approve_run(run_id: str, payload: ApproveRequest, request: Request) ->
 async def cancel_run(run_id: str, request: Request) -> dict[str, Any]:
     run = _orchestrator(request).cancel(run_id)
     return {"run": run.model_dump(mode="json")}
+
+
+@router.post("/runs/{run_id}/retry")
+async def retry_run(run_id: str, request: Request) -> dict[str, Any]:
+    """重试失败的运行：规划失败就重新规划，执行失败就从失败步骤继续。
+
+    502/503 这类网关抖动是暂时的，用户不该为此重建任务、重看一遍纲领。
+    """
+
+    run = _orchestrator(request).retry_run(run_id)
+    return {"run": run.model_dump(mode="json"), "action": "retry_run"}
 
 
 @router.post("/runs/{run_id}/resume")

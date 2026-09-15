@@ -937,6 +937,42 @@ class Orchestrator:
         )
         return self.store.load(run_id), summary
 
+    def retry_run(self, run_id: str) -> Run:
+        """重试一次失败的运行：按失败发生在哪一段，决定重新规划还是从失败步骤继续。
+
+        502/503 这类网关抖动是**暂时**的，用户不该为此重建任务、重看一遍纲领。
+        """
+        self._cancelled.discard(run_id)
+        run = self.store.load(run_id)
+        if run.status in (RunStatus.PLANNING, RunStatus.EXECUTING):
+            raise AppError(
+                "运行还在进行中，等它跑完或先点「停止」。",
+                code="run_busy",
+            )
+
+        error_code = str((run.error or {}).get("code") or "")
+        planning_failed = not run.steps or error_code in (
+            "architect_error",
+            "plan_parse_error",
+            "relay_error",
+            "configuration_error",
+        )
+        if planning_failed:
+            # 规划阶段失败：纲领可能根本没产出，重跑规划
+            run.error = None
+            run.status = RunStatus.PLANNING
+            self.store.save(run)
+            self.start_planning(run_id)
+            return self.store.load(run_id)
+
+        # 执行阶段失败：把悬挂在 running 的步骤退回 pending，再从失败处继续
+        for step in run.steps:
+            if step.status in (StepStatus.RUNNING, StepStatus.BLOCKED, StepStatus.FAILED):
+                step.status = StepStatus.PENDING
+                step.error = ""
+        run.error = None
+        return self.resume(run_id, note="")
+
     def cancel(self, run_id: str) -> Run:
         self._cancelled.add(run_id)
         run = self.store.load(run_id)

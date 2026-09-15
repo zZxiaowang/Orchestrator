@@ -93,6 +93,10 @@ body[data-panel="open"] .app {
   background: var(--panel);
   border-right: 1px solid var(--border);
   min-width: 0;
+  /* 一级入口 + 项目导航 + 运行列表 + 底部区可能超过一屏：
+     让侧栏自己滚动，别让运行列表溢出、盖住底部按钮。 */
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .brand {
@@ -137,6 +141,8 @@ body[data-panel="open"] .app {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* 运行列表是主入口，至少留出能看三四条的可见高度 */
+  min-height: 180px;
 }
 
 .run-item {
@@ -184,9 +190,40 @@ body[data-panel="open"] .app {
   margin-top: auto;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding-top: 8px;
+  gap: 4px;
+  padding-top: 6px;
   border-top: 1px solid var(--border-soft);
+  /* 底部区只占它需要的高度，不参与压缩运行列表 */
+  flex: 0 0 auto;
+  /* 固定在侧栏底部：内容滚动时它始终可见，也不会被运行列表盖住 */
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: var(--panel);
+  padding-bottom: 4px;
+}
+
+/* 侧栏底部的低频信息（配置切换 / 版本号）默认折叠 */
+.foot-more {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.foot-more > summary {
+  cursor: pointer;
+  color: var(--muted-2);
+  font-size: 11px;
+  padding: 2px 4px;
+  user-select: none;
+}
+
+.foot-more[open] > summary {
+  color: var(--muted);
+}
+
+.foot-more > *:not(summary) {
+  margin-top: 2px;
 }
 
 .sidebar-route {
@@ -201,6 +238,14 @@ body[data-panel="open"] .app {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+
+/* 底部按钮改成两列：竖着一列五个会把侧栏底部撑到 200+ 像素，
+   在 800px 高的屏幕上直接把运行列表挤没。 */
+.footer-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
 }
 
 .settings-area {

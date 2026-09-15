@@ -111,7 +111,29 @@ class Cdp {
       const x = r.left + r.width / 2;
       const y = r.top + r.height / 2;
       const top = document.elementFromPoint(x, y);
-      return { x, y, hit: top === el || el.contains(top) };
+      return {
+        x,
+        y,
+        hit: top === el || el.contains(top),
+        // 没点中时把"实际点到谁"带回来：被遮罩/浮层挡住是最常见的失败原因
+        topTag: top ? top.tagName : "",
+        topId: top ? top.id : "",
+        topClass: top ? String(top.className || "").slice(0, 40) : "",
+        topPath: top
+          ? (() => {
+              const parts = [];
+              let node = top;
+              for (let depth = 0; node && depth < 4; depth += 1, node = node.parentElement) {
+                parts.push(
+                  node.tagName + (node.id ? "#" + node.id : "") + "." +
+                    String(node.className || "").split(" ")[0],
+                );
+              }
+              return parts.join(" < ");
+            })()
+          : "",
+        topText: top ? String(top.textContent || "").slice(0, 24) : "",
+      };
     })()`);
     if (!box) return { clicked: false, reason: "元素不存在或不可见" };
     for (const type of ["mousePressed", "mouseReleased"]) {
@@ -124,7 +146,14 @@ class Cdp {
       });
     }
     await sleep(250);
-    return { clicked: true, hit: box.hit };
+    // top：没点中时"实际点到谁"，用于定位遮挡（遮罩、浮层、被别的元素盖住）
+    return {
+      clicked: true,
+      hit: box.hit,
+      top: `${box.topTag || ""}#${box.topId || ""}.${box.topClass || ""}`,
+      topPath: box.topPath || "",
+      topText: box.topText || "",
+    };
   }
 
   /** 发送真实组合键（modifiers: 1=Alt 2=Ctrl 4=Meta 8=Shift）。 */
@@ -391,9 +420,18 @@ async function main() {
       const hit = (selector) => {
         const el = document.querySelector(selector);
         if (!el) return null;
+        // 侧栏现在可滚动：先把目标滚进视口，再测"点得到点不到"
+        el.scrollIntoView({ block: "center", inline: "nearest" });
         const r = el.getBoundingClientRect();
         const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
-        return { present: true, hit: top === el || el.contains(top) };
+        return {
+          present: true,
+          hit: top === el || el.contains(top),
+          topPath: top
+            ? top.tagName + (top.id ? "#" + top.id : "") + "." + String(top.className || "").split(" ")[0]
+            : "",
+          topText: top ? String(top.textContent || "").slice(0, 20) : "",
+        };
       };
       return {
         market: hit('[data-entry="market"]'),
@@ -534,16 +572,30 @@ async function main() {
       return index;
     })()`);
     if (targetIndex >= 0) {
-      const clickRun = await cdp.clickSelector(".run-item", targetIndex);
-      const afterRun = await cdp.evaluate(
-        `(() => ({ title: document.getElementById("run-title").textContent,
-                   steps: document.querySelectorAll(".step").length,
-                   status: document.getElementById("status-pill").textContent }))()`,
-      );
+      // 点标题（.run-name）而不是条目的几何中心：条目居中位置可能落在
+      // ☆/✎/▣ 这些操作按钮上，它们 stopPropagation，点了不会打开运行详情。
+      // 列表在运行中可能被刷新而重排，所以点一次没命中就重新定位再点一次。
+      let clickRun = await cdp.clickSelector(".run-item .run-name", targetIndex);
+      if (!clickRun.hit) {
+        await sleep(400);
+        clickRun = await cdp.clickSelector(".run-item .run-name", targetIndex);
+      }
+      // openRun 是异步的（拉运行详情 + 建 SSE），演示目录攒多了会明显变慢：
+      // 轮询等详情真的打开，别用固定 sleep 去赌（曾经因此误判成"点了没反应"）。
+      let afterRun = null;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        afterRun = await cdp.evaluate(
+          `(() => ({ title: document.getElementById("run-title").textContent,
+                     steps: document.querySelectorAll(".step").length,
+                     status: document.getElementById("status-pill").textContent }))()`,
+        );
+        if (afterRun.steps > 0 && !afterRun.status.includes("待开始")) break;
+        await sleep(250);
+      }
       check(
         "点击运行记录能打开详情",
         clickRun.hit && afterRun.steps > 0 && !afterRun.status.includes("待开始"),
-        JSON.stringify(afterRun),
+        JSON.stringify({ ...afterRun, click: clickRun }),
       );
     } else {
       check("存在已完成步骤的运行记录", false, "列表为空，请先在演示模式下跑一次");

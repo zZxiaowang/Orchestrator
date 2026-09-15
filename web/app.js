@@ -180,6 +180,7 @@ const api = {
   continueRun: (id, instruction) =>
     request("POST", `/api/v1/runs/${id}/continue`, { instruction }),
   cancel: (id) => request("POST", `/api/v1/runs/${id}/cancel`, {}),
+  retryRun: (id) => request("POST", `/api/v1/runs/${id}/retry`, {}),
   tree: (id) => request("GET", `/api/v1/runs/${id}/tree`),
   file: (id, path) => request("GET", `/api/v1/runs/${id}/file?path=${encodeURIComponent(path)}`),
   docs: (id) => request("GET", `/api/v1/runs/${id}/docs`),
@@ -810,6 +811,18 @@ function renderRunActions() {
   if (status === "planning" || status === "executing") {
     nodes.push(button("停止", "ghost", () => api.cancel(run.id)));
   }
+  if (status === "failed") {
+    // 网关抖动（502/503）重试一次往往就过了，不该重建任务
+    nodes.push(
+      button("重试", "primary", async () => {
+        const payload = await api.retryRun(run.id);
+        state.run = payload.run;
+        state.buffers = {};
+        connectStream(run.id, state.lastSeq);
+        render();
+      })
+    );
+  }
   if (run && ["done", "blocked", "failed", "paused"].includes(status)) {
     nodes.push(
       button("继续说下一步", "ghost", () => {
@@ -987,6 +1000,17 @@ function renderTimeline() {
   if (run.error) {
     // 可操作的提示（怎么处理）必须一起显示，不能只丢网关原文
     const hint = run.error.hint || run.error.details?.hint || "";
+    const retryBtn = h("button", { class: "btn ghost small", type: "button", text: "重试" });
+    retryBtn.addEventListener(
+      "click",
+      safe(async () => {
+        const payload = await api.retryRun(run.id);
+        state.run = payload.run;
+        state.buffers = {};
+        connectStream(run.id, state.lastSeq);
+        render();
+      })
+    );
     nodes.push(
       h(
         "div",
@@ -995,6 +1019,7 @@ function renderTimeline() {
         hint && hint !== run.error.message
           ? h("div", { class: "error-hint", text: `建议：${hint}` })
           : null,
+        h("div", { class: "step-actions" }, retryBtn),
       )
     );
   }
@@ -1862,6 +1887,7 @@ function openSettings(section = "model") {
     document.getElementById(`f-${role}-backup-base`).value = backup.base_url || "";
     document.getElementById(`f-${role}-backup-model`).value = backup.model || "";
     document.getElementById(`f-${role}-backup-label`).value = backup.label || "";
+    document.getElementById(`f-${role}-backup-wire`).value = backup.wire_api || "";
     const keyField = document.getElementById(`f-${role}-backup-key`);
     keyField.value = "";
     keyField.placeholder = backup.api_key_set
@@ -2231,9 +2257,11 @@ async function saveProviderForm() {
     step_command_rounds: Number(document.getElementById("f-command-rounds").value) || 0,
     // 备用配置：Key 留空 = 不修改（和主 Key 一致的约定）
     architect_backup_base_url: document.getElementById("f-architect-backup-base").value.trim(),
+    architect_backup_wire_api: document.getElementById("f-architect-backup-wire").value,
     architect_backup_model: document.getElementById("f-architect-backup-model").value.trim(),
     architect_backup_label: document.getElementById("f-architect-backup-label").value.trim(),
     editor_backup_base_url: document.getElementById("f-editor-backup-base").value.trim(),
+    editor_backup_wire_api: document.getElementById("f-editor-backup-wire").value,
     editor_backup_model: document.getElementById("f-editor-backup-model").value.trim(),
     editor_backup_label: document.getElementById("f-editor-backup-label").value.trim(),
   };
