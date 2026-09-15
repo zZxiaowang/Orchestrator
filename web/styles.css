@@ -955,6 +955,34 @@ textarea.feedback {
   color: var(--text);
 }
 
+/* 步骤卡片可折叠：已完成的步骤默认收起明细，标题行留一行摘要（状态 · 耗时 · 验收）。 */
+.card-head.step-head {
+  cursor: pointer;
+  user-select: none;
+}
+
+.card-head.step-head:hover {
+  background: #eef1f4;
+}
+
+.card-head.step-head:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 收起时正文不在了，标题行下面的分隔线就成了多余的横线 */
+.card-head.step-head.is-collapsed {
+  border-bottom-color: transparent;
+}
+
+.step-caret {
+  flex: 0 0 auto;
+  width: 10px;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--muted-2);
+}
+
 .step[data-status="running"] {
   border-color: rgba(9, 105, 218, 0.35);
 }
