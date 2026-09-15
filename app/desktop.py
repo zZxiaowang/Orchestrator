@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import socket
 import sys
@@ -28,6 +29,129 @@ from app.core import config as config_module
 from app.core.config import get_settings
 
 logger = logging.getLogger("app.desktop")
+
+# ---------------------------------------------------------------------------
+# 左侧栏信息架构（第 3 步交付）：一级入口只有「普通对话」与「项目」
+#
+# 上位契约：docs/project-navigation-contract.md。架构 / 计划 / 执行 / 步骤 / 验证 / 日志 /
+# 设置全部下沉到「项目」内部二级模块，不再作为左侧栏一级入口出现。
+# ---------------------------------------------------------------------------
+
+#: 左侧栏一级区域的**全部**内容，顺序固定。
+SIDEBAR_PRIMARY_ENTRIES: tuple[dict[str, str], ...] = (
+    {"id": "chat", "label": "普通对话", "route": "#/chat"},
+    {"id": "projects", "label": "项目", "route": "#/projects"},
+)
+
+#: 项目内部二级模块：只有选中项目之后才渲染，普通对话上下文里一律隐藏。
+PROJECT_SECONDARY_MODULES: tuple[dict[str, str], ...] = (
+    {"id": "overview", "label": "概览"},
+    {"id": "architecture", "label": "架构"},
+    {"id": "plan", "label": "计划"},
+    {"id": "execution", "label": "执行"},
+    {"id": "verification", "label": "验证"},
+    {"id": "logs", "label": "日志"},
+    {"id": "settings", "label": "设置"},
+)
+
+#: 普通对话上下文里必须藏起来的工程概念（与二级模块同名）。
+PROJECT_ONLY_SECTIONS: tuple[str, ...] = tuple(item["id"] for item in PROJECT_SECONDARY_MODULES)
+
+#: 页面侧渲染脚本：把两级导航应用到已加载的界面上。
+#: 一级区域只画「普通对话」与「项目」；二级区域只有选中项目后才画，
+#: 普通对话工作区既不画也不返回任何项目执行控制。
+SIDEBAR_NAVIGATION_JS = """
+(() => {
+  const PRIMARY = __PRIMARY__;
+  const PROJECT_MODULES = __MODULES__;
+
+  const sidebar = document.getElementById('sidebar')
+    || document.querySelector('.sidebar')
+    || document.querySelector('aside');
+  if (!sidebar) { return { ok: false, reason: 'sidebar-not-found' }; }
+
+  // 一级区域只保留「普通对话」与「项目」。
+  let primaryHost = sidebar.querySelector('[data-nav-primary]');
+  if (!primaryHost) {
+    primaryHost = document.createElement('nav');
+    primaryHost.className = 'nav-primary-group';
+    primaryHost.setAttribute('data-nav-primary', '');
+    sidebar.prepend(primaryHost);
+  }
+  primaryHost.innerHTML = PRIMARY.map((item) =>
+    '<a class="nav-primary" data-nav="' + item.id + '" href="' + item.route + '">' + item.label + '</a>'
+  ).join('');
+
+  const hash = location.hash || '#/chat';
+  const projectMatch = hash.match(/#\\/projects\\/([^\\/?#]+)/);
+  const selectedProjectId = projectMatch ? decodeURIComponent(projectMatch[1]) : null;
+  const inChat = !hash.startsWith('#/projects');
+
+  // 二级区域只属于项目：普通对话里不渲染。
+  let moduleHost = sidebar.querySelector('[data-project-modules]');
+  if (!moduleHost) {
+    moduleHost = document.createElement('nav');
+    moduleHost.className = 'nav-project-modules';
+    moduleHost.setAttribute('data-project-modules', '');
+    sidebar.appendChild(moduleHost);
+  }
+  moduleHost.hidden = inChat || !selectedProjectId;
+  moduleHost.dataset.project = selectedProjectId || '';
+  if (moduleHost.hidden) {
+    moduleHost.innerHTML = '';
+    moduleHost.dataset.active = '';
+  } else {
+    const current = hash.split('?')[0].split('/').pop();
+    moduleHost.innerHTML = PROJECT_MODULES.map((item) =>
+      '<a class="nav-module" data-module="' + item.id + '" href="#/projects/'
+        + selectedProjectId + '/' + item.id + '">' + item.label + '</a>'
+    ).join('');
+    moduleHost.dataset.active = PROJECT_MODULES.some((m) => m.id === current) ? current : 'overview';
+  }
+
+  // 兼容历史标记：把残留的工程概念一级入口摘掉。
+  sidebar.querySelectorAll('.nav-primary').forEach((el) => {
+    if (!PRIMARY.some((item) => item.id === el.dataset.nav)) { el.remove(); }
+  });
+
+  return {
+    ok: true,
+    primary: PRIMARY.map((item) => item.id),
+    visibleModules: moduleHost.hidden ? [] : PROJECT_MODULES.map((item) => item.id),
+    selectedProjectId: selectedProjectId,
+    workspace: inChat ? 'chat' : 'projects'
+  };
+})();
+""".replace("__PRIMARY__", json.dumps(list(SIDEBAR_PRIMARY_ENTRIES), ensure_ascii=False)).replace(
+    "__MODULES__", json.dumps(list(PROJECT_SECONDARY_MODULES), ensure_ascii=False)
+)
+
+
+def sidebar_primary_entries() -> list[dict[str, str]]:
+    """左侧栏一级入口。除返回值里的两项之外，任何东西都不算一级入口。"""
+    return [dict(item) for item in SIDEBAR_PRIMARY_ENTRIES]
+
+
+def project_secondary_modules() -> list[dict[str, str]]:
+    """项目内部二级模块（选中项目后才可见）。"""
+    return [dict(item) for item in PROJECT_SECONDARY_MODULES]
+
+
+def apply_sidebar_navigation(window) -> dict[str, object]:
+    """把两级导航应用到已加载的窗口，并回读页面侧探针结果。"""
+    try:
+        result = window.evaluate_js(SIDEBAR_NAVIGATION_JS)
+    except Exception as exc:  # pragma: no cover - 需要真实窗口
+        logger.warning("[导航] 注入左侧栏失败：%s", exc)
+        return {"ok": False, "reason": str(exc)}
+    if not isinstance(result, dict):
+        logger.warning("[导航] 左侧栏探针返回异常：%r", result)
+        return {"ok": False, "reason": "bad-probe"}
+    expected = [item["id"] for item in SIDEBAR_PRIMARY_ENTRIES]
+    if list(result.get("primary") or []) != expected:
+        logger.warning("[导航] 一级入口不是 %s：%s", expected, result.get("primary"))
+    return result
+
 
 WINDOW_TITLE = "Orchestrator · 架构-执行双模型编排器"
 DEFAULT_WIDTH = 1360

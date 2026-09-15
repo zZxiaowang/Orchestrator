@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from app.core.jsonx import extract_json_object
 from app.core.relay import CallStats, RelayClient, unwrap_result
+from app.schemas.project import (
+    DEFAULT_PROJECT_ID,
+    ensure_same_project,
+)
 from app.schemas.step import StepOutput
 
 EXECUTOR_SYSTEM = """你是一名执行工程师，负责把已经定稿的**纲领**落地成具体产出。
@@ -120,3 +124,28 @@ def parse_step_output(text: str) -> StepOutput | None:
     if data is None:
         return None
     return StepOutput.model_validate(data)
+
+
+# --- 项目边界（第 4 步：执行段只在项目上下文中运行） ---
+#: 执行产出上的项目字段名；老记录缺该字段时按契约回落到默认项目。
+STEP_PROJECT_FIELD = "project_id"
+
+
+def step_project_id(output: Any) -> str:
+    """读取执行产出所属项目；缺字段时回落 project:default。"""
+
+    raw: Any = None
+    if isinstance(output, Mapping):
+        raw = output.get(STEP_PROJECT_FIELD)
+    else:
+        raw = getattr(output, STEP_PROJECT_FIELD, None)
+    value = str(raw or "").strip()
+    return value or DEFAULT_PROJECT_ID
+
+
+def ensure_step_project(
+    output: Any, requested_project_id: str, *, context_id: str | None = None
+) -> None:
+    """校验执行产出归属；跨项目读取或在落盘前一律拒绝。"""
+
+    ensure_same_project(step_project_id(output), requested_project_id, context_id=context_id)

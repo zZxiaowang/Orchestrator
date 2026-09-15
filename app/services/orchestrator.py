@@ -10,7 +10,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Sequence
+import contextlib
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from fnmatch import fnmatch
 from pathlib import Path
@@ -29,6 +30,10 @@ from app.core.fallback import (
     mask_endpoint,
 )
 from app.core.relay import CallStats, RelayClient
+from app.schemas.project import (
+    DEFAULT_PROJECT_ID,
+    ensure_same_project,
+)
 from app.schemas.run import (
     PHASE_ARCHITECT,
     PHASE_EXECUTOR,
@@ -1506,3 +1511,52 @@ class Orchestrator:
         self.store.save(run)
         self.bus.publish(run.id, "error", error=exc.as_dict(), status=run.status.value)
         self.bus.publish(run.id, "status", status=run.status.value)
+
+
+# --- 项目边界（第 4 步：架构与执行能力收拢到项目之下） ---
+#: 运行记录上的项目字段名；历史记录缺该字段时按契约回落到默认项目。
+RUN_PROJECT_FIELD = "project_id"
+
+
+def run_project_id(run: Any) -> str:
+    """读取运行所属项目；老记录没有 project_id 时回落 project:default。"""
+
+    raw: Any = None
+    if isinstance(run, Mapping):
+        raw = run.get(RUN_PROJECT_FIELD)
+    else:
+        raw = getattr(run, RUN_PROJECT_FIELD, None)
+    if raw is None:
+        for holder_name in ("meta", "extra", "context"):
+            holder = (
+                run.get(holder_name)
+                if isinstance(run, Mapping)
+                else getattr(run, holder_name, None)
+            )
+            if isinstance(holder, Mapping):
+                raw = holder.get(RUN_PROJECT_FIELD)
+                if raw is not None:
+                    break
+    value = str(raw or "").strip()
+    return value or DEFAULT_PROJECT_ID
+
+
+def ensure_run_project(
+    run: Any, requested_project_id: str, *, context_id: str | None = None
+) -> None:
+    """校验运行归属：跨项目读取或控制一律拒绝，且发生在任何写操作之前。"""
+
+    ensure_same_project(run_project_id(run), requested_project_id, context_id=context_id)
+
+
+def stamp_run_project(run: Any, project_id: str) -> Any:
+    """把项目边界写到运行记录上（新建 / 恢复运行时调用），原样返回该记录。"""
+
+    value = str(project_id or "").strip() or DEFAULT_PROJECT_ID
+    if isinstance(run, dict):
+        run[RUN_PROJECT_FIELD] = value
+        return run
+    #: 记录模型可能禁止新增字段（frozen dataclass / pydantic 严格模式），此时保持原样。
+    with contextlib.suppress(Exception):
+        setattr(run, RUN_PROJECT_FIELD, value)
+    return run

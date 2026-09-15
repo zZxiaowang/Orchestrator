@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.catalog import CatalogStore, supported_capabilities
@@ -24,6 +24,14 @@ from app.core.errors import AppError, NotFoundError
 from app.core.plugins import PluginStore
 from app.core.providers import KIND_PRESETS
 from app.core.relay import RelayClient
+from app.schemas.navigation import (
+    PROJECT_LIST_ROUTE,
+    PROJECT_MODULES,
+    PROJECT_ONLY_ACTIONS,
+    NavEntry,
+    ProjectModule,
+    project_module_context,
+)
 from app.services.git_service import GitService
 from app.services.orchestrator import Orchestrator
 from app.services.workspace import Workspace
@@ -967,3 +975,159 @@ async def uninstall_plugin(plugin_id: str, request: Request) -> dict[str, Any]:
     store = _plugins(request)
     store.uninstall(plugin_id)
     return plugins_payload(store)
+
+
+# ---------------------------------------------------------------------------
+# 导航信息架构（第 3 步）：左侧栏一级入口只有「普通对话」与「项目」
+#
+# 上位契约：docs/project-navigation-contract.md。架构 / 计划 / 执行 / 步骤 / 验证 / 日志 /
+# 设置只作为「项目」下的二级模块出现；普通对话上下文既不渲染也不返回这类数据。
+# ---------------------------------------------------------------------------
+
+#: 一级导航文案：这里就是左侧栏一级区域的全部内容。
+PRIMARY_NAVIGATION_LABELS: dict[str, str] = {
+    NavEntry.CHAT.value: "普通对话",
+    NavEntry.PROJECTS.value: "项目",
+}
+
+#: 一级导航落点。
+PRIMARY_NAVIGATION_ROUTES: dict[str, str] = {
+    NavEntry.CHAT.value: "#/chat",
+    NavEntry.PROJECTS.value: PROJECT_LIST_ROUTE,
+}
+
+#: 二级模块文案：只挂在「项目」下面。
+PROJECT_MODULE_LABELS: dict[str, str] = {
+    ProjectModule.OVERVIEW.value: "概览",
+    ProjectModule.ARCHITECTURE.value: "架构",
+    ProjectModule.PLAN.value: "计划",
+    ProjectModule.EXECUTION.value: "执行",
+    ProjectModule.VERIFICATION.value: "验证",
+    ProjectModule.LOGS.value: "日志",
+    ProjectModule.SETTINGS.value: "设置",
+}
+
+
+def primary_navigation_items() -> list[dict[str, str]]:
+    """左侧栏一级入口，顺序固定为「普通对话」→「项目」。"""
+    return [
+        {
+            "id": entry.value,
+            "label": PRIMARY_NAVIGATION_LABELS[entry.value],
+            "route": PRIMARY_NAVIGATION_ROUTES[entry.value],
+            "context_type": "chat" if entry is NavEntry.CHAT else "project",
+        }
+        for entry in NavEntry
+    ]
+
+
+def project_module_items() -> list[dict[str, Any]]:
+    """项目内部二级模块；没有选中项目时不允许渲染。"""
+    return [
+        {
+            "id": module.value,
+            "label": PROJECT_MODULE_LABELS.get(module.value, module.value),
+            "visible_without_project": False,
+        }
+        for module in PROJECT_MODULES
+    ]
+
+
+def _module_not_found(module_id: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=404,
+        content={
+            "error": {
+                "code": "project_module_not_found",
+                "message": f"项目里没有这个模块：{module_id}",
+                "details": {
+                    "module_id": module_id,
+                    "allowed": [module.value for module in PROJECT_MODULES],
+                },
+            }
+        },
+    )
+
+
+def _empty_project_state(module_id: str) -> dict[str, Any]:
+    """没有选中项目时的引导态：只给选择/创建入口，绝不返回全局运行数据。"""
+    return {
+        "requires_project": True,
+        "module": module_id,
+        "selected_project_id": None,
+        "is_empty_state": True,
+        "empty_state": {
+            "title": "先选择一个项目",
+            "message": "架构、计划、执行、步骤、验证、日志与设置都属于项目内部，请先选择或创建项目。",
+            "actions": [
+                {"id": "projects.list", "label": "选择已有项目", "route": PROJECT_LIST_ROUTE},
+                {
+                    "id": "projects.create",
+                    "label": "新建项目",
+                    "route": f"{PROJECT_LIST_ROUTE}?new=1",
+                },
+            ],
+        },
+    }
+
+
+@router.get("/navigation/sidebar")
+async def navigation_sidebar() -> dict[str, Any]:
+    """左侧栏契约：一级入口只有普通对话与项目，工程概念全部下沉到项目内。"""
+    return {
+        "primary": primary_navigation_items(),
+        "project_modules": project_module_items(),
+        "project_only_actions": sorted(PROJECT_ONLY_ACTIONS),
+        "default_route": PROJECT_LIST_ROUTE,
+        "default_context_type": "project",
+    }
+
+
+@router.get("/navigation/chat-workspace")
+async def navigation_chat_workspace() -> dict[str, Any]:
+    """普通对话工作区：独立于项目，不携带任何项目执行控制。"""
+    return {
+        "route": "#/chat",
+        "context_type": "chat",
+        "shows_project_controls": False,
+        "shows_execution_controls": False,
+    }
+
+
+@router.get("/navigation/project-modules/{module_id}")
+async def project_module_entry(module_id: str) -> Any:
+    """未选中项目时点二级模块的落点：项目选择/创建引导，而不是全局运行数据。"""
+    try:
+        module = ProjectModule(module_id)
+    except ValueError:
+        return _module_not_found(module_id)
+    return _empty_project_state(module.value)
+
+
+@router.get("/projects/{project_id}/modules/{module_id}")
+async def project_module(project_id: str, module_id: str) -> Any:
+    """项目内部二级模块：上下文由 project_id 决定，刷新后据此恢复项目与模块。"""
+    normalized = (project_id or "").strip()
+    if not normalized:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "missing_project_context",
+                    "message": "项目模块必须携带 project_id",
+                    "details": {"module_id": module_id},
+                }
+            },
+        )
+    try:
+        module = ProjectModule(module_id)
+    except ValueError:
+        return _module_not_found(module_id)
+    context = project_module_context(module, normalized)
+    return {
+        "project_id": context.project_id,
+        "module": context.module,
+        "context_id": context.context_id,
+        "route": context.route,
+        "is_empty_state": False,
+    }

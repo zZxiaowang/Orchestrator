@@ -15,13 +15,17 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
 
 from app.core.errors import WorkspaceError
 from app.schemas.plan import CheckResult, StepCheck
+from app.schemas.project import (
+    DEFAULT_PROJECT_ID,
+    ensure_same_project,
+)
 from app.services.gitguard import safe_relative
 from app.services.workspace import Workspace
 
@@ -268,3 +272,46 @@ def _default_label(check: StepCheck) -> str:
     if check.type == "json_valid":
         return f"{check.path} 是合法 JSON"
     return check.path
+
+
+# --- 项目边界（第 4 步：验证请求同样属于某个项目） ---
+#: 检查项上的项目字段名；老记录缺该字段时按契约回落到默认项目。
+CHECK_PROJECT_FIELD = "project_id"
+
+
+def check_project_id(check: Any) -> str:
+    """读取检查项所属项目；缺字段时回落 project:default。"""
+
+    raw: Any = None
+    if isinstance(check, Mapping):
+        raw = check.get(CHECK_PROJECT_FIELD)
+    else:
+        raw = getattr(check, CHECK_PROJECT_FIELD, None)
+    if raw is None and hasattr(check, "model_dump"):
+        try:
+            dumped = check.model_dump()
+        except Exception:  # noqa: BLE001 - 老记录可能不允许导出
+            dumped = None
+        if isinstance(dumped, Mapping):
+            raw = dumped.get(CHECK_PROJECT_FIELD)
+    value = str(raw or "").strip()
+    return value or DEFAULT_PROJECT_ID
+
+
+def ensure_check_project(
+    check: Any, requested_project_id: str, *, context_id: str | None = None
+) -> None:
+    """跨项目验证请求在跑检查前就被拒绝，不触碰目标项目数据。"""
+
+    ensure_same_project(check_project_id(check), requested_project_id, context_id=context_id)
+
+
+def ensure_checks_project(
+    checks: Iterable[Any], requested_project_id: str, *, context_id: str | None = None
+) -> list[Any]:
+    """整批检查项都归属同一项目时才放行。"""
+
+    materialized = list(checks)
+    for check in materialized:
+        ensure_check_project(check, requested_project_id, context_id=context_id)
+    return materialized
