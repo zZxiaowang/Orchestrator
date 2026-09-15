@@ -68,6 +68,8 @@
 | 48 | 项目边界与导航信息架构（架构/执行只为项目服务、项目间隔离） | ✅ `be9d07b`：一级导航只留「普通对话 / 项目」，其余降为项目内模块；项目工作区与数据隔离（第 2/5 步交付物） |
 | 49 | `--server` 忽略 `--port`（换了端口其实没换） | ✅ 命令行参数真正生效：桌面入口把 `--host/--port` 传给服务器形态，`app.main.main()` 接受显式绑定地址（`tests/test_server_mode.py` 钉住） |
 | 50 | 写代码类步骤缺「能编译 / 能导入」的客观验收 | ✅ 本步写过的 `.py` 自动补 `py_compile`（并预留名额，不被纲领检查挤掉）；新增 `py_import` 检查类型（受「允许执行验证命令」开关约束；关着、或打包版里找不到可用 Python 解释器时降级为语法编译，并写明未真正导入） |
+| 51 | 发送快捷键改成 Enter | ✅ `Enter` 发送、`Shift+Enter` 换行（`Ctrl/Cmd+Enter` 保留）；输入法组合中的 Enter 不当发送；提示文案与快捷键说明同步更新，自检加了「Shift+Enter 只换行」「Enter 能提交」两条 |
+| 52 | 执行过程中把已完成步骤折叠起来 | ✅ 时间线里 `done` 步骤默认只留标题行（状态 · 耗时 · token · 验收），点标题行展开/收起；选择按「运行+步骤」记住，重跑会自动展开；待执行/运行中/阻塞/失败一律保持展开 |
 
 ## 三、数据与文件位置（重要）
 
@@ -124,7 +126,8 @@
 | 临时脚本 / 截图 / 迁移前源码快照 | `D:\orchestrator\.logs\`（已 gitignore） |
 | 环境变量模板 | `D:\orchestrator\.env.example`（真实 `.env` 不入库） |
 | 打包版旧数据目录（**已不使用**） | `D:\orchestrator\dist\data\`（可删） |
-| 界面自检脚本 | `D:\orchestrator\scripts\ui_check.mjs`、冒烟 `scripts\smoke_check.py` |
+| 界面自检脚本 | `D:\orchestrator\scripts\ui_check.mjs`（**67 项**）、冒烟 `scripts\smoke_check.py` |
+| 演示实例起法（本次新增，均在 `.logs\`，已 gitignore） | `.logs\run_demo.py` 起 8788（进程内设 `ORCHESTRATOR_DATA_DIR=.logs\ui-check-data`，配置读 `.logs\ui-check-data\settings.json` → 本地假网关 `http://127.0.0.1:8799/v1`），加 `python -m scripts.fake_relay`。**坑**：Codex 会话里 `$env:X = ...` 赋值不生效（写了也传不到子进程），所以别再靠环境变量传配置 |
 | 界面自检截图 | `D:\orchestrator\.logs\ui-light.png` |
 | 界面负载 / 卡死探针（本次排查用，**在 Codex 会话工作区，不在仓库内**） | `work\ui_freeze_probe.mjs`（注入 token 风暴）、`work\real_run_probe.mjs`（真实链路）、`work\demo_server.ps1`（起演示实例）、`work\slow_relay.ps1`（调速假中转） |
 | 假中转调速开关 | `FAKE_RELAY_CHUNK_DELAY`、`FAKE_RELAY_CHUNK_SIZE`（默认 0.02 秒 / 40 字符，行为不变） |
@@ -145,10 +148,10 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **469 项**通过；ruff check/format 全绿；界面自检 **64 项全通过** |
+| 质量门 | pytest **469 项**通过；ruff check/format 全绿；界面自检 **67 项全通过**（`node scripts/ui_check.mjs --url http://127.0.0.1:8788`） |
 | 桌面自检 | 打包版 `--selftest` 5 项 PASS / 0 FAIL（渲染、点击链路、Git 面板等） |
-| 打包产物 | `dist\Orchestrator.exe` 约 20.9 MB（2026-09-16 00:13 构建，已确认内含最新前端） |
-| 最近提交 | `3fe4370`（打包版导入解释器修正）、`436e014`（能编译/能导入验收）、`a556ac4`（`--server` 认 `--port`）、`aedfd86`（文档）、`b8b3dbd`（修界面卡死）、`be9d07b`（项目边界与导航 IA）—— 已推送 `origin/main` |
+| 打包产物 | `dist\Orchestrator.exe` 约 20.9 MB（2026-09-16 00:23 构建，已确认内含最新前端：Enter 发送提示 + 步骤折叠代码都在包里） |
+| 最近提交 | `24c01d0`（已完成步骤折叠）、`d3aee81`（Enter 发送）、`3fe4370`（打包版导入解释器修正）、`436e014`（能编译/能导入验收）、`a556ac4`（`--server` 认 `--port`）—— 已推送 `origin/main` |
 | 打包版实测 | `--selftest 3` 全 PASS、退出码 0；`--server --port 8791` → 8791 健康检查 200、8787 不再监听（2026-09-16 复验） |
 | 界面卡死实测 | 突发 3000 个 token：主线程被占住 **43630 毫秒 → 2 毫秒**；4 秒快速流的运行列表 DOM 变更 **177822 个节点 → 0**；流式文本逐字符一致（41270/41270） |
 | 推送 | 已配置 `http.https://github.com/.proxy = http://127.0.0.1:10809`（**只对 github.com 生效**） |
