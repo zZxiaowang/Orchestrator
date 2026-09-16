@@ -80,7 +80,24 @@ class Cdp {
     const id = this.nextId;
     this.nextId += 1;
     this.socket.send(JSON.stringify({ id, method, params }));
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    // 超时保护：浏览器崩了 / 页面卡死时，快速失败并给出方法名，
+    // 而不是让整个自检无限期挂在死掉的 WebSocket 上（曾经真的挂过 10 分钟）
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`CDP 调用超时（${method}）：浏览器可能已崩溃或页面卡死`));
+      }, 30000);
+      this.pending.set(id, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      });
+    });
   }
 
   async evaluate(expression) {
@@ -209,6 +226,13 @@ function check(name, ok, detail = "") {
   results.push({ name, ok: Boolean(ok), detail });
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  — ${detail}` : ""}`);
 }
+
+// 整体超时兜底：任何一步卡住都不该让自检无限期挂着（曾经挂过 10 分钟）
+const watchdog = setTimeout(() => {
+  console.error("自检整体超时（8 分钟），强制退出。");
+  process.exit(1);
+}, 8 * 60 * 1000);
+watchdog.unref?.();
 
 async function main() {
   // 安全闸：自检会写配置/装插件/提交任务，禁止打到接了真实中转的实例，
@@ -368,6 +392,91 @@ async function main() {
         JSON.stringify(state),
       );
     }
+
+    // 1b2) 架构 / 计划里的卡片：默认折叠，点标题行原地展开（不跳模块）
+    const collapsedModules = {};
+    for (const module of ["architecture", "plan"]) {
+      await cdp.clickSelector(`#project-nav [data-nav-section="${module}"]`);
+      await sleep(600);
+      collapsedModules[module] = await cdp.evaluate(`(() => {
+        const cards = Array.from(document.querySelectorAll("#timeline > .card"));
+        // 第一个 card 是模块头（不可折叠），所以按"有可折叠标题行"来挑
+        const heads = cards
+          .map((card) => card.querySelector('.card-head[role="button"]'))
+          .filter(Boolean);
+        const before = {
+          hash: location.hash,
+          total: cards.length,
+          collapsible: heads.length,
+          collapsed: heads.filter((head) => head.closest(".card").querySelector(".card-body").hidden)
+            .length,
+          carets: heads.map((head) => head?.querySelector(".step-caret")?.textContent.trim() || ""),
+        };
+        const first = heads[0];
+        if (!first) return { before, missing: true };
+        first.click();
+        const after = {
+          hash: location.hash,
+          expanded: first.closest(".card").querySelector(".card-body").hidden === false,
+          aria: first.getAttribute("aria-expanded"),
+        };
+        first.click();
+        return { before, after };
+      })()`);
+    }
+    for (const module of ["architecture", "plan"]) {
+      const state = collapsedModules[module];
+      check(
+        `「${module}」卡片默认折叠、点标题原地展开（不跳转）`,
+        state.before.collapsible > 0 &&
+          state.before.collapsed === state.before.collapsible &&
+          state.before.carets.every((caret) => caret === "▸") &&
+          state.after.expanded === true &&
+          state.after.aria === "true" &&
+          state.after.hash === state.before.hash,
+        JSON.stringify(state),
+      );
+    }
+
+    // 1b3) 概览：点运行记录是**原地展开**，不再把人甩到执行模块
+    await cdp.clickSelector('#project-nav [data-nav-section="overview"]');
+    await sleep(700);
+    const overviewExpand = await cdp.evaluate(`(() => {
+      // 概览里的运行条目在 .module-list 里（不是 #timeline 的直接子节点）
+      const cards = Array.from(document.querySelectorAll("#timeline .card"));
+      const first = cards.find((card) => card.querySelector('.card-head[role="button"]'));
+      if (!first) return { missing: true };
+      const head = first.querySelector('.card-head[role="button"]');
+      const body = first.querySelector(".card-body");
+      const before = {
+        hash: location.hash,
+        total: cards.length,
+        collapsedRuns: cards.filter(
+          (card) =>
+            card.querySelector('.card-head[role="button"]') &&
+            card.querySelector(".card-body").hidden,
+        ).length,
+        hidden: body.hidden,
+      };
+      head.click();
+      const after = {
+        hash: location.hash,
+        expanded: body.hidden === false,
+        hasDetail: (body.textContent || "").includes("运行 ID"),
+      };
+      head.click();
+      return { before, after };
+    })()`);
+    check(
+      "概览里点运行记录是原地展开（hash 不变）",
+      !overviewExpand.missing &&
+        overviewExpand.before.hidden === true &&
+        overviewExpand.after.expanded === true &&
+        overviewExpand.after.hasDetail === true &&
+        overviewExpand.after.hash === overviewExpand.before.hash,
+      JSON.stringify(overviewExpand),
+    );
+
     // 回到执行模块（后面的运行列表 / 时间线检查依赖它）
     await cdp.clickSelector('#project-nav [data-nav-section="execution"]');
     await sleep(700);
@@ -416,6 +525,46 @@ async function main() {
     // 回到项目的执行模块
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
     await sleep(900);
+
+    // 1d) 造一条**确定的**已完成运行：后面的运行相关检查都基于它，不再从演示目录的历史数据里挑
+    //     （历史里可能有 blocked / 已追加过步骤的记录，会让断言飘）
+    const seeded = await cdp.evaluate(`(async () => {
+      const call = (path, options) => fetch(path, options).then((response) => response.json());
+      const created = await call("/api/v1/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: "自检用：建立目录与说明", project_id: "default" }),
+      });
+      const id = created.run.id;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const state = await call("/api/v1/runs/" + id);
+        if (state.run.status === "awaiting_approval") break;
+        await new Promise((done) => setTimeout(done, 300));
+      }
+      await call("/api/v1/runs/" + id + "/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback: "" }),
+      });
+      for (let attempt = 0; attempt < 60; attempt += 1) {
+        const state = await call("/api/v1/runs/" + id);
+        if (["done", "failed", "blocked"].includes(state.run.status)) {
+          return { id, status: state.run.status, steps: state.run.steps.length };
+        }
+        await new Promise((done) => setTimeout(done, 300));
+      }
+      return { id, status: "timeout", steps: 0 };
+    })()`);
+    check(
+      "自检基础运行已就绪（2 步全部完成）",
+      seeded.status === "done" && seeded.steps === 2,
+      JSON.stringify(seeded),
+    );
+    // 重新加载页面，让左侧运行列表带上这条新记录
+    await cdp.send("Page.navigate", { url: BASE_URL });
+    await sleep(2500);
+    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+    await sleep(1200);
 
     const modalHidden = await cdp.evaluate(
       `(() => { const m = document.getElementById("settings-modal");
@@ -678,15 +827,10 @@ async function main() {
       }
     })()`);
     await sleep(200);
-    // 优先挑一条真的跑出过步骤的记录（列表里可能残留失败的历史运行）
+    // 直接打开刚才那条自检运行（不依赖历史数据里挑到哪一条）
     const targetIndex = await cdp.evaluate(`(() => {
-      const items = [...document.querySelectorAll(".run-item")];
-      const index = items.findIndex((item) => {
-        const meta = item.querySelector(".run-meta")?.textContent || "";
-        // 形如「已完成3/3 步」，前面还有状态文字，所以不做行首锚定
-        const match = meta.match(/(\\d+)\\/(\\d+)\\s*步/);
-        return match && Number(match[1]) > 0;
-      });
+      const items = [...document.querySelectorAll("#run-list .run-item")];
+      const index = items.findIndex((item) => item.dataset.run === ${JSON.stringify(seeded.id)});
       return index;
     })()`);
     if (targetIndex >= 0) {
@@ -1402,6 +1546,30 @@ async function main() {
         collapse.expanded.aria === "true" &&
         collapse.collapsedAgain.hidden === true,
       JSON.stringify(collapse),
+    );
+
+    // 执行模块：已经输出完的部分（架构段输出、已完成步骤）默认折叠但保留一行总结
+    const execCollapse = await cdp.evaluate(`(() => {
+      const cards = Array.from(document.querySelectorAll("#timeline > .card"));
+      const arch = cards.find((card) => (card.textContent || "").includes("架构段输出"));
+      const steps = Array.from(document.querySelectorAll("#timeline .card.step"));
+      return {
+        archFound: Boolean(arch),
+        archCollapsed: arch ? arch.querySelector(".card-body").hidden : null,
+        archSummary: arch ? (arch.querySelector(".card-head .muted")?.textContent || "").trim() : "",
+        steps: steps.length,
+        doneCollapsed: steps
+          .filter((card) => card.dataset.status === "done")
+          .every((card) => card.querySelector(".card-body").hidden === true),
+      };
+    })()`);
+    check(
+      "执行里已输出的部分默认折叠（架构段输出 + 已完成步骤），并保留一行总结",
+      execCollapse.archFound &&
+        execCollapse.archCollapsed === true &&
+        execCollapse.archSummary.includes("已解析为纲领") &&
+        execCollapse.doneCollapsed === true,
+      JSON.stringify(execCollapse),
     );
 
     const composition = await cdp.evaluate(`(() => {

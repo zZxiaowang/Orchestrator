@@ -112,6 +112,9 @@ const state = {
   //: 已完成的步骤默认折叠：执行长任务时，视野留给"正在跑的那一步"。
   //: 记 status 是为了"某步被重跑（done → running）"时自动重新展开，而不是沿用旧选择。
   stepOpen: {},
+  //: 普通折叠卡片（概览里的运行、架构/计划的卡片、架构段原始输出）的展开状态。
+  //: 只记用户显式点过的；没点过就按"是否还在输出"决定的默认值走。
+  cardOpen: {},
   statusHint: "", // 后端给当前状态的一句话说明（例如"正在判断这是需求还是问答…"）
   tab: "plan",
   docs: [],
@@ -1149,24 +1152,21 @@ function renderTimeline() {
   const architectRaw = (run.messages || []).find((message) => message.phase === "architect");
   const architectBuffer = state.buffers.architect || "";
   if (architectBuffer || architectRaw) {
-    const body = h("pre", {
-      class: "stream",
-      dataset: { stream: "architect" },
-      text: architectBuffer || (architectRaw ? architectRaw.content : ""),
-    });
+    const rawText = architectBuffer || (architectRaw ? architectRaw.content : "");
+    const parsed = Boolean(run.plan);
+    // 和 Codex 一样：正在流式生成时展开（看得见输出），出完纲领就折起来只留一行摘要
     nodes.push(
-      h(
-        "div",
-        { class: "card" },
-        h(
-          "div",
-          { class: "card-head" },
-          h("div", { class: "avatar", text: "G" }),
-          h("strong", { text: "架构段输出 · " + (run.route?.architect?.model || "GPT") }),
-          h("span", { class: "muted", text: run.plan ? "（已解析为纲领）" : "流式生成中…" })
-        ),
-        h("div", { class: "card-body" }, body)
-      )
+      collapsibleCard(`architect:${run.id}`, "架构段输出 · " + (run.route?.architect?.model || "GPT"), {
+        defaultOpen: !parsed,
+        subtitle: parsed ? `已解析为纲领 · ${rawText.length} 字` : "流式生成中…",
+        children: [
+          h("pre", {
+            class: "stream",
+            dataset: { stream: "architect" },
+            text: rawText,
+          }),
+        ],
+      })
     );
   }
 
@@ -4274,6 +4274,14 @@ const PROJECT_SECTION_LABELS = {
   settings: "设置",
 };
 
+//: 概览里最多列多少次运行（一百条折叠卡片既慢又没人看）
+const OVERVIEW_RUN_LIMIT = 20;
+
+//: 主区两块视图的结构签名：数据没变就不重建 DOM（和运行时间线同一套防重排思路）
+let lastChatSignature = "";
+let lastModuleSignature = "";
+let lastProjectListSignature = "";
+
 const ProjectWorkspace = {
   contextType: DEFAULT_CONTEXT_TYPE,
   projectId: "",
@@ -4435,13 +4443,14 @@ function projectRoute(projectId, module) {
   return module && module !== "overview" ? `${base}/${module}` : base;
 }
 
-let suppressHashChange = false;
+//: 自己设进去的 hash：只忽略"恰好是这一个"的回调，避免丢一次事件后把后续导航也吞掉
+let expectedHash = "";
 
 function setRouteHash(route) {
   if (!route) return;
   const next = route.startsWith("#") ? route : `#${route}`;
   if (location.hash === next) return;
-  suppressHashChange = true;
+  expectedHash = next;
   location.hash = next;
 }
 
@@ -4808,10 +4817,12 @@ function bindPrimaryNav() {
     });
   }
   window.addEventListener("hashchange", () => {
-    if (suppressHashChange) {
-      suppressHashChange = false;
+    // 自己设的 hash 不再重复导航；但只认"那一个"，不会吞掉随后用户点的导航
+    if (expectedHash && location.hash === expectedHash) {
+      expectedHash = "";
       return;
     }
+    expectedHash = "";
     applyRoute().catch(showToast);
   });
 }
@@ -4844,6 +4855,85 @@ function cardBlock(title, ...children) {
   );
 }
 
+function cardIsOpen(key, defaultOpen) {
+  const remembered = state.cardOpen[key];
+  return remembered === undefined ? Boolean(defaultOpen) : Boolean(remembered);
+}
+
+function setCardOpen(key, open) {
+  state.cardOpen[key] = Boolean(open);
+}
+
+/** 可折叠卡片：折叠时只留标题行（标题 + 一行摘要），点标题行**原地**展开/收起。
+
+  和 Codex 执行过程的折叠一致：已经输出完的默认折起来、只留总结，
+  正在输出的（例如架构段流式生成中）默认展开；用户点过之后按用户的选择走。
+*/
+function collapsibleCard(key, title, options = {}) {
+  const {
+    subtitle = "",
+    defaultOpen = false,
+    children = [],
+    actions = [],
+    extraHead = [],
+    cardClass = "",
+    dataset = {},
+  } = options;
+  const open = cardIsOpen(key, defaultOpen);
+  const body = h("div", { class: "card-body" }, ...children);
+  body.hidden = !open;
+  const caret = h("span", { class: "step-caret", text: open ? "▾" : "▸", "aria-hidden": "true" });
+  const head = h(
+    "div",
+    {
+      class: `card-head step-head${open ? "" : " is-collapsed"}`,
+      role: "button",
+      tabindex: "0",
+      "aria-expanded": String(open),
+      title: open ? "点击收起" : "点击展开",
+    },
+    caret,
+    ...extraHead,
+    h("strong", { text: title }),
+    subtitle ? h("span", { class: "muted", text: subtitle }) : null,
+    ...actions
+  );
+  const applyOpen = (next) => {
+    body.hidden = !next;
+    caret.textContent = next ? "▾" : "▸";
+    head.classList.toggle("is-collapsed", !next);
+    head.setAttribute("aria-expanded", String(next));
+    head.title = next ? "点击收起" : "点击展开";
+  };
+  const toggle = () => {
+    const next = !cardIsOpen(key, defaultOpen);
+    setCardOpen(key, next);
+    applyOpen(next);
+  };
+  head.addEventListener(
+    "click",
+    safe((event) => {
+      // 标题行里的按钮（看变更 / 复制 / 去执行）有自己的动作，不算折叠
+      if (event.target.closest("button")) return;
+      toggle();
+    })
+  );
+  head.addEventListener(
+    "keydown",
+    safe((event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      toggle();
+    })
+  );
+  return h(
+    "div",
+    { class: cardClass ? `card ${cardClass}` : "card", dataset },
+    head,
+    body
+  );
+}
+
 function kvLine(label, value) {
   return h(
     "div",
@@ -4856,6 +4946,11 @@ function kvLine(label, value) {
 /** 没选项目时的主区：明确告诉用户去哪儿选 / 新建。 */
 function renderProjectListView() {
   const projects = WorkspaceState.projects || [];
+  const signature = JSON.stringify(
+    projects.map((item) => [item.project_id, item.name, item.runs, item.steps_done])
+  );
+  if (signature === lastProjectListSignature && dom.timeline.childElementCount) return;
+  lastProjectListSignature = signature;
   const nodes = [
     cardBlock(
       "项目",
@@ -4906,7 +5001,8 @@ function chatMessageNode(message) {
     return h("div", { class: "card chat-notice" }, h("div", { class: "card-body", text: message.content }));
   }
   const body = message.streaming
-    ? h("pre", { class: "stream", text: message.content || "…" })
+    ? // 流式回答就地写入（data-stream="chat"）：不再逐 token 重建整页
+      h("pre", { class: "stream", dataset: { stream: "chat" }, text: message.content || "…" })
     : h("div", { class: "card-body", text: message.content });
   return h(
     "div",
@@ -4926,6 +5022,7 @@ function chatMessageNode(message) {
 function renderChatThread() {
   const chat = WorkspaceState.chatPayload;
   if (!chat) {
+    lastChatSignature = "";
     dom.timeline.replaceChildren(
       cardBlock(
         "开始一段新对话",
@@ -4937,6 +5034,19 @@ function renderChatThread() {
     );
     return;
   }
+  // 结构签名：会话数据没变就不重建 DOM（流式文本由 flushStreams 就地写入）
+  const signature = JSON.stringify([
+    chat.id,
+    chat.status,
+    (chat.messages_list || []).length,
+    chat.summary_chars,
+    chat.folded_turns,
+    chat.prev_session_id,
+    chat.next_session_id,
+    chat.error,
+  ]);
+  if (signature === lastChatSignature && dom.timeline.querySelector(".chat-thread")) return;
+  lastChatSignature = signature;
   const streaming = state.buffers.chat || "";
   const nodes = (chat.messages_list || []).map((message) => chatMessageNode(message));
   // 承接链与上下文账：这段对话从哪来、折叠了多少、上一轮实际发了多少字符
@@ -5044,22 +5154,21 @@ function moduleHeader(payload) {
 }
 
 function runRows(payload) {
-  const runs = payload.runs || [];
+  // 概览只列最近若干次运行：一百条折叠卡片既慢又没人看，全量在「执行」的列表里
+  const all = payload.runs || [];
+  const runs = all.slice(0, OVERVIEW_RUN_LIMIT);
   if (!runs.length) {
     return h("p", { class: "muted", text: "这个项目还没有运行记录。" });
   }
   const list = h("div", { class: "module-list" });
   for (const run of runs) {
-    const row = h(
-      "button",
-      { class: "module-row", type: "button", dataset: { runId: run.id } },
-      h("div", { class: "run-name", text: run.title || run.id }),
-      h("div", {
-        class: "run-meta",
-        text: `${run.status} · ${run.steps?.done || 0}/${run.steps?.total || 0} 步 · ${run.updated_at || ""}`,
-      })
-    );
-    row.addEventListener(
+    // 概览里点运行记录**原地展开**，不再把人甩到别的模块去
+    const goExecution = h("button", {
+      class: "btn ghost small",
+      type: "button",
+      text: "去执行看时间线 →",
+    });
+    goExecution.addEventListener(
       "click",
       safe(async () => {
         await selectProjectSection("execution");
@@ -5067,31 +5176,48 @@ function runRows(payload) {
         render();
       })
     );
-    list.append(row);
+    list.append(
+      collapsibleCard(`overview:run:${run.id}`, run.title || run.id, {
+        subtitle: `${run.status} · ${run.steps?.done || 0}/${run.steps?.total || 0} 步 · ${
+          run.files_changed || 0
+        } 个文件改动`,
+        children: [
+          h("p", { text: run.task || "（没有填写任务描述）" }),
+          h("p", {
+            class: "muted",
+            text: `运行 ID：${run.id} · 更新于 ${run.updated_at || "—"}`,
+          }),
+          run.error ? h("div", { class: "error-box", text: run.error }) : null,
+          h("div", { class: "approval-actions" }, goExecution),
+        ],
+      })
+    );
+  }
+  if (all.length > runs.length) {
+    list.append(
+      h("p", {
+        class: "muted",
+        text: `共 ${all.length} 次运行，这里只列最近 ${runs.length} 次；全部记录见左侧「运行记录」。`,
+      })
+    );
   }
   return list;
 }
 
 function overviewNodes(payload) {
-  const nodes = [];
-  const latest = payload.current_run;
-  nodes.push(
-    cardBlock(
-      "最近一次运行",
-      latest
-        ? h(
-            "div",
-            {},
-            h("p", { text: `${latest.title}（${latest.status}）` }),
-            h("p", {
-              class: "muted",
-              text: `${latest.steps?.done || 0}/${latest.steps?.total || 0} 步完成 · ${latest.updated_at || ""}`,
-            })
-          )
-        : h("p", { class: "muted", text: "还没有运行：点上面的「新建任务」开始。" })
-    )
-  );
-  nodes.push(cardBlock("运行记录", runRows(payload)));
+  const runs = payload.runs || [];
+  const nodes = [
+    h("div", { class: "section-label", text: `运行记录（${runs.length}）` }),
+    runRows(payload),
+  ];
+  if (!runs.length) {
+    nodes.push(
+      cardBlock(
+        "还没有运行",
+        h("p", { class: "muted", text: "点上面的「＋ 新建任务」开始：架构段先出纲领，确认后执行。" })
+      )
+    );
+  }
   return nodes;
 }
 
@@ -5106,48 +5232,90 @@ function architectureNodes(payload) {
     ];
   }
   const nodes = [
-    cardBlock(
-      "纲领目标",
-      h("p", { class: "plan-goal", text: data.goal || "（未写目标）" }),
-      h("p", { text: data.summary || "" }),
-      h("p", {
-        class: "muted",
-        text: `模型 ${data.metrics?.model || "—"} · ${(data.metrics?.duration_ms || 0) / 1000} 秒${
-          typeof data.metrics?.total_tokens === "number" ? ` · ${data.metrics.total_tokens} tokens` : ""
-        }`,
-      })
-    ),
+    // 折叠时标题行就是它的一句话摘要——收起来也不丢信息
+    collapsibleCard("architecture:goal", "纲领目标", {
+      subtitle: (data.goal || "").slice(0, 60),
+      children: [
+        h("p", { class: "plan-goal", text: data.goal || "（未写目标）" }),
+        data.summary ? h("p", { text: data.summary }) : null,
+        h("p", {
+          class: "muted",
+          text: `模型 ${data.metrics?.model || "—"} · ${(
+            (data.metrics?.duration_ms || 0) / 1000
+          ).toFixed(1)} 秒${
+            typeof data.metrics?.total_tokens === "number"
+              ? ` · ${data.metrics.total_tokens} tokens`
+              : ""
+          }`,
+        }),
+      ],
+    }),
   ];
   if (data.principles?.length) {
     nodes.push(
-      cardBlock("设计原则", h("ul", { class: "list" }, ...data.principles.map((item) => h("li", { text: item }))))
+      collapsibleCard("architecture:principles", "设计原则", {
+        subtitle: `${data.principles.length} 条`,
+        children: [
+          h(
+            "ul",
+            { class: "list" },
+            ...data.principles.map((item) => h("li", { text: item }))
+          ),
+        ],
+      })
     );
   }
   if (data.components?.length) {
     nodes.push(
-      cardBlock(
-        "组件与职责",
-        h(
-          "ul",
-          { class: "list" },
-          ...data.components.map((item) =>
-            h("li", { text: `${item.name}：${item.responsibility}${item.interfaces?.length ? `（接口：${item.interfaces.join("、")}）` : ""}` })
+      collapsibleCard("architecture:components", "组件与职责", {
+        subtitle: `${data.components.length} 个`,
+        children: [
+          h(
+            "ul",
+            { class: "list" },
+            ...data.components.map((item) =>
+              h("li", {
+                text: `${item.name}：${item.responsibility}${
+                  item.interfaces?.length ? `（接口：${item.interfaces.join("、")}）` : ""
+                }`,
+              })
+            )
           )
-        )
-      )
+        ],
+      })
     );
   }
   if (data.risks?.length) {
-    nodes.push(cardBlock("风险", h("ul", { class: "list" }, ...data.risks.map((item) => h("li", { text: item })))));
+    nodes.push(
+      collapsibleCard("architecture:risks", "风险", {
+        subtitle: `${data.risks.length} 条`,
+        children: [
+          h("ul", { class: "list" }, ...data.risks.map((item) => h("li", { text: item }))),
+        ],
+      })
+    );
   }
   if (data.open_questions?.length) {
     nodes.push(
-      cardBlock("待澄清", h("ul", { class: "list" }, ...data.open_questions.map((item) => h("li", { text: item }))))
+      collapsibleCard("architecture:questions", "待澄清", {
+        subtitle: `${data.open_questions.length} 条`,
+        children: [
+          h(
+            "ul",
+            { class: "list" },
+            ...data.open_questions.map((item) => h("li", { text: item }))
+          ),
+        ],
+      })
     );
   }
   if (data.raw) {
-    const details = h("details", {}, h("summary", { text: "架构段原始输出" }), h("pre", { class: "stream", text: data.raw }));
-    nodes.push(h("div", { class: "card" }, h("div", { class: "card-body" }, details)));
+    nodes.push(
+      collapsibleCard("architecture:raw", "架构段原始输出", {
+        subtitle: `${data.raw.length} 字`,
+        children: [h("pre", { class: "stream", text: data.raw })],
+      })
+    );
   }
   return nodes;
 }
@@ -5168,34 +5336,33 @@ function planNodes(payload) {
   ];
   for (const step of data.steps || []) {
     nodes.push(
-      h(
-        "div",
-        { class: "card step", dataset: { step: step.id, status: step.status } },
-        h(
-          "div",
-          { class: "card-head" },
-          h("div", { class: "step-index", text: step.id }),
-          h("strong", { text: step.title || `第 ${step.id} 步` }),
-          h("span", { class: "muted", text: STEP_STATUS_TEXT[step.status] || step.status })
-        ),
-        h(
-          "div",
-          { class: "card-body" },
+      collapsibleCard(`plan:step:${step.id}`, step.title || `第 ${step.id} 步`, {
+        subtitle: `${STEP_STATUS_TEXT[step.status] || step.status} · 交付物 ${
+          step.deliverables?.length || 0
+        } 个 · 验收 ${step.acceptance?.length || 0} 条`,
+        extraHead: [h("div", { class: "step-index", text: step.id })],
+        cardClass: "step",
+        dataset: { step: step.id, status: step.status },
+        children: [
           h("p", { text: step.goal || "" }),
           step.deliverables?.length
             ? h("p", { class: "muted", text: `交付物：${step.deliverables.join("、")}` })
             : null,
           step.acceptance?.length
-            ? h("ul", { class: "list" }, ...step.acceptance.map((item) => h("li", { text: item })))
+            ? h(
+                "ul",
+                { class: "list" },
+                ...step.acceptance.map((item) => h("li", { text: item }))
+              )
             : null,
           step.checks?.length
-            ? h(
-                "p",
-                { class: "muted", text: `客观检查：${step.checks.map((item) => item.type).join("、")}` }
-              )
-            : null
-        )
-      )
+            ? h("p", {
+                class: "muted",
+                text: `客观检查：${step.checks.map((item) => item.type).join("、")}`,
+              })
+            : null,
+        ],
+      })
     );
   }
   return nodes;
@@ -5357,15 +5524,37 @@ function settingsNodes(payload) {
 
 /** 项目模块主区：概览 / 架构 / 计划 / 验证 / 日志 / 设置（执行模块走运行时间线）。 */
 function renderModuleView() {
-  if (!ProjectWorkspace.projectId) return renderProjectListView();
+  if (!ProjectWorkspace.projectId) {
+    lastModuleSignature = "";
+    return renderProjectListView();
+  }
   const payload = WorkspaceState.modulePayload;
   if (!payload) {
+    lastModuleSignature = "";
     dom.timeline.replaceChildren(
       h("div", { class: "empty", text: "正在加载项目模块…" })
     );
     return;
   }
   const module = ProjectWorkspace.module;
+  // 结构签名：载荷没变就不重建 DOM（否则每次 render 都会整块替换，触发重排风暴）
+  const signature = JSON.stringify([
+    module,
+    payload.project?.project_id,
+    payload.project?.name,
+    payload.counts,
+    payload.is_empty_state,
+    payload.current_run?.id,
+    payload.current_run?.status,
+    (payload.runs || []).map((run) => [
+      run.id,
+      run.status,
+      run.steps?.done,
+      run.steps?.total,
+    ]),
+  ]);
+  if (signature === lastModuleSignature && dom.timeline.childElementCount) return;
+  lastModuleSignature = signature;
   let nodes = [moduleHeader(payload)];
   if (module === "overview") nodes = nodes.concat(overviewNodes(payload));
   else if (module === "architecture") nodes = nodes.concat(architectureNodes(payload));
