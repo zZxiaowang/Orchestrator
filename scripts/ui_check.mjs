@@ -21,6 +21,22 @@ const argOf = (name, fallback) => {
   return index >= 0 && args[index + 1] ? args[index + 1] : fallback;
 };
 
+// 分组：改哪个模块就只跑相关那几组（发布前仍跑全量）
+//   node scripts/ui_check.mjs --only chat,caps     # 只跑对话与能力中心
+//   node scripts/ui_check.mjs                      # 全量（默认）
+// 可用分组：run（运行/审批/续聊）、chat（普通对话）、caps（skill/MCP/能力中心）
+const ONLY = (argOf("only", "") || "")
+  .split(",")
+  .map((item) => item.trim())
+  .filter(Boolean);
+const runAllStages = ONLY.length === 0 || ONLY.includes("all");
+const stageEnabled = (name) => runAllStages || ONLY.includes(name);
+let skippedStages = 0;
+const skipStage = (name, why) => {
+  skippedStages += 1;
+  console.log(`SKIP  ${name}（${why}）`);
+};
+
 const BASE_URL = argOf("url", "http://127.0.0.1:8787");
 const PORT = Number(argOf("port", "9222"));
 const ALLOW_REMOTE = args.includes("--allow-remote");
@@ -502,6 +518,8 @@ async function main() {
     await sleep(1000);
 
     // 1c) 普通对话：真实会话（新建 → 发消息 → 拿到回答 → 进列表），且不渲染项目控件
+    if (!stageEnabled("chat")) skipStage("普通对话", "--only 未包含 chat");
+    else {
     await cdp.evaluate(`location.hash = "#/chat"`);
     await sleep(800);
     const chatShell = await cdp.evaluate(`(() => ({
@@ -541,6 +559,7 @@ async function main() {
       `document.querySelectorAll("#chat-list .chat-item").length`,
     );
     check("新对话出现在对话列表里", chatListed >= 1, `对话数=${chatListed}`);
+    }
 
     // 回到项目的执行模块
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
@@ -548,7 +567,10 @@ async function main() {
 
     // 1d) 造一条**确定的**已完成运行：后面的运行相关检查都基于它，不再从演示目录的历史数据里挑
     //     （历史里可能有 blocked / 已追加过步骤的记录，会让断言飘）
-    const seeded = await cdp.evaluate(`(async () => {
+    let seeded = { id: "", status: "skipped", steps: 0 };
+    if (!stageEnabled("run")) skipStage("基础运行 + 运行相关检查", "--only 未包含 run");
+    else {
+    seeded = await cdp.evaluate(`(async () => {
       const call = (path, options) => fetch(path, options).then((response) => response.json());
       const created = await call("/api/v1/runs", {
         method: "POST",
@@ -575,16 +597,19 @@ async function main() {
       }
       return { id, status: "timeout", steps: 0 };
     })()`);
+    }
     check(
       "自检基础运行已就绪（2 步全部完成）",
-      seeded.status === "done" && seeded.steps === 2,
+      seeded.id === "" || (seeded.status === "done" && seeded.steps === 2),
       JSON.stringify(seeded),
     );
     // 重新加载页面，让左侧运行列表带上这条新记录
-    await cdp.send("Page.navigate", { url: BASE_URL });
-    await sleep(2500);
-    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
-    await sleep(1200);
+    if (seeded.id) {
+      await cdp.send("Page.navigate", { url: BASE_URL });
+      await sleep(2500);
+      await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+      await sleep(1200);
+    }
 
     // 1e) 能力中心：skill / MCP / 插件共用一个入口（P0 先看注册表视图）
     await cdp.clickSelector("#capabilities-btn");
@@ -611,6 +636,8 @@ async function main() {
     await sleep(250);
 
     // 1e2) Skills：从「能力中心」装一个技能（仓库自带示例，不依赖网络）
+    if (!stageEnabled("caps")) skipStage("能力中心 skill / MCP", "--only 未包含 caps");
+    else {
     await cdp.clickSelector("#capabilities-btn");
     await sleep(600);
     const skillInstall = await cdp.evaluate(`(async () => {
@@ -655,6 +682,8 @@ async function main() {
     await sleep(250);
 
     // 1e3) 装了技能之后：任务文本命中触发词 → 步骤自动注入该技能（并在卡片上显示）
+    if (!seeded.id) skipStage("技能注入检查", "需要 run 分组先造一条运行");
+    else {
     const skillInjection = await cdp.evaluate(`(async () => {
       const call = (path, options) => fetch(path, options).then((response) => response.json());
       const created = await call("/api/v1/runs", {
@@ -704,6 +733,7 @@ async function main() {
     check("步骤卡片显示本步注入的技能", domSkill.hasLine === true, JSON.stringify(domSkill));
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
     await sleep(800);
+    }
 
     // 1e4) MCP：预设添加 → 默认不启用/未信任 → 三道闸门 → 列工具 → 手动调用
     const mcpFlow = await cdp.evaluate(`(async () => {
@@ -780,8 +810,11 @@ async function main() {
     );
     await cdp.clickSelector("#capabilities-close");
     await sleep(250);
+    }
 
     // 1f) 旧链接重定向（前端路由层实现，替代原先的 navigation_migration 契约层）
+    if (!seeded.id) skipStage("旧链接 #/runs 重定向", "需要 run 分组先造一条运行");
+    else {
     await cdp.evaluate(`location.hash = "#/runs/${seeded.id}"`);
     await sleep(1200);
     const legacyRun = await cdp.evaluate(
@@ -792,6 +825,7 @@ async function main() {
       legacyRun.hash.includes("/execution") && legacyRun.hash.includes("default"),
       JSON.stringify(legacyRun),
     );
+    }
 
     await cdp.evaluate(`location.hash = "#/settings"`);
     await sleep(1000);
@@ -808,6 +842,10 @@ async function main() {
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
     await sleep(900);
 
+    // 设置 / 侧栏槽位 / 插件市场这一大段（固定 sleep 最多）归为 settings 分组：
+    // 改对话或能力中心时用 --only chat,caps 可以整段跳过
+    if (!stageEnabled("settings")) skipStage("设置 / 侧栏槽位 / 插件市场", "--only 未包含 settings");
+    else {
     const modalHidden = await cdp.evaluate(
       `(() => { const m = document.getElementById("settings-modal");
         return { hidden: m.hidden, display: getComputedStyle(m).display }; })()`,
@@ -1097,6 +1135,7 @@ async function main() {
       JSON.stringify(afterUninstall),
     );
     await cdp.clickSelector("#market-close");
+    }
 
     // 3) 点击运行列表 → 打开运行
     // 先确保没有弹窗遮罩（弹窗未关时，后面的点击会被遮罩吃掉 → 误判"点了没反应"）
@@ -1140,7 +1179,8 @@ async function main() {
         JSON.stringify({ ...afterRun, click: clickRun }),
       );
     } else {
-      check("存在已完成步骤的运行记录", false, "列表为空，请先在演示模式下跑一次");
+      // --only 没带 run 时这里没有 seed 运行：如实标 SKIP，不误报成失败
+      skipStage("点击运行记录能打开详情", "需要 run 分组先造一条运行");
     }
 
     // 3a1) 设置弹窗：分区导航（不再是一条长滚动）
@@ -1568,6 +1608,9 @@ async function main() {
     check("纲领/步骤卡片提供复制按钮", copyButtons > 0, `copy-btn=${copyButtons}`);
 
     // 3f) 右上角「架构 → 执行」：点哪个标签就只改哪一段
+    //     依赖 settings 分组里建好的第二套配置（没有它时保存分段路由不会生效）
+    if (!stageEnabled("settings")) skipStage("分段路由标签", "--only 未包含 settings");
+    else {
     const chipClicked = await cdp.clickSelector("#route-chips button.chip.architect");
     const architectView = await cdp.evaluate(`(() => {
       const modal = document.getElementById("route-modal");
@@ -1626,6 +1669,7 @@ async function main() {
     await cdp.clickSelector("#route-edit");
     await cdp.clickSelector("#route-follow");
     await sleep(400);
+    }
 
     // 4) 右侧标签页切换
     for (const tab of ["changes", "files", "docs", "plan"]) {

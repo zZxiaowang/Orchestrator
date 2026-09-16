@@ -78,6 +78,7 @@
 | 58 | Skills：能装市面上大多数 skill | ✅ `SKILL.md`（frontmatter: name/description/version/triggers，可带 scripts/references/assets）解析与资格校验；三种来源：**本地目录 / GitHub（owner/repo#ref/子目录）/ zip 地址**；装成副本（`data/capabilities/skills/<id>/`）；启用 / 全局或按项目作用域；**按触发词按需注入执行段**（最多 2 个、≤2400 字符）并在步骤卡片显示「本步注入的技能」；能力中心可安装、预览 SKILL.md、启停、卸载；带示例技能 `skills/code-review/`。MCP 见下一步 |
 | 59 | MCP：接入常用 MCP 并让模型自主调用 | ✅ MCP 客户端（stdio + Streamable HTTP，JSON/SSE 双解析）；能力中心 MCP 分页：9 个预设（filesystem/git/fetch/sqlite/memory/time/playwright/sequential-thinking/示例）、添加、启用、**确认信任**、列工具（10 分钟缓存）、手动调用；模型自主调用走应用层 `tool_calls`（不依赖网关 tools 字段），结果回灌同一步并在步骤卡片显示；三道闸门（启用 → 作用域 → 已确认信任）对"面板"和"模型"一视同仁；设置项 `mcp_enabled` / `mcp_call_rounds` / `mcp_max_calls_per_step`。自带 `scripts/demo_mcp_server.py` 供离线验证 |
 | 60 | UI 收敛（P3）：入口合并、设置四区、折叠统一、四态 | ✅ 侧栏底部只剩「能力中心 / Git / 更新 / 设置」（插件市场 + 已装插件并进能力中心的插件分页）；设置四区：**模型与路由 / 执行与验收 / 上下文与记忆 / 能力与集成**，并把上下文预算与验收补轮搬进界面（以前只能改 `.env`）；折叠规则统一到架构 / 计划 / 验证 / 日志（默认收起、点标题原地展开）；模块与对话补上**错误态 + 重试**（加载 / 空 / 错误 / 有数据四态齐了）。注意：`desktop.py` 的点击探针同步改成点 `#capabilities-btn` |
+| 61 | 前端拆模块 + 自检分组 | ✅ `web/app.js`（6058 行）按区段拆成 `web/js/` 下 **12 个普通脚本**（core / runs / timeline / composer / settings / git / palette / capabilities / dashboard / workspace / views / boot），仍是零构建、按顺序加载、共享全局作用域，行为不变；启动调用挪到最后一块；资源版本号改为对 `index.html + styles.css + js/*.js` 一起取哈希。自检加 `--only run,chat,caps,settings` 分组：全量 99 项约 106 秒，`--only chat,caps` 70 项约 70 秒，跳过的组打印 `SKIP` 并计数（发布前仍跑全量） |
 
 ## 三、数据与文件位置（重要）
 

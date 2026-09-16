@@ -600,6 +600,19 @@
       </div>
     </div>
 
-    <script src="/app.js?v=__ASSET_VERSION__"></script>
+    <!-- 普通 <script>：按顺序加载，共享全局作用域（零构建，行为与拆分前一致） -->
+    <script src="/js/core.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/runs.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/timeline.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/composer.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/settings.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/git.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/palette.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/capabilities.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/dashboard.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/workspace.js?v=__ASSET_VERSION__"></script>
+    <script src="/js/views.js?v=__ASSET_VERSION__"></script>
+    <!-- 启动放在最后：所有模块定义完成才 boot() -->
+    <script src="/js/boot.js?v=__ASSET_VERSION__"></script>
   </body>
 </html>

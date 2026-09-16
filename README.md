@@ -51,8 +51,11 @@
 
 ```powershell
 node scripts/ui_check.mjs          # 64 项检查：可点击性、弹窗、配置切换、滚轮、快捷键、提交任务
+node scripts/ui_check.mjs --only chat,caps   # 只跑对话与能力中心（约 70 秒，全量约 106 秒）
 ```
 
+自检按模块分组（`--only run,chat,caps,settings`，不写就是全量）：改哪个模块就跑哪几组，
+**发布前仍跑全量**；被跳过的组会打印 `SKIP` 并在结论里计数，不会假装跑过。
 需要本机装有 Chrome 或 Edge；截图默认落在 `.logs/ui-light.png`。
 
 ### 命令行方式（Windows / PowerShell）
@@ -343,7 +346,7 @@ orchestrator/
 │   ├── services/      # 工作区落地、事件总线、持久化、架构段、执行段、编排器
 │   ├── api/routes.py  # HTTP 接口
 │   └── main.py        # 入口（静态界面 + 全局错误处理）
-├── web/               # 界面：index.html / styles.css / app.js（无构建步骤）
+├── web/               # 界面：index.html / styles.css / js/（12 个普通脚本，无构建步骤）
 ├── scripts/           # fake_relay（离线假中转）、smoke_check（端到端自检）、run.ps1
 ├── tests/             # pytest：中转协议、解析容错、路径防护、客观验收、端到端流程
 └── data/              # 运行记录与工作区（已 gitignore）

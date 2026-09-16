@@ -182,8 +182,12 @@ def create_app(
 def _asset_version(static_dir) -> str:
     digest = hashlib.sha256()
     directory = Path(static_dir)
-    for name in ("index.html", "styles.css", "app.js"):
-        file = directory / name
+    # 前端已按模块拆到 web/js/：版本号必须覆盖全部资源，否则改 JS 后浏览器还在用旧缓存
+    files = [directory / "index.html", directory / "styles.css"]
+    js_dir = directory / "js"
+    if js_dir.is_dir():
+        files.extend(sorted(js_dir.glob("*.js")))
+    for file in files:
         if file.is_file():
             digest.update(file.read_bytes())
     return digest.hexdigest()[:8]

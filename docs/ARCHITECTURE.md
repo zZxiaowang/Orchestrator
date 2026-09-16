@@ -5,7 +5,7 @@
 > 具体契约细节仍见 `docs/*-contract*.md`。
 > 更新规则：**动了结构（分层、模块、接口、存储布局）就必须同时改本文**。
 
-基线日期：2026-09-16　分支：`main`　质量门：pytest 364 项 / ruff / 界面自检 88 项 / 打包版 `--selftest`
+基线日期：2026-09-16　分支：`main`　质量门：pytest 387 项 / ruff / 界面自检 99 项 / 打包版 `--selftest`
 
 ---
 
@@ -57,12 +57,22 @@ app/
   desktop.py       桌面客户端入口（窗口 / 自检 / `--server` 透传）
 web/
   index.html       页面骨架 + 后端注入的 `__ORCHESTRATOR_PROJECT_MODULES__`
-  app.js           前端（状态 / 路由 / 渲染 / 面板）
   styles.css
+  js/              前端按模块拆的 12 个普通脚本（按 index.html 里的顺序加载，共享全局作用域）
+    core.js        状态 / DOM 引用 / h() / request() / api    runs.js      运行列表 + 打开运行 + SSE
+    timeline.js    主区渲染 + 检查器                          composer.js  输入区与提交任务
+    settings.js    设置弹窗 / 分段路由 / 多套配置              git.js       Git 面板
+    palette.js     命令面板 / 侧栏槽位 / 插件市场入口          capabilities.js 能力中心（skill / MCP / 插件）
+    dashboard.js   统计看板                                   workspace.js 工作区导航 / 路由 / 数据加载
+    views.js       对话线程 / 项目模块视图                     boot.js      启动（放最后）
 data/              settings.json · projects.json · runs/<id>/ · capabilities/ · plugins/ · logs/
 ```
 
 依赖方向严格单向：`core → schemas → services → api → main`；前端只通过 `/api/v1` 取数。
+
+前端拆分的约定：**零构建不变**——继续用普通 `<script>`（不是 ES module），按顺序加载、
+共享全局作用域；因此"改哪个模块看哪个文件"，而打包仍然只有一步。资源版本号由后端对
+`index.html + styles.css + js/*.js` 一起取哈希（改任何一个文件都会换版本号，避免旧缓存）。
 
 ---
 
@@ -83,7 +93,7 @@ data/              settings.json · projects.json · runs/<id>/ · capabilities/
 | Git 能力 | `services/git_service.py` `gitguard.py` | `/git/*` | `test_git_service` `test_gitguard` |
 | 插件市场（legacy） | `core/plugins.py` `core/catalog.py` | `/plugins` `/market/*` | `test_marketplace` |
 | 桌面客户端 | `desktop.py` | `--selftest` `--server` | `test_desktop` `test_server_mode` |
-| 前端 | `web/app.js` | — | `scripts/ui_check.mjs`（88 项） |
+| 前端 | `web/js/*.js`（12 个模块） | — | `scripts/ui_check.mjs`（99 项，支持 `--only` 分组） |
 
 最小化修改的口径：改一个模块 = 改上表对应行里的文件 + 跑对应测试；跨行的改动说明边界被打破了，
 先在本文里更新边界，再动代码。
@@ -167,7 +177,8 @@ Capability { id, kind(skill|mcp|plugin), name, description, version,
 | --- | --- | --- |
 | 单元 / 集成 | `python -m pytest -q`（364 项） | 每次改动 |
 | 静态检查 | `python -m ruff check .` + `ruff format --check .` | 每次改动 |
-| 界面自检 | `node scripts/ui_check.mjs --url http://127.0.0.1:8788`（88 项） | 改前端 / 改接口契约 |
+| 界面自检 | `node scripts/ui_check.mjs --url http://127.0.0.1:8788`（99 项） | 改前端 / 改接口契约 |
+| 界面自检（分组） | `node scripts/ui_check.mjs --url http://127.0.0.1:8788 --only chat,caps` | 只改对话 / 能力中心时（~70 秒 vs 全量 ~106 秒；发布前仍跑全量） |
 | 打包自检 | `.\dist\Orchestrator.exe --selftest 3` | 发版前 / 改前端或启动逻辑 |
 
 界面自检只允许打**演示实例**（8788 + 假中转 8799，脚本里有安全闸）；
