@@ -54,6 +54,13 @@ from app.services.architect import (
     build_continue_messages,
     run_architect,
     run_chat,
+    run_chat_messages,
+    run_summarize,
+)
+from app.services.chat_context import (
+    build_context_messages,
+    needs_new_session,
+    plan_chat_context,
 )
 from app.services.commands import failure_block, run_allowed
 from app.services.context import StepContextBuilder, clip, clip_head_tail
@@ -196,7 +203,11 @@ class Orchestrator:
         return run
 
     def send_chat_message(self, run_id: str, text: str) -> Run:
-        """往普通对话里追加一条消息，并让架构段模型给出回答（流式）。"""
+        """往普通对话里追加一条消息，并让架构段模型给出回答（流式）。
+
+        如果承接摘要已经撑不住（超过 ``chat_summary_max_chars``），这里会**开一个新会话**
+        承接：旧会话留在列表里并留一条跳转说明，新会话带着摘要继续答——返回的是新会话。
+        """
 
         message = (text or "").strip()
         if not message:
@@ -211,6 +222,10 @@ class Orchestrator:
         if pending is not None and not pending.done():
             raise AppError("上一条消息还在回答中，等它说完再发。", code="chat_busy")
 
+        settings = self._settings_provider()
+        if needs_new_session(run.summary, settings):
+            return self._start_followup_session(run, message, settings)
+
         run.messages.append(RunMessage(role="user", phase="chat", content=message))
         if not run.task:
             run.task = message
@@ -223,6 +238,51 @@ class Orchestrator:
         self._cancelled.discard(run_id)
         self._tasks[run_id] = asyncio.create_task(self._chat_reply(run_id))
         return self.store.load(run_id)
+
+    def _start_followup_session(self, previous: Run, question: str, settings: Settings) -> Run:
+        """承接摘要开新会话：上下文重启，但用户的连续感不能断。"""
+
+        followup = Run(
+            id=new_run_id(),
+            title=f"{previous.title}（续）"[:60],
+            task=question,
+            kind="chat",
+            context_type="chat",
+            status=RunStatus.PLANNING,
+            summary=previous.summary,
+            folded_turns=previous.folded_turns,
+            prev_session_id=previous.id,
+            route=self.describe_route(settings),
+        )
+        followup.messages.append(RunMessage(role="user", phase="chat", content=question))
+        self.store.save(followup)
+
+        previous.next_session_id = followup.id
+        previous.status = RunStatus.DONE
+        previous.messages.append(
+            RunMessage(
+                role="system",
+                phase="chat-split",
+                content=(
+                    f"这段对话的上下文已经很长（承接摘要 {len(previous.summary)} 字），"
+                    f"已自动开启新对话继续：{followup.title}。"
+                    "历史与摘要都保留在这里，随时可以点回去看。"
+                ),
+            )
+        )
+        self.store.save(previous)
+
+        self.bus.publish(
+            previous.id,
+            "session_split",
+            next_session_id=followup.id,
+            next_title=followup.title,
+            message=f"上下文已达上限，已自动开启新对话继续：{followup.title}",
+        )
+        self.bus.publish(followup.id, "status", status=followup.status.value, message="正在回答…")
+        self._cancelled.discard(followup.id)
+        self._tasks[followup.id] = asyncio.create_task(self._chat_reply(followup.id))
+        return self.store.load(followup.id)
 
     async def _chat_reply(self, run_id: str) -> None:
         run = self.store.load(run_id)
@@ -238,27 +298,65 @@ class Orchestrator:
             ]
             # 最后一条就是这次要回答的问题，其余作为历史轮次
             question = turns.pop()[1] if turns else run.task
+
+            async def summarize(previous: str, overflow: list[tuple[str, str]]) -> str:
+                """把溢出的历史合并进承接摘要（非流式，不混进可见回答）。"""
+
+                return await run_summarize(
+                    client,
+                    previous=previous,
+                    turns=overflow,
+                    model=endpoint.model,
+                    limit=300,
+                )
+
+            plan = await plan_chat_context(
+                turns,
+                settings=settings,
+                previous_summary=run.summary,
+                total_folded=run.folded_turns,
+                summarize=summarize,
+            )
+            messages = build_context_messages(
+                system=CHAT_SESSION_SYSTEM,
+                brief=run.brief,
+                plan=plan,
+                question=question,
+            )
             stats = CallStats()
             try:
-                answer = await run_chat(
+                answer = await run_chat_messages(
                     client,
-                    question,
+                    messages,
                     model=endpoint.model,
-                    history=turns,
-                    system=CHAT_SESSION_SYSTEM,
                     stats=stats,
                     on_token=lambda text: self.bus.publish(
                         run_id, "token", phase="chat", model=endpoint.model, text=text
                     ),
                 )
             finally:
+                sent_chars = plan.sent_chars(question, system_chars=len(CHAT_SESSION_SYSTEM))
                 self._record_metrics(
                     run,
                     stats,
                     endpoint,
                     phase=PHASE_ARCHITECT,
-                    context_chars=sum(len(item[1]) for item in turns) + len(question),
+                    context_chars=sent_chars,
                     runner=client,
+                )
+            # 上下文记账：省了多少、折叠了几轮，都要能查（也是自检的断言点）
+            run.summary = plan.summary
+            run.folded_turns = plan.total_folded
+            run.last_context_chars = plan.sent_chars(
+                question, system_chars=len(CHAT_SESSION_SYSTEM)
+            )
+            if plan.folded_now:
+                self.bus.publish(
+                    run_id,
+                    "context_folded",
+                    **plan.as_event(),
+                    message=f"已把 {plan.folded_now} 轮历史折叠进摘要"
+                    + ("（摘要模型不可用，用了原样折叠）" if plan.degraded else ""),
                 )
             run.messages.append(
                 RunMessage(role="assistant", phase="chat", model=endpoint.model, content=answer)

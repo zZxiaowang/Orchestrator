@@ -373,6 +373,41 @@
             <p class="hint">
               步骤越多，纲领越细，但每一步都要单独过验收。建议 3–8 步。
             </p>
+
+            <hr class="settings-divider" />
+            <h3 class="settings-group-title">普通对话：长上下文自动拆分（省 token）</h3>
+            <p class="hint">
+              普通对话默认把历史原样重发，聊得越久越贵。开启后按"<b>滚动窗口 + 承接摘要</b>"发送：
+              只带最近几轮原文，更早的压成一段摘要；摘要本身也撑不住时<b>自动开新对话</b>承接
+              （旧对话保留，可随时点回去）。<b>项目里的运行不受影响</b>——执行段的上下文始终是确定性裁剪。
+            </p>
+            <label class="checkbox">
+              <input type="checkbox" id="f-chat-context" />
+              <span>开启长上下文自动拆分（默认开启）</span>
+            </label>
+            <div class="field-grid" id="chat-context-options">
+              <label class="field">
+                <span>保留原文的最近轮数</span>
+                <input id="f-chat-window-turns" type="number" min="2" max="60" />
+              </label>
+              <label class="field">
+                <span>最近原文的字符上限</span>
+                <input id="f-chat-window-chars" type="number" min="500" max="60000" />
+              </label>
+              <label class="field">
+                <span>每次折叠几轮（批量折叠更省）</span>
+                <input id="f-chat-fold-batch" type="number" min="1" max="20" />
+              </label>
+              <label class="field">
+                <span>摘要超过多少字就开新对话</span>
+                <input id="f-chat-summary-max" type="number" min="200" max="20000" />
+              </label>
+            </div>
+            <label class="checkbox">
+              <input type="checkbox" id="f-chat-auto-split" />
+              <span>摘要超限时自动开新对话（关闭则只折叠并提示）</span>
+            </label>
+            <p class="hint" id="chat-context-status"></p>
           </section>
 
           <section class="settings-section" data-section="integrations" hidden>

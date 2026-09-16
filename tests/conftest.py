@@ -66,6 +66,8 @@ class FakeRelay:
         #: 写代码类步骤：让执行段额外产出一个 .py 文件（用于「能编译 / 能导入」验收测试）
         self.python_file = ""
         self.python_source = "VALUE = 1\n"
+        #: 折叠历史触发的摘要调用次数
+        self.summary_calls = 0
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -131,6 +133,24 @@ class FakeRelay:
                     "model": body.get("model", "fake"),
                     "choices": [{"message": {"role": "assistant", "content": text}}],
                     "usage": {"total_tokens": 21},
+                },
+            )
+
+        # 折叠历史用的摘要调用：非流式，返回一段可断言的短摘要
+        if "你在压缩一段对话的历史" in system:
+            self.summary_calls += 1
+            turns_text = body["messages"][-1]["content"]
+            # 长度够到 300 字：真实摘要上限默认 2000，测试里会把阈值调小来触发"开新会话"
+            text = (
+                f"摘要（合并 {len(turns_text)} 字历史）：用户在做示例项目，已定下骨架方案。"
+                + "要点。" * 90
+            )
+            return httpx.Response(
+                200,
+                json={
+                    "model": body.get("model", "fake"),
+                    "choices": [{"message": {"role": "assistant", "content": text}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50},
                 },
             )
 

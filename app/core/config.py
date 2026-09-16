@@ -132,6 +132,13 @@ OVERRIDABLE_FIELDS = (
     "brief_max_chars",
     "step_fetch_rounds",
     "step_file_fetch_limit",
+    # 普通对话的长上下文管理（省 token）：滚动窗口 + 累进摘要 + 超阈值开新会话
+    "chat_context_enabled",
+    "chat_window_turns",
+    "chat_window_chars",
+    "chat_fold_batch",
+    "chat_summary_max_chars",
+    "chat_auto_split",
     # 主备降级（留空 = 不启用自动降级）
     "architect_backup_base_url",
     "architect_backup_api_key",
@@ -220,6 +227,20 @@ class Settings(BaseSettings):
     step_fetch_rounds: int = 3
     #: 每轮最多取回的文件数
     step_file_fetch_limit: int = 6
+
+    # ── 普通对话的长上下文管理（省 token）──
+    #: 总开关：关闭后普通对话按原样发送全部历史（旧行为，最贵）
+    chat_context_enabled: bool = True
+    #: 保留原文的最近轮次（一问一答算 1 轮）
+    chat_window_turns: int = 12
+    #: 最近原文的字符上限（与轮数先到先算）
+    chat_window_chars: int = 6000
+    #: 每次折叠的轮数：批量折叠，避免每轮都调一次摘要模型
+    chat_fold_batch: int = 4
+    #: 承接摘要累计超过该字数就开新会话（"摘要的摘要"开始失真）
+    chat_summary_max_chars: int = 2000
+    #: 是否自动开新会话；关闭时只折叠并在界面上提示
+    chat_auto_split: bool = True
     #: Git 面板操作的仓库目录；留空 = 本项目目录
     git_dir: str = ""
 

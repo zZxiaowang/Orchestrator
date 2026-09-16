@@ -877,6 +877,56 @@ async function main() {
       JSON.stringify(revertLabels),
     );
 
+    // 3f) 普通对话的长上下文自动拆分：开关 + 可选项都在「行为与上下文」里，且能保存
+    await cdp.clickSelector("#settings-btn");
+    await sleep(400);
+    await cdp.clickSelector('#settings-nav [data-section="behavior"]');
+    await sleep(300);
+    const chatContextUi = await cdp.evaluate(`(() => {
+      const master = document.getElementById("f-chat-context");
+      const options = document.getElementById("chat-context-options");
+      const inputs = options ? Array.from(options.querySelectorAll("input")) : [];
+      const before = inputs.map((el) => el.disabled);
+      master.checked = false;
+      master.dispatchEvent(new Event("change", { bubbles: true }));
+      const disabledWhenOff = inputs.every((el) => el.disabled);
+      master.checked = true;
+      master.dispatchEvent(new Event("change", { bubbles: true }));
+      const enabledWhenOn = inputs.every((el) => !el.disabled);
+      document.getElementById("f-chat-window-turns").value = "8";
+      return {
+        hasGroup: Boolean(master && options),
+        fields: inputs.map((el) => el.id),
+        before,
+        disabledWhenOff,
+        enabledWhenOn,
+        status: (document.getElementById("chat-context-status").textContent || "").slice(0, 60),
+      };
+    })()`);
+    await cdp.clickSelector("#settings-save");
+    await sleep(600);
+    const savedChatContext = await cdp.evaluate(`fetch("/api/v1/settings").then((r) => r.json())`);
+    check(
+      "设置里有「长上下文自动拆分」开关与可选项（关掉时选项禁用）",
+      chatContextUi.hasGroup &&
+        chatContextUi.fields.length >= 4 &&
+        chatContextUi.disabledWhenOff &&
+        chatContextUi.enabledWhenOn &&
+        savedChatContext.chat_context_enabled === true &&
+        savedChatContext.chat_window_turns === 8 &&
+        typeof savedChatContext.chat_summary_max_chars === "number",
+      JSON.stringify({ ...chatContextUi, saved: savedChatContext.chat_window_turns }),
+    );
+    // 还原默认值，别把演示实例的配置改坏
+    await cdp.evaluate(`(() => {
+      document.getElementById("f-chat-window-turns").value = "12";
+      return true;
+    })()`);
+    await cdp.clickSelector("#settings-save");
+    await sleep(500);
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(250);
+
     // 3e) 运行操作条 + 首次使用引导
     const actions = await cdp.evaluate(`(() => {
       const host = document.getElementById("run-actions");

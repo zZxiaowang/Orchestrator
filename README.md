@@ -353,7 +353,7 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 482 passed
+python -m pytest -q             # 495 passed
 python -m ruff check .          # All checks passed
 python -m ruff format --check . # 95 files already formatted
 ```
@@ -386,6 +386,17 @@ python -m ruff format --check . # 95 files already formatted
 | `COMPLETED_LOG_MAX_CHARS` | 1200 | 已完成步骤交接日志上限 |
 | `STEP_FETCH_ROUNDS` | 2 | "按需索取文件"最大轮次 |
 | `STEP_FILE_FETCH_LIMIT` | 6 | 每轮最多取回文件数 |
+
+普通对话的长上下文管理（设置 → 行为与上下文；机制见 `docs/chat-context-window.md`）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CHAT_CONTEXT_ENABLED` | `true` | 总开关；关闭 = 历史全部原样发送（旧行为，最贵） |
+| `CHAT_WINDOW_TURNS` | `12` | 保留原文的最近轮数 |
+| `CHAT_WINDOW_CHARS` | `6000` | 最近原文的字符上限 |
+| `CHAT_FOLD_BATCH` | `4` | 每次折叠几轮（批量折叠更省调用） |
+| `CHAT_SUMMARY_MAX_CHARS` | `2000` | 承接摘要超过该字数就自动开新对话（下限 200） |
+| `CHAT_AUTO_SPLIT` | `true` | 关掉则只折叠并在界面提示，不切会话 |
 
 经验值：把 `CONTEXT_BUDGET_CHARS` 压到 12000 左右通常仍能保持质量且明显省 token；
 任务涉及大量既有代码时，优先靠 `need_files` 取件，而不是把预算调大。
@@ -455,6 +466,13 @@ footArea
 普通对话**不产生纲领与步骤、不碰工作区、不能进执行流程**（接口返回 `not_a_project_run`），
 反向也成立——项目里的运行不能当对话用（`not_a_chat_session`）。
 项目与工作区一一绑定：没填"落地目录"时，项目内的运行直接落在项目的工作区里。
+
+**普通对话越聊越贵的问题已经处理**：默认只把最近 12 轮 / 6000 字符的原文发出去，
+更早的历史增量折进一段 ≤300 字的**承接摘要**；摘要本身超过 2000 字时**自动开新对话承接**
+（旧对话保留、可互相跳转，事件流里会提示）。线程顶部有一张「长上下文管理」卡片，
+显示「已折叠 n 轮 · 摘要 n 字 · 上一轮发送 n 字符」，摘要可展开查看。
+开关与全部阈值都在 **设置 → 行为与上下文**，关掉即回到"全量历史"的旧行为；
+项目里的运行不受影响（执行段始终是确定性裁剪）。细节见 `docs/chat-context-window.md`。
 
 地址栏也可以直接进：`#/chat`、`#/chat/<会话ID>`、`#/projects`、`#/projects/<项目ID>/<模块>`；
 旧的 `#/runs/<运行ID>`、`#/settings`、`#/plugins` 会自动重定向。

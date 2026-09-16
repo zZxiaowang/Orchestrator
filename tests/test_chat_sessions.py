@@ -135,3 +135,141 @@ def test_chats_are_listed_separately_from_project_runs(tmp_path: Path):
         assert len(chats) == 1
         assert [item["id"] for item in runs] == [run_id]
         assert chats[0]["id"] != run_id
+
+
+# ── 长上下文管理：滚动窗口 + 累积摘要 + 超阈值自动开新会话 ──
+
+
+def test_long_chat_keeps_each_turn_bounded(tmp_path: Path):
+    """聊得越久不该越贵：每轮发送的历史轮次被窗口限制住（不再线性增长）。"""
+
+    relay = FakeRelay()
+    with build_project_client(
+        tmp_path,
+        relay,
+        chat_window_turns=2,
+        chat_window_chars=4000,
+        chat_fold_batch=2,
+        chat_summary_max_chars=100000,  # 本用例只验窗口，不让它开新会话
+    ) as client:
+        chat = client.post("/api/v1/chats", json={"message": "第 0 句"}).json()["chat"]
+        chat_id = chat["id"]
+        wait_for_messages(client, chat_id, 2)
+        for index in range(1, 7):
+            client.post(f"/api/v1/chats/{chat_id}/messages", json={"text": f"第 {index} 句"})
+            wait_for_messages(client, chat_id, 2 * (index + 1))
+
+        detail = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]
+        assert detail["messages"] == 14  # 会话自己完整留着
+        assert detail["folded_turns"] >= 8  # 但发出去的只有窗口内的
+        assert detail["summary_chars"] > 0
+        assert detail["last_context_chars"] > 0
+
+        chat_calls = [
+            item
+            for item in relay.requests
+            if "本地桌面工具" in item["body"]["messages"][0]["content"]
+        ]
+        last = chat_calls[-1]["body"]["messages"]
+        # system + 摘要 + 窗口 2 轮（4 条）+ 当前提问
+        assert len(last) <= 7, [m["role"] for m in last]
+        assert relay.summary_calls >= 1
+
+
+def test_summary_exceeding_limit_opens_a_followup_session(tmp_path: Path):
+    """摘要撑不住时自动开新对话承接；旧对话留着，并留一条跳转说明。"""
+
+    relay = FakeRelay()
+    with build_project_client(
+        tmp_path,
+        relay,
+        chat_window_turns=1,
+        chat_window_chars=1000,
+        chat_fold_batch=1,
+        chat_summary_max_chars=200,  # 下限就是 200；摘要一生成就超限，下一轮必然触发拆分
+    ) as client:
+        chat_id = client.post("/api/v1/chats", json={"message": "第一句"}).json()["chat"]["id"]
+        wait_for_messages(client, chat_id, 2)
+        for index in (2, 3):
+            client.post(f"/api/v1/chats/{chat_id}/messages", json={"text": f"第 {index} 句"})
+            wait_for_messages(client, chat_id, 2 * index)
+        folded = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]
+        assert folded["folded_turns"] >= 2
+        assert folded["summary_chars"] > 200
+
+        sent = client.post(f"/api/v1/chats/{chat_id}/messages", json={"text": "第四句"})
+        assert sent.status_code == 202
+        payload = sent.json()
+        assert "split_from" in payload and payload["split_reason"]
+        followup = payload["chat"]
+        assert followup["id"] != chat_id
+        assert followup["prev_session_id"] == chat_id
+        assert followup["summary_chars"] > 0
+
+        # 旧会话：留着、能点回去、留了一条说明
+        previous = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]
+        assert previous["next_session_id"] == followup["id"]
+        assert any(item["phase"] == "chat-split" for item in previous["messages_list"])
+        assert previous["messages_list"][-1]["role"] == "system"
+
+        # 新会话：接着答，并带着承接摘要
+        detail = wait_for_messages(client, followup["id"], 2)
+        assert [item["role"] for item in detail["messages_list"]] == ["user", "assistant"]
+        assert detail["summary"]
+        assert detail["last_context_chars"] > 0
+
+        ids = [item["id"] for item in client.get("/api/v1/chats").json()["chats"]]
+        assert chat_id in ids and followup["id"] in ids
+
+
+def test_auto_split_can_be_turned_off(tmp_path: Path):
+    """关掉"自动开新对话"后只折叠、不切换会话（保守模式）。"""
+
+    relay = FakeRelay()
+    with build_project_client(
+        tmp_path,
+        relay,
+        chat_window_turns=1,
+        chat_window_chars=1000,
+        chat_fold_batch=1,
+        chat_summary_max_chars=200,
+        chat_auto_split=False,
+    ) as client:
+        chat_id = client.post("/api/v1/chats", json={"message": "第一句"}).json()["chat"]["id"]
+        wait_for_messages(client, chat_id, 2)
+        for index in (2, 3, 4):
+            sent = client.post(f"/api/v1/chats/{chat_id}/messages", json={"text": f"第 {index} 句"})
+            assert "split_from" not in sent.json()
+            wait_for_messages(client, chat_id, 2 * index)
+        detail = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]
+        assert detail["next_session_id"] == ""
+        assert detail["folded_turns"] >= 2
+
+
+def test_disabled_context_management_sends_full_history(tmp_path: Path):
+    """总开关关掉 = 回到旧行为：历史原样发，不折叠、不拆分。"""
+
+    relay = FakeRelay()
+    with build_project_client(
+        tmp_path,
+        relay,
+        chat_context_enabled=False,
+        chat_window_turns=1,
+        chat_fold_batch=1,
+    ) as client:
+        chat_id = client.post("/api/v1/chats", json={"message": "第一句"}).json()["chat"]["id"]
+        wait_for_messages(client, chat_id, 2)
+        for index in (2, 3):
+            client.post(f"/api/v1/chats/{chat_id}/messages", json={"text": f"第 {index} 句"})
+            wait_for_messages(client, chat_id, 2 * index)
+
+        detail = client.get(f"/api/v1/chats/{chat_id}").json()["chat"]
+        assert detail["folded_turns"] == 0
+        assert relay.summary_calls == 0
+        chat_calls = [
+            item
+            for item in relay.requests
+            if "本地桌面工具" in item["body"]["messages"][0]["content"]
+        ]
+        # 最后一轮仍然是全量历史（1 system + 4 条历史 + 当前提问）
+        assert len(chat_calls[-1]["body"]["messages"]) == 6

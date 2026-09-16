@@ -213,6 +213,15 @@ class Run(BaseModel):
     project_id: str = DEFAULT_PROJECT_ID
     #: 上下文类型：``project`` = 项目内运行；``chat`` = 普通对话（不进入编排）
     context_type: ContextType = "project"
+    #: 普通对话的**承接摘要**：被折叠掉的历史压成的一段背景（项目运行不用它）
+    summary: str = ""
+    #: 已经折叠掉的轮数（用于界面提示"已折叠 n 轮"）
+    folded_turns: int = 0
+    #: 上一次回答实际发送的上下文字符数（让它"省了多少"可见）
+    last_context_chars: int = 0
+    #: 承接链：自动开新会话时，新会话记 prev，旧会话记 next，两边都能点回去
+    prev_session_id: str = ""
+    next_session_id: str = ""
     #: 置顶（Codex 式任务列表管理）
     pinned: bool = False
     #: 归档：默认不出现在列表里，但记录保留

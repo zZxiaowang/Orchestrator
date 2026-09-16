@@ -72,6 +72,7 @@
 | 52 | 执行过程中把已完成步骤折叠起来 | ✅ 时间线里 `done` 步骤默认只留标题行（状态 · 耗时 · token · 验收），点标题行展开/收起；选择按「运行+步骤」记住，重跑会自动展开；待执行/运行中/阻塞/失败一律保持展开 |
 | 53 | 普通对话 / 项目只是有 UI，没有功能 | ✅ 项目是真容器（`data/projects.json`：新建 / 列表 / 改名换目录 / 归档 + 稳定 ID + 工作区绑定）；运行归属项目并按项目过滤；普通对话是真会话（新建 / 多轮带历史 / 流式回答 / 搜索 / 删除） |
 | 54 | 项目内「执行 架构 计划」等模块没有功能 | ✅ 二级模块接真实数据：概览 / 架构 / 计划 / 执行 / 验证 / 日志 / 设置，各自从 `GET /api/v1/projects/{id}/modules/{module}` 装配（旧名 steps/verify/events 自动别名）；前端按契约实现 hash 路由 `#/chat`、`#/chat/<id>`、`#/projects/<id>/<module>` |
+| 55 | 长上下文自动拆分、切新对话以省 token | ✅ 普通对话：最近 12 轮 / 6000 字符保留原文，更早的**增量折进 ≤300 字承接摘要**；摘要超 2000 字**自动开新对话承接**（旧对话保留、双向可跳、事件提示）；摘要失败退化为原样折叠。开关与阈值全在「设置 → 行为与上下文」，设计见 `docs/chat-context-window.md` |
 
 ## 三、数据与文件位置（重要）
 
@@ -152,7 +153,7 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **482 项**通过；ruff check/format 全绿；界面自检 **77 项全通过**（`node scripts/ui_check.mjs --url http://127.0.0.1:8788`） |
+| 质量门 | pytest **495 项**通过；ruff check/format 全绿；界面自检 **78 项全通过**（`node scripts/ui_check.mjs --url http://127.0.0.1:8788`） |
 | 桌面自检 | 打包版 `--selftest` 5 项 PASS / 0 FAIL（渲染、点击链路、Git 面板等） |
 | 打包产物 | `dist\Orchestrator.exe` 约 20.9 MB（2026-09-16 18:50 构建；已确认包内含项目 / 普通对话 / 七个模块的前端与接口） |
 | 最近提交 | `b8caea7`（项目与普通对话做成真功能）、`24c01d0`（已完成步骤折叠）、`d3aee81`（Enter 发送）、`3fe4370`（打包版导入解释器修正）、`436e014`（能编译/能导入验收）、`a556ac4`（`--server` 认 `--port`）—— 已推送 `origin/main` |

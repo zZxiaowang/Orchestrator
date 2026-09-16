@@ -369,6 +369,9 @@ function bindEvents() {
   // 注意：这里不能直接把 openSettings 当处理器——它第一个参数是"要显示哪个分区"，
   // 直接传会把 MouseEvent 当成分区名，结果四个分区全部隐藏。
   on("settings-btn", "click", () => openSettings());
+  // 长上下文自动拆分：开关一变，下面的可选项即时启用/禁用并说明效果
+  on("f-chat-context", "change", updateChatContextOptionState);
+  on("f-chat-auto-split", "change", updateChatContextOptionState);
   on("settings-nav", "click", (event) => {
     const item = event.target.closest(".settings-nav-item");
     if (item) switchSettingsSection(item.dataset.section);
@@ -824,6 +827,27 @@ function handleEvent(event) {
         break;
       }
       refreshRun();
+      break;
+    }
+    case "context_folded": {
+      // 历史被折叠进摘要：让用户看得见"省了什么"，而不是悄悄丢上下文
+      const chat = WorkspaceState.chatPayload;
+      if (chat) {
+        chat.folded_turns = event.data.total_folded ?? chat.folded_turns;
+        chat.summary_chars = event.data.summary_chars ?? chat.summary_chars;
+        if (event.data.summary_preview) chat.summary = event.data.summary_preview;
+      }
+      showToast(event.data.message || "已折叠较早的历史为摘要");
+      scheduleRender();
+      break;
+    }
+    case "session_split": {
+      // 后端开了新会话承接：跟着切过去，并把旧会话留在列表里
+      const nextId = event.data.next_session_id;
+      if (!nextId) break;
+      showToast(event.data.message || "已自动开启新对话（承接摘要）");
+      loadChats();
+      enterChat(nextId).catch(() => {});
       break;
     }
     case "metrics_updated": {
@@ -2119,10 +2143,37 @@ function switchSettingsSection(section) {
   });
 }
 
+/** 长上下文自动拆分：总开关关掉时，下面的可选项一起禁用（并说明会发生什么）。 */
+function updateChatContextOptionState() {
+  const master = document.getElementById("f-chat-context");
+  const host = document.getElementById("chat-context-options");
+  const autoSplit = document.getElementById("f-chat-auto-split");
+  const status = document.getElementById("chat-context-status");
+  if (!master || !host) return;
+  const enabled = master.checked;
+  host.querySelectorAll("input").forEach((input) => {
+    input.disabled = !enabled;
+  });
+  if (autoSplit) autoSplit.disabled = !enabled;
+  if (!status) return;
+  status.textContent = enabled
+    ? `已开启：只发最近 ${document.getElementById("f-chat-window-turns").value || 12} 轮原文，` +
+      `更早的折叠进摘要${autoSplit && autoSplit.checked ? "；摘要超限时自动开新对话" : "（不自动开新对话，只提示）"}。`
+    : "已关闭：普通对话会把全部历史原样发出去（最贵，仅建议排查问题时临时关闭）。";
+}
+
 function openSettings(section = "model") {
   const settings = state.settings;
   if (!settings) return;
   document.getElementById("f-max-steps").value = settings.max_plan_steps || 8;
+  // 普通对话：长上下文自动拆分（开关 + 可选项）
+  document.getElementById("f-chat-context").checked = settings.chat_context_enabled !== false;
+  document.getElementById("f-chat-window-turns").value = settings.chat_window_turns ?? 12;
+  document.getElementById("f-chat-window-chars").value = settings.chat_window_chars ?? 6000;
+  document.getElementById("f-chat-fold-batch").value = settings.chat_fold_batch ?? 4;
+  document.getElementById("f-chat-summary-max").value = settings.chat_summary_max_chars ?? 2000;
+  document.getElementById("f-chat-auto-split").checked = settings.chat_auto_split !== false;
+  updateChatContextOptionState();
   document.getElementById("f-allow-cmd").checked = Boolean(settings.allow_command_execution);
   document.getElementById("f-command-allowlist").value = (
     settings.command_allowlist || []
@@ -2498,6 +2549,14 @@ async function saveProviderForm() {
   const data = collectProviderForm();
   const globals = {
     max_plan_steps: Number(document.getElementById("f-max-steps").value) || 8,
+    // 普通对话的长上下文管理：开关 + 可选项一起保存
+    chat_context_enabled: document.getElementById("f-chat-context").checked,
+    chat_auto_split: document.getElementById("f-chat-auto-split").checked,
+    chat_window_turns: Number(document.getElementById("f-chat-window-turns").value) || 12,
+    chat_window_chars: Number(document.getElementById("f-chat-window-chars").value) || 6000,
+    chat_fold_batch: Number(document.getElementById("f-chat-fold-batch").value) || 4,
+    chat_summary_max_chars:
+      Number(document.getElementById("f-chat-summary-max").value) || 2000,
     allow_command_execution: document.getElementById("f-allow-cmd").checked,
     command_allowlist: String(document.getElementById("f-command-allowlist").value || "")
       .split("\n")
@@ -4679,6 +4738,14 @@ async function sendChatMessage(text) {
     state.buffers.chat = "";
     const payload = await api.sendChat(chatId, message);
     WorkspaceState.chatPayload = payload.chat;
+    if (payload.split_from) {
+      // 后端判定"摘要撑不住了"，已开新会话承接：跟着切过去（旧会话留在列表里）
+      showToast(payload.split_reason || "已自动开启新对话（承接摘要）");
+      await loadChats();
+      await enterChat(payload.chat.id);
+      render();
+      return;
+    }
     connectStream(chatId, state.lastSeq, { chat: true });
     await loadChats();
     render();
@@ -4834,6 +4901,10 @@ function renderProjectListView() {
 
 function chatMessageNode(message) {
   const isUser = message.role === "user";
+  // 系统提示（例如"已自动开启新对话"）：单独一种样式，别混进对话气泡里
+  if (message.role === "system") {
+    return h("div", { class: "card chat-notice" }, h("div", { class: "card-body", text: message.content }));
+  }
   const body = message.streaming
     ? h("pre", { class: "stream", text: message.content || "…" })
     : h("div", { class: "card-body", text: message.content });
@@ -4868,6 +4939,52 @@ function renderChatThread() {
   }
   const streaming = state.buffers.chat || "";
   const nodes = (chat.messages_list || []).map((message) => chatMessageNode(message));
+  // 承接链与上下文账：这段对话从哪来、折叠了多少、上一轮实际发了多少字符
+  const contextBits = [];
+  if (chat.folded_turns) contextBits.push(`已折叠 ${chat.folded_turns} 轮为摘要`);
+  if (chat.summary_chars) contextBits.push(`摘要 ${chat.summary_chars} 字`);
+  if (chat.last_context_chars) contextBits.push(`上一轮发送 ${chat.last_context_chars} 字符`);
+  if (contextBits.length || chat.prev_session_id || chat.next_session_id) {
+    const actions = h("div", { class: "approval-actions" });
+    if (chat.prev_session_id) {
+      const back = h("button", { class: "btn ghost small", type: "button", text: "← 回到上一段对话" });
+      back.addEventListener("click", safe(() => enterChat(chat.prev_session_id).catch(showToast)));
+      actions.append(back);
+    }
+    if (chat.next_session_id) {
+      const forward = h("button", { class: "btn ghost small", type: "button", text: "下一段对话 →" });
+      forward.addEventListener("click", safe(() => enterChat(chat.next_session_id).catch(showToast)));
+      actions.append(forward);
+    }
+    nodes.unshift(
+      h(
+        "div",
+        { class: "card chat-context" },
+        h(
+          "div",
+          { class: "card-head" },
+          h("strong", { text: "长上下文管理" }),
+          h("span", { class: "muted", text: contextBits.join(" · ") || "这段对话是新开的" })
+        ),
+        h(
+          "div",
+          { class: "card-body" },
+          chat.prev_session_id
+            ? h("p", { class: "muted", text: "本对话承接自上一段：更早的内容已压成摘要，其余原文留在上一段对话里。" })
+            : null,
+          chat.summary
+            ? h(
+                "details",
+                {},
+                h("summary", { text: `承接摘要（${chat.summary_chars || chat.summary.length} 字）` }),
+                h("pre", { class: "stream", text: chat.summary })
+              )
+            : null,
+          actions.childElementCount ? actions : null
+        )
+      )
+    );
+  }
   const answering = chat.status === "planning";
   if (answering) {
     nodes.push(

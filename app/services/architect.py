@@ -92,6 +92,59 @@ CHAT_SESSION_SYSTEM = """你是本地桌面工具（架构-执行双模型编排
 4. 不知道就直说不知道，不要编造本工具的功能。"""
 
 
+#: 折叠历史用的摘要提示词：只保留"接着聊还需要的东西"，不保留细节与寒暄
+SUMMARY_SYSTEM = """你在压缩一段对话的历史，压缩结果会作为后续轮次的**背景**继续使用。
+
+要求：
+1. 只输出摘要本身，不要开场白、不要分点标题、不要复述对话原文。
+2. 必须保留：① 用户的目标与当前在做什么；② 已经定下的结论与决定；③ 用户的偏好与约束；
+   ④ 还没解决的问题；⑤ 关键事实（名字、路径、参数、命令等）。寒暄、客套、重复内容一律丢掉。
+3. 控制在 __LIMIT__ 字以内（中文按字算）。宁可短，不要凑字数。
+4. 如果给了"已有摘要"，把新内容**合并**进去，输出一份合并后的最新摘要，而不是两段拼起来。
+5. 直接输出摘要，不要写"以下是摘要"这类话。"""
+
+
+def build_summary_messages(
+    previous: str,
+    turns: Sequence[tuple[str, str]],
+    *,
+    limit: int = 300,
+) -> list[dict[str, Any]]:
+    """把"旧摘要 + 新溢出轮次"拼成一次摘要请求。"""
+
+    lines: list[str] = []
+    if previous.strip():
+        lines.append(f"## 已有摘要\n{previous.strip()}\n")
+    lines.append("## 需要合并进摘要的新对话")
+    for role, content in turns:
+        speaker = "用户" if role == "user" else "助手"
+        lines.append(f"{speaker}：{content.strip()}")
+    lines.append(f"\n请输出合并后的最新摘要（≤{max(80, limit)} 字）。")
+    return [
+        {"role": "system", "content": SUMMARY_SYSTEM.replace("__LIMIT__", str(max(80, limit)))},
+        {"role": "user", "content": "\n".join(lines)},
+    ]
+
+
+async def run_summarize(
+    client: RelayClient,
+    *,
+    previous: str,
+    turns: Sequence[tuple[str, str]],
+    model: str,
+    limit: int = 300,
+    stats: CallStats | None = None,
+) -> str:
+    """折叠历史：非流式调用（摘要不该混进界面上"正在回答"的流里）。"""
+
+    messages = build_summary_messages(previous, turns, limit=limit)
+    result = await client.acomplete(messages, model=model, max_tokens=600, stats=stats)
+    # 兼容两种客户端：RelayClient 直接返回结果，FailoverRunner 返回 (结果, 降级摘要)
+    if isinstance(result, tuple):
+        result = result[0]
+    return " ".join((getattr(result, "text", "") or "").split()).strip()
+
+
 def build_chat_messages(
     task: str,
     *,

@@ -157,6 +157,13 @@ class SettingsPatch(BaseModel):
     command_timeout_seconds: float | None = None
     step_command_rounds: int | None = None
     request_timeout_seconds: float | None = None
+    # 普通对话的长上下文管理（省 token）
+    chat_context_enabled: bool | None = None
+    chat_window_turns: int | None = None
+    chat_window_chars: int | None = None
+    chat_fold_batch: int | None = None
+    chat_summary_max_chars: int | None = None
+    chat_auto_split: bool | None = None
     # 主备降级：主用失败（502/503/超时）时自动切到备用配置
     architect_backup_base_url: str | None = None
     architect_backup_api_key: str | None = None
@@ -267,6 +274,13 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "command_timeout_seconds": settings.command_timeout_seconds,
         "step_command_rounds": settings.step_command_rounds,
         "request_timeout_seconds": settings.request_timeout_seconds,
+        # 普通对话的长上下文管理（省 token）：开关 + 可选项
+        "chat_context_enabled": settings.chat_context_enabled,
+        "chat_window_turns": settings.chat_window_turns,
+        "chat_window_chars": settings.chat_window_chars,
+        "chat_fold_batch": settings.chat_fold_batch,
+        "chat_summary_max_chars": settings.chat_summary_max_chars,
+        "chat_auto_split": settings.chat_auto_split,
         # 备用配置：Key 只回掩码，界面据此显示"已配置/留空不修改"
         "architect_backup": {
             "base_url": settings.architect_backup_base_url,
@@ -1222,6 +1236,12 @@ def _chat_summary(run) -> dict[str, Any]:
         "context_id": run.context_id,
         "messages": len(run.messages),
         "preview": " ".join((last.content if last else "").split())[:120],
+        # 长上下文管理：折叠了多少轮、摘要多长、上一轮实际发了多少字符、承接链
+        "folded_turns": run.folded_turns,
+        "summary_chars": len(run.summary or ""),
+        "last_context_chars": run.last_context_chars,
+        "prev_session_id": run.prev_session_id,
+        "next_session_id": run.next_session_id,
         "created_at": run.created_at.isoformat(),
         "updated_at": run.updated_at.isoformat(),
     }
@@ -1231,6 +1251,7 @@ def _chat_detail(run) -> dict[str, Any]:
     return {
         **_chat_summary(run),
         "status": run.status.value,
+        "summary": run.summary,
         "error": (run.error or {}).get("message", "") if run.error else "",
         "messages_list": [
             {
@@ -1286,8 +1307,14 @@ async def send_chat_message(
     chat_id: str, payload: ChatMessageRequest, request: Request
 ) -> dict[str, Any]:
     orchestrator = _orchestrator(request)
+    before = orchestrator.store.load(chat_id)
     run = orchestrator.send_chat_message(chat_id, payload.text)
-    return {"chat": _chat_detail(run), "accepted": True}
+    result: dict[str, Any] = {"chat": _chat_detail(run), "accepted": True}
+    # 摘要撑不住时后端会自动开新会话承接：把"从哪来"一并告诉界面，好做跳转与提示
+    if run.id != before.id and run.prev_session_id == before.id:
+        result["split_from"] = _chat_detail(orchestrator.store.load(before.id))
+        result["split_reason"] = "上下文已达上限（承接摘要过长），已自动开启新对话"
+    return result
 
 
 @router.delete("/chats/{chat_id}")

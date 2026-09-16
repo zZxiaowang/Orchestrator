@@ -2190,6 +2190,28 @@ textarea:focus {
   margin-bottom: 8px;
 }
 
+/* 普通对话：长上下文管理的提示卡片与系统通知 */
+.chat-context {
+  border-color: rgba(9, 105, 218, 0.25);
+  background: var(--accent-soft);
+}
+
+.chat-notice {
+  background: #fffdf5;
+  border-color: rgba(154, 103, 0, 0.3);
+}
+
+.settings-divider {
+  border: 0;
+  border-top: 1px solid var(--border-soft);
+  margin: 16px 0 12px;
+}
+
+.settings-group-title {
+  margin: 0 0 6px;
+  font-size: 13.5px;
+}
+
 .project-picker .run-list {
   max-height: 180px;
   overflow: auto;
