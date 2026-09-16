@@ -12,7 +12,8 @@ from typing import Any, Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from app.capabilities.registry import CapabilityRegistry
+from app.capabilities import mcp as mcp_module
+from app.capabilities.registry import CapabilityRegistry, resolve_callable_mcp
 from app.capabilities.skills import (
     install_from_github,
     install_from_zip_url,
@@ -20,7 +21,7 @@ from app.capabilities.skills import (
     read_skill_body,
 )
 from app.core.errors import AppError
-from app.schemas.capability import CapabilityKind, CapabilityScope
+from app.schemas.capability import Capability, CapabilityKind, CapabilityScope, CapabilitySource
 
 #: 挂到 ``app/api/routes.py`` 的主 router 上（那边已经有 ``/api/v1`` 前缀），
 #: 所以这里只写资源路径，避免出现 ``/api/v1/api/v1/...``
@@ -51,6 +52,29 @@ class InstallSkillRequest(BaseModel):
 class SkillScopeRequest(BaseModel):
     scope: Literal["global", "project"] = "global"
     project_id: str = ""
+
+
+class McpServerRequest(BaseModel):
+    """新增一个 MCP 服务器：用预设，或自己填传输方式。"""
+
+    preset_id: str = Field("", description="预设 id；填了就按预设填命令，其余字段可覆盖")
+    name: str = ""
+    transport: Literal["stdio", "http"] = "stdio"
+    command: str = ""
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str = ""
+    url: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
+    scope: Literal["global", "project"] = "global"
+    project_id: str = ""
+    enabled: bool = False
+    trusted: bool = False
+
+
+class McpCallRequest(BaseModel):
+    tool: str = Field(..., description="工具名")
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 def _registry(request: Request) -> CapabilityRegistry:
@@ -177,6 +201,202 @@ async def set_capability_scope(
         }
     )
     return {"capability": registry.upsert(updated, record="scope").describe()}
+
+
+# ── MCP：预设 / 新增服务器 / 信任确认 / 工具清单 / 手动调用 ──
+
+
+def _resolve_mcp(registry: CapabilityRegistry, capability_id: str, *, project_id: str = ""):
+    """取一个**可调用**的 MCP 服务器（三道闸门见 ``resolve_callable_mcp``）。"""
+
+    return resolve_callable_mcp(registry, capability_id, project_id=project_id)
+
+
+@router.get("/capabilities/mcp/presets")
+async def mcp_presets() -> dict[str, Any]:
+    """常用 MCP 服务器预设（只给启动方式，不含密钥；装了默认不启用）。"""
+
+    return {"presets": [dict(item) for item in mcp_module.MCP_PRESETS]}
+
+
+@router.post("/capabilities/mcp/servers", status_code=201)
+async def add_mcp_server(payload: McpServerRequest, request: Request) -> dict[str, Any]:
+    """新增 MCP 服务器：默认 **不启用、未确认信任**（会跑代码的能力不该默认放开）。"""
+
+    registry = _registry(request)
+    preset = mcp_module.preset_by_id(payload.preset_id) if payload.preset_id else None
+    if payload.preset_id and preset is None:
+        raise AppError(f"没有这个预设：{payload.preset_id}", code="mcp_preset_not_found")
+
+    meta: dict[str, Any] = {
+        "transport": payload.transport if not preset else preset["transport"],
+        "command": payload.command or (preset or {}).get("command", ""),
+        "args": payload.args or list((preset or {}).get("args") or []),
+        "env": dict(payload.env or {}),
+        "cwd": payload.cwd,
+        "url": payload.url,
+        "headers": dict(payload.headers or {}),
+        "trusted": bool(payload.trusted),
+        "tools": [],
+        "tools_fetched_at": "",
+        "preset_id": payload.preset_id,
+    }
+    if payload.preset_id == "demo" and not payload.command and not payload.args:
+        # 示例服务器是仓库自带脚本：用绝对路径 + 当前解释器，避免受 cwd 影响
+        meta["command"], meta["args"] = _demo_server_launcher()
+    if meta["transport"] == "stdio" and not meta["command"]:
+        raise AppError("stdio 传输必须填 command。", code="invalid_mcp_server")
+    if meta["transport"] == "http" and not meta["url"]:
+        raise AppError("HTTP 传输必须填 url。", code="invalid_mcp_server")
+
+    name = payload.name or (preset or {}).get("name") or meta["command"] or meta["url"]
+    capability_id = f"mcp.{_slug(name)}"
+    capability = Capability(
+        id=capability_id,
+        kind=CapabilityKind.MCP,
+        name=str(name)[:80],
+        description=str((preset or {}).get("description") or ""),
+        enabled=payload.enabled,
+        scope=CapabilityScope(payload.scope),
+        project_id=payload.project_id if payload.scope == "project" else "",
+        permissions=["tools", "network" if meta["transport"] == "http" else "process"],
+        source=CapabilitySource(
+            kind="builtin" if preset else "local",
+            location=f"preset:{payload.preset_id}" if preset else (meta["command"] or meta["url"]),
+        ),
+        meta=meta,
+    )
+    stored = registry.upsert(capability)
+    return {"capability": stored.describe()}
+
+
+def _slug(value: str) -> str:
+    import re
+
+    text = re.sub(r"[^a-z0-9._-]+", "-", str(value).strip().lower()).strip("-._")
+    text = text[:48].strip("-._")
+    if text and re.match(r"^[a-z0-9]", text):
+        return text
+    import hashlib
+
+    return "server-" + hashlib.sha1(str(value).encode("utf-8")).hexdigest()[:8]
+
+
+def _demo_server_launcher() -> tuple[str, list[str]]:
+    """示例 MCP 服务器的启动命令：绝对路径 + 可用解释器。
+
+    打包版里 ``sys.executable`` 是 exe 自己（不是 Python 解释器），所以冻结时退回 PATH 上的
+    ``python``，找不到就报一条能看懂的错。
+    """
+
+    import sys
+
+    from app.core.config import RESOURCE_ROOT
+
+    script = Path(RESOURCE_ROOT) / "scripts" / "demo_mcp_server.py"
+    if not script.is_file():
+        raise AppError(
+            "示例 MCP 服务器脚本不在（打包版需要把 scripts/demo_mcp_server.py 一起打进去）。",
+            code="mcp_demo_missing",
+        )
+    if not getattr(sys, "frozen", False):
+        return sys.executable, [str(script)]
+    return "python", [str(script)]
+
+
+@router.post("/capabilities/{capability_id}/trust")
+async def trust_mcp_server(capability_id: str, request: Request) -> dict[str, Any]:
+    """首次确认：明确告诉用户"它会以本机权限跑代码"，确认后才允许调用工具。"""
+
+    registry = _registry(request)
+    capability = registry.require(capability_id)
+    if capability.kind is not CapabilityKind.MCP:
+        raise AppError("只有 MCP 服务器需要确认信任。", code="not_an_mcp_server")
+    updated = capability.model_copy(update={"meta": {**capability.meta, "trusted": True}})
+    return {"capability": registry.upsert(updated, record="trust").describe()}
+
+
+@router.get("/capabilities/{capability_id}/mcp/tools")
+async def mcp_tools(capability_id: str, request: Request, refresh: bool = False) -> dict[str, Any]:
+    """列出服务器的工具（默认吃缓存；``refresh=true`` 强制重取）。"""
+
+    registry = _registry(request)
+    capability = _resolve_mcp(registry, capability_id)
+    cached = capability.meta.get("tools") or []
+    fetched_at = str(capability.meta.get("tools_fetched_at") or "")
+    if cached and not refresh and _cache_fresh(fetched_at):
+        return {"tools": cached, "cached": True, "fetched_at": fetched_at}
+    try:
+        tools = await mcp_module.list_tools(capability, transport=_download_transport(request))
+    except AppError as exc:
+        return {
+            "tools": cached,
+            "cached": bool(cached),
+            "error": exc.message,
+            "fetched_at": fetched_at,
+        }
+    payload = [item.describe() for item in tools]
+    updated = capability.model_copy(
+        update={
+            "meta": {
+                **capability.meta,
+                "tools": payload,
+                "tools_fetched_at": _now_iso(),
+            }
+        }
+    )
+    stored = registry.upsert(updated, record="mcp_tools")
+    return {
+        "tools": payload,
+        "cached": False,
+        "fetched_at": stored.meta.get("tools_fetched_at", ""),
+    }
+
+
+@router.post("/capabilities/{capability_id}/mcp/call")
+async def mcp_call(capability_id: str, payload: McpCallRequest, request: Request) -> dict[str, Any]:
+    """手动调用一个工具（和模型自主调用走同一条闸门与同一条执行路径）。"""
+
+    registry = _registry(request)
+    capability = _resolve_mcp(
+        registry, capability_id, project_id=request.query_params.get("project_id", "")
+    )
+    result = await mcp_module.call_tool(
+        capability,
+        payload.tool,
+        payload.arguments,
+        transport=_download_transport(request),
+    )
+    registry.touch(capability_id)
+    registry.audit(
+        {
+            "event": "mcp_call",
+            "id": capability_id,
+            "tool": payload.tool,
+            "ok": result.ok,
+            "duration_ms": result.duration_ms,
+            "manual": True,
+        }
+    )
+    return {"result": result.as_dict(), "capability": capability.describe()}
+
+
+def _cache_fresh(fetched_at: str, *, ttl_seconds: int = 600) -> bool:
+    from datetime import UTC, datetime
+
+    if not fetched_at:
+        return False
+    try:
+        moment = datetime.fromisoformat(fetched_at)
+    except ValueError:
+        return False
+    return (datetime.now(UTC) - moment).total_seconds() < ttl_seconds
+
+
+def _now_iso() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).isoformat()
 
 
 @router.post("/capabilities/{capability_id}/enable")

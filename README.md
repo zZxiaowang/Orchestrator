@@ -353,7 +353,7 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 378 passed
+python -m pytest -q             # 387 passed
 python -m ruff check .          # All checks passed
 python -m ruff format --check . # 95 files already formatted
 ```
@@ -429,8 +429,28 @@ zip 地址        https://example.com/my-skill.zip
 
 仓库自带一个示例技能 `skills/code-review/`（含一个示例脚本，用来验证"脚本只登记不执行"）。
 
-**MCP（下一步 P2）**：MCP 客户端（stdio + Streamable HTTP）、server 管理与常用预设、
-模型通过应用层 `tool_calls` 请求工具调用（不依赖网关的 `tools` 字段）。
+**MCP（已可用）**：把外部工具服务器接进来——本地进程（stdio）或服务地址（Streamable HTTP）。
+
+```
+能力中心 → MCP → 选预设（filesystem / git / fetch / sqlite / memory / time /
+playwright / sequential-thinking / 示例 MCP）→ 添加 → 列出工具 → 确认信任
+```
+
+三条边界，缺一不可：
+
+1. **默认不启用**：添加后是关闭状态，要去能力中心打开；
+2. **首次确认信任**：MCP 服务器是**会以本机权限跑代码**的进程，确认前模型调用会被明确拒绝
+   （拒绝原因如实回灌给执行段，不假装执行过）；
+3. **作用域**：可以全局启用，也可以只在某个项目里生效。
+
+模型侧走**应用层协议**（不依赖网关是否支持 `tools` 字段）：执行段在需要时输出
+`{"tool_calls": [{"capability_id": "mcp.xxx", "tool": "…", "arguments": {…}}]}`，
+应用校验并执行后把结果回灌，让它在**同一步**继续。可用工具清单（名字 + 一句说明）会随
+上下文下发，命中"已启用 + 已确认信任"的服务器才会出现；设置里可整体关掉
+（`MCP_ENABLED`），也能限定"一步最多几个调用、最多回灌几轮"。
+
+仓库自带 `scripts/demo_mcp_server.py`（零依赖、离线可跑），「示例 MCP」预设就指向它，
+用来验证整条链路。
 
 左侧任务栏底部的 **插件市场** 入口（`market`）打开市场面板，分三页：
 

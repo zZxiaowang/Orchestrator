@@ -2219,6 +2219,25 @@ textarea:focus {
   font-size: 12.5px;
 }
 
+/* 能力中心：MCP 手动调用一行（工具 + 参数 + 执行 + 结果） */
+.mcp-call-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  width: 100%;
+  margin-top: 6px;
+}
+
+.mcp-call-row input {
+  flex: 1 1 220px;
+}
+
+.mcp-call-row pre {
+  flex: 1 1 100%;
+  margin: 0;
+}
+
 .settings-divider {
   border: 0;
   border-top: 1px solid var(--border-soft);

@@ -53,6 +53,10 @@ a = Analysis(  # noqa: F821
     datas=[
         (str(ROOT / "web"), "web"),
         (str(ROOT / ".env.example"), "."),
+        # 示例 MCP 服务器（能力中心「示例 MCP」预设要用它；纯 Python，可离线跑）
+        (str(ROOT / "scripts" / "demo_mcp_server.py"), "scripts"),
+        # 自带示例技能（能力中心安装 skill 时可直接指向它）
+        (str(ROOT / "skills"), "skills"),
     ],
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],

@@ -181,7 +181,7 @@ Capability { id, kind(skill|mcp|plugin), name, description, version,
 | --- | --- | --- |
 | **P0 地基** | 能力层（契约 + 注册表 + 接口 + 审计）、模块清单单一来源、删除历史死代码、能力中心入口、架构基线文档 | ✅ 本次完成 |
 | **P1 Skills** | ✅ `SKILL.md` 解析与资格校验、本地目录 / GitHub / zip 三种来源安装、启用与项目作用域、按触发词按需注入执行段上下文（带预算）、能力中心安装与正文预览 UI；**待补**：HTTPS 清单源（目录契约那套）与 skill 版本升级 | 基本完成 |
-| **P2 MCP** | MCP 客户端（stdio + Streamable HTTP）、server 配置与启用、`tools/list` 缓存、应用层 `tool_calls` 闭环、手动调用面板、常用 server 预设、审计与超时 | 待做（下一步） |
+| **P2 MCP** | ✅ MCP 客户端（stdio + Streamable HTTP，JSON/SSE 双解析）、server 配置与三道闸门（启用 → 作用域 → 确认信任）、`tools/list` 缓存（10 分钟 TTL）、应用层 `tool_calls` 闭环（结果回灌同一步）、能力中心手动调用面板、9 个常用预设、审计与超时；**待补**：常驻 stdio 会话（现在每次操作起一个进程，换来的是不留僵尸）、resources/prompts | 基本完成 |
 | **P3 UI 收敛** | 能力中心合并「插件市场 / 已装插件」、设置四区收敛、折叠规则统一、四态（加载 / 空 / 错误 / 有数据）统一 | 待做 |
 
 ### 已下线的历史层（不要再照着写）

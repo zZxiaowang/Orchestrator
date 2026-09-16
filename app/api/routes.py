@@ -169,6 +169,10 @@ class SettingsPatch(BaseModel):
     chat_fold_batch: int | None = None
     chat_summary_max_chars: int | None = None
     chat_auto_split: bool | None = None
+    # MCP 工具调用（模型可自主请求）
+    mcp_enabled: bool | None = None
+    mcp_call_rounds: int | None = None
+    mcp_max_calls_per_step: int | None = None
     # 主备降级：主用失败（502/503/超时）时自动切到备用配置
     architect_backup_base_url: str | None = None
     architect_backup_api_key: str | None = None
@@ -286,6 +290,10 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "chat_fold_batch": settings.chat_fold_batch,
         "chat_summary_max_chars": settings.chat_summary_max_chars,
         "chat_auto_split": settings.chat_auto_split,
+        # MCP 工具调用：模型可自主请求，工具本身仍要"已启用 + 已确认信任"
+        "mcp_enabled": settings.mcp_enabled,
+        "mcp_call_rounds": settings.mcp_call_rounds,
+        "mcp_max_calls_per_step": settings.mcp_max_calls_per_step,
         # 备用配置：Key 只回掩码，界面据此显示"已配置/留空不修改"
         "architect_backup": {
             "base_url": settings.architect_backup_base_url,

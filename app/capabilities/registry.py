@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.core.errors import NotFoundError
+from app.core.errors import AppError, NotFoundError
 from app.schemas.capability import Capability, CapabilityKind, CapabilityScope
 
 STATE_VERSION = 1
@@ -22,6 +22,38 @@ MAX_AUDIT_BYTES = 2 * 1024 * 1024
 
 #: 列表顺序按形态固定（与能力中心的分页顺序一致）：skill → mcp → plugin
 KIND_ORDER: dict[str, int] = {"skill": 0, "mcp": 1, "plugin": 2}
+
+
+def resolve_callable_mcp(
+    registry: CapabilityRegistry, capability_id: str, *, project_id: str = ""
+) -> Capability:
+    """取一个**可调用**的 MCP 服务器；三道闸门缺一不可：启用 → 作用域匹配 → 已确认信任。
+
+    手动调用（能力中心）与模型自主调用（执行段 tool_calls）共用这一个入口，
+    不存在"面板能跑、模型不能跑"的偏差。
+    """
+
+    capability = registry.require(capability_id)
+    if capability.kind is not CapabilityKind.MCP:
+        raise AppError("这不是 MCP 服务器。", code="not_an_mcp_server")
+    if not capability.enabled:
+        raise AppError("这个 MCP 服务器还没启用：到「能力中心 → MCP」打开它。", code="mcp_disabled")
+    if (
+        capability.scope is CapabilityScope.PROJECT
+        and project_id
+        and capability.project_id != project_id
+    ):
+        raise AppError(
+            f"这个 MCP 服务器只对项目 {capability.project_id} 生效。",
+            code="mcp_scope_mismatch",
+        )
+    if not capability.meta.get("trusted"):
+        raise AppError(
+            "这个 MCP 服务器还没确认信任：它会以本机权限运行，"
+            "请到「能力中心 → MCP」点一次「确认信任」再让它执行工具。",
+            code="mcp_needs_trust",
+        )
+    return capability
 
 
 def _now() -> datetime:

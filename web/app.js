@@ -286,6 +286,20 @@ const api = {
   installSkill: (body) => request("POST", "/api/v1/capabilities/skills/install", body),
   setCapabilityScope: (id, body) =>
     request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/scope`, body),
+  mcpPresets: () => request("GET", "/api/v1/capabilities/mcp/presets"),
+  addMcpServer: (body) => request("POST", "/api/v1/capabilities/mcp/servers", body),
+  trustCapability: (id) =>
+    request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/trust`, {}),
+  mcpTools: (id, refresh = false) =>
+    request(
+      "GET",
+      `/api/v1/capabilities/${encodeURIComponent(id)}/mcp/tools?refresh=${refresh ? "true" : "false"}`
+    ),
+  mcpCall: (id, tool, args) =>
+    request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/mcp/call`, {
+      tool,
+      arguments: args,
+    }),
   chat: (id) => request("GET", `/api/v1/chats/${encodeURIComponent(id)}`),
   createChat: (body) => request("POST", "/api/v1/chats", body),
   sendChat: (id, text) =>
@@ -1744,6 +1758,35 @@ function renderStepCard(step) {
       })
     );
   }
+  if (step.tool_results?.length) {
+    body.append(
+      h("h3", {
+        class: "section-label",
+        text: `工具调用（${step.tool_results.filter((item) => item.ok).length}/${
+          step.tool_results.length
+        } 成功）`,
+      })
+    );
+    for (const item of step.tool_results) {
+      const ok = item.ok;
+      const row = h("div", {
+        class: `cmd-row ${ok ? "verify-ok" : "verify-fail"}`,
+        text: `${ok ? "✓" : "✗"} ${item.capability_id} → ${item.tool}（${
+          item.duration_ms || 0
+        }ms）${ok ? "" : `：${item.error || "失败"}`}`,
+      });
+      if (item.content) {
+        const pre = h("pre", { class: "cmd-output", hidden: true, text: item.content });
+        row.classList.add("clickable");
+        row.addEventListener("click", () => {
+          pre.hidden = !pre.hidden;
+        });
+        body.append(row, pre);
+      } else {
+        body.append(row);
+      }
+    }
+  }
   if (step.acceptance?.length) {
     body.append(h("h3", { class: "section-label", text: "验收标准" }));
     body.append(h("ul", { class: "list" }, ...step.acceptance.map((item) => h("li", { text: item }))));
@@ -2215,6 +2258,10 @@ function openSettings(section = "model") {
   document.getElementById("f-chat-summary-max").value = settings.chat_summary_max_chars ?? 2000;
   document.getElementById("f-chat-auto-split").checked = settings.chat_auto_split !== false;
   updateChatContextOptionState();
+  // MCP 工具调用（模型可自主请求）
+  document.getElementById("f-mcp-enabled").checked = settings.mcp_enabled !== false;
+  document.getElementById("f-mcp-rounds").value = settings.mcp_call_rounds ?? 2;
+  document.getElementById("f-mcp-max-calls").value = settings.mcp_max_calls_per_step ?? 3;
   document.getElementById("f-allow-cmd").checked = Boolean(settings.allow_command_execution);
   document.getElementById("f-command-allowlist").value = (
     settings.command_allowlist || []
@@ -2598,6 +2645,10 @@ async function saveProviderForm() {
     chat_fold_batch: Number(document.getElementById("f-chat-fold-batch").value) || 4,
     chat_summary_max_chars:
       Number(document.getElementById("f-chat-summary-max").value) || 2000,
+    // MCP：模型可请求调用工具（工具本身仍要已启用 + 已确认信任）
+    mcp_enabled: document.getElementById("f-mcp-enabled").checked,
+    mcp_call_rounds: Number(document.getElementById("f-mcp-rounds").value) || 2,
+    mcp_max_calls_per_step: Number(document.getElementById("f-mcp-max-calls").value) || 3,
     allow_command_execution: document.getElementById("f-allow-cmd").checked,
     command_allowlist: String(document.getElementById("f-command-allowlist").value || "")
       .split("\n")
@@ -3662,6 +3713,12 @@ function renderCapabilities(payload) {
       if (filtered.length) listHost.append(...filtered.map(capabilityNode));
       return;
     }
+    // MCP 页顶部给"从预设添加服务器"的入口
+    if (kind === "mcp") {
+      listHost.replaceChildren(mcpAddForm());
+      if (filtered.length) listHost.append(...filtered.map(capabilityNode));
+      return;
+    }
     if (!filtered.length) {
       const hint = kinds.find((info) => info.id === kind);
       listHost.replaceChildren(
@@ -3738,6 +3795,50 @@ function renderCapabilities(payload) {
         })
       );
       actions.append(scopeSelect);
+    } else if (capability.kind === "mcp") {
+      // MCP：先确认信任（会跑代码），再列工具 / 调用
+      if (!capability.meta?.trusted) {
+        const trust = h("button", {
+          class: "btn primary small",
+          type: "button",
+          text: "确认信任",
+        });
+        trust.addEventListener(
+          "click",
+          safe(async () => {
+            const ok = await appConfirm({
+              title: "确认信任这个 MCP 服务器",
+              message:
+                "它会以本机权限运行（可读写文件、访问网络）。只有你信任它的来源时才确认；\n" +
+                "确认后，模型在执行步骤时可以请求调用它的工具。",
+              confirmText: "确认信任",
+            });
+            if (!ok) return;
+            await api.trustCapability(capability.id);
+            await openCapabilities();
+          })
+        );
+        actions.append(trust);
+      }
+      const listTools = h("button", { class: "btn ghost small", type: "button", text: "列出工具" });
+      listTools.addEventListener(
+        "click",
+        safe(async () => {
+          listTools.disabled = true;
+          try {
+            const payload = await api.mcpTools(capability.id, true);
+            if (payload.error) showToast(`拉取工具失败：${payload.error}`);
+            else showToast(`已列出 ${(payload.tools || []).length} 个工具`);
+            await openCapabilities();
+          } catch (error) {
+            showToast(error.message);
+          } finally {
+            listTools.disabled = false;
+          }
+        })
+      );
+      actions.append(listTools);
+      actions.append(mcpCallPanel(capability));
     }
 
     if (capability.kind === "plugin") {
@@ -3785,9 +3886,149 @@ function renderCapabilities(payload) {
                   text: `自带脚本（默认不执行，要跑需开启命令白名单）：${capability.meta.scripts.join("、")}`,
                 })
               : null,
+            capability.kind === "mcp" ? h("p", { class: "muted", text: mcpSummary(capability) }) : null,
+            capability.kind === "mcp" && (capability.meta?.tools || []).length
+              ? h(
+                  "ul",
+                  { class: "list" },
+                  ...(capability.meta.tools || [])
+                    .slice(0, 20)
+                    .map((tool) =>
+                      h("li", { text: `${tool.name}：${tool.description || "（没有说明）"}` })
+                    )
+                )
+              : null,
             actions,
           ],
         });
+  };
+
+  const mcpSummary = (capability) => {
+    const meta = capability.meta || {};
+    const bits = [
+      meta.transport === "http" ? `HTTP ${meta.url || ""}` : `stdio ${meta.command || ""}`,
+      meta.trusted ? "已确认信任" : "未确认信任（模型调用会被拒绝）",
+      (meta.tools || []).length
+        ? `工具 ${meta.tools.length} 个${meta.tools_fetched_at ? `（${meta.tools_fetched_at.slice(0, 19)} 拉取）` : ""}`
+        : "还没拉取工具清单",
+    ];
+    return bits.join(" · ");
+  };
+
+  const mcpCallPanel = (capability) => {
+    const tools = capability.meta?.tools || [];
+    const button = h("button", { class: "btn ghost small", type: "button", text: "手动调用" });
+    const select = h("select", { class: "capability-scope" });
+    for (const tool of tools) select.append(h("option", { value: tool.name, text: tool.name }));
+    const args = h("input", { placeholder: '参数 JSON，例如 {"text":"hi"}' });
+    const result = h("pre", { class: "stream", hidden: true });
+    const run = h("button", { class: "btn primary small", type: "button", text: "执行" });
+    const box = h(
+      "div",
+      { class: "mcp-call-row", hidden: true },
+      select,
+      args,
+      run,
+      result
+    );
+    button.addEventListener(
+      "click",
+      safe(() => {
+        box.hidden = !box.hidden;
+        if (!tools.length) showToast("先点「列出工具」，拿到工具清单再调用。");
+      })
+    );
+    run.addEventListener(
+      "click",
+      safe(async () => {
+        run.disabled = true;
+        try {
+          let parsed = {};
+          const raw = args.value.trim();
+          if (raw) parsed = JSON.parse(raw);
+          const payload = await api.mcpCall(capability.id, select.value, parsed);
+          result.hidden = false;
+          result.textContent = payload.result.ok
+            ? payload.result.content || "（没有返回内容）"
+            : `失败：${payload.result.error}`;
+        } catch (error) {
+          showToast(error.message);
+        } finally {
+          run.disabled = false;
+        }
+      })
+    );
+    return h("span", {}, button, box);
+  };
+
+  const mcpAddForm = () => {
+    const presetSelect = h("select", { id: "mcp-preset" });
+    presetSelect.append(h("option", { value: "", text: "自定义（自己填命令 / 地址）" }));
+    const serverSelect = () => state.mcpPresets || [];
+    const fill = () => {
+      presetSelect.replaceChildren(h("option", { value: "", text: "自定义（自己填命令 / 地址）" }));
+      for (const preset of serverSelect()) {
+        presetSelect.append(h("option", { value: preset.id, text: preset.name }));
+      }
+    };
+    fill();
+    (async () => {
+      try {
+        const payload = await api.mcpPresets();
+        state.mcpPresets = payload.presets || [];
+        fill();
+      } catch (error) {
+        /* 预设拿不到也能自定义添加 */
+      }
+    })();
+    const name = h("input", { id: "mcp-name", placeholder: "名字（留空用预设名）" });
+    const transport = h("select", { id: "mcp-transport" });
+    transport.append(
+      h("option", { value: "stdio", text: "stdio（本地进程）" }),
+      h("option", { value: "http", text: "http（远端 / 本地服务）" })
+    );
+    const command = h("input", { id: "mcp-command", placeholder: "command，例如 npx 或 python" });
+    const argsInput = h("input", { id: "mcp-args", placeholder: "参数，空格分隔（可留空）" });
+    const url = h("input", { id: "mcp-url", placeholder: "HTTP 地址，例如 https://host/mcp" });
+    const add = h("button", { class: "btn primary small", type: "button", text: "添加服务器" });
+    add.addEventListener(
+      "click",
+      safe(async () => {
+        add.disabled = true;
+        try {
+          const isHttp = transport.value === "http";
+          const payload = await api.addMcpServer({
+            preset_id: presetSelect.value,
+            name: name.value.trim(),
+            transport: transport.value,
+            command: isHttp ? "" : command.value.trim(),
+            args: isHttp ? [] : String(argsInput.value || "").split(/\s+/).filter(Boolean),
+            url: isHttp ? url.value.trim() : "",
+          });
+          showToast(`已添加「${payload.capability.name}」（默认未启用、未确认信任）`);
+          await openCapabilities();
+        } catch (error) {
+          showToast(error.message);
+        } finally {
+          add.disabled = false;
+        }
+      })
+    );
+    return h(
+      "div",
+      { class: "card" },
+      h("div", { class: "card-head" }, h("strong", { text: "添加 MCP 服务器" })),
+      h(
+        "div",
+        { class: "card-body" },
+        h("p", {
+          class: "hint",
+          text: "会跑代码的能力默认不启用、未确认信任：添加后先「列出工具」，确认信任后才允许（含模型自主）调用。",
+        }),
+        h("div", { class: "skill-install-row" }, presetSelect, name),
+        h("div", { class: "skill-install-row" }, transport, command, argsInput, url, add)
+      )
+    );
   };
 
   const skillInstallForm = () => {

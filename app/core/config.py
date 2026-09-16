@@ -139,6 +139,10 @@ OVERRIDABLE_FIELDS = (
     "chat_fold_batch",
     "chat_summary_max_chars",
     "chat_auto_split",
+    # MCP 工具调用（模型可自主请求，经应用层三道闸门执行）
+    "mcp_enabled",
+    "mcp_call_rounds",
+    "mcp_max_calls_per_step",
     # 主备降级（留空 = 不启用自动降级）
     "architect_backup_base_url",
     "architect_backup_api_key",
@@ -241,6 +245,12 @@ class Settings(BaseSettings):
     chat_summary_max_chars: int = 2000
     #: 是否自动开新会话；关闭时只折叠并在界面上提示
     chat_auto_split: bool = True
+    #: 是否允许执行段请求调用 MCP 工具（工具本身仍要"已启用 + 已确认信任"）
+    mcp_enabled: bool = True
+    #: 同一步里"回灌工具结果后继续"的最大轮数
+    mcp_call_rounds: int = 2
+    #: 一步最多执行多少个工具调用
+    mcp_max_calls_per_step: int = 3
     #: Git 面板操作的仓库目录；留空 = 本项目目录
     git_dir: str = ""
 

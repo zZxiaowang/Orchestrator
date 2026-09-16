@@ -19,7 +19,8 @@ from typing import Any
 
 import httpx
 
-from app.capabilities.registry import CapabilityRegistry
+from app.capabilities.mcp import call_tool
+from app.capabilities.registry import CapabilityRegistry, resolve_callable_mcp
 from app.capabilities.skills import build_skill_section, select_skills
 from app.core.config import Endpoint, Settings, get_settings
 from app.core.errors import AppError, ConfigurationError, NotFoundError, WorkspaceError
@@ -107,6 +108,8 @@ class Orchestrator:
         self.capabilities = capabilities or CapabilityRegistry(
             Path(store.runs_dir).parent / "capabilities"
         )
+        #: MCP 的 HTTP 传输（测试里注入假 transport；stdio 不需要）
+        self._mcp_transport: httpx.AsyncBaseTransport | None = None
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancelled: set[str] = set()
 
@@ -837,6 +840,8 @@ class Orchestrator:
             user_notes=run.user_notes,
             brief_text=run.brief,
             skills_section=self._skills_section(run, step),
+            # 关掉 MCP 调用时连工具清单都不下发（模型不知道有什么可调，就不会去请求）
+            tools_section=self._tools_section(run) if settings.mcp_enabled else "",
             # 文件树只在第一步给全量：后面每步都给全量，既贵又破坏前缀缓存
             tree_full=step.id == run.steps[0].id,
         )
@@ -884,6 +889,38 @@ class Orchestrator:
         step.context_chars = packet.chars
         step.fetched_files = list(dict.fromkeys(fetched))
         fetch_rounds = rounds
+
+        # 模型请求调用 MCP 工具：应用执行（三道闸门）后把结果回灌，让它在**同一步**继续。
+        # 与 need_files / commands 是同一套循环思路，所以行为可预期。
+        tool_rounds = 0
+        if settings.mcp_enabled:
+            while (
+                output.tool_calls
+                and not output.blocked
+                and tool_rounds < max(0, settings.mcp_call_rounds)
+            ):
+                limit = max(1, settings.mcp_max_calls_per_step)
+                results = await self._run_tool_calls(run, step, output.tool_calls[:limit])
+                tool_rounds += 1
+                self.bus.publish(
+                    run.id,
+                    "status",
+                    status=run.status.value,
+                    message=f"第 {step.id} 步：已执行 {len(results)} 个工具调用，继续…",
+                )
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": self._tool_results_block(results)
+                        + f"\n\n请基于上面的工具结果继续完成第 {step.id} 步，"
+                        "仍然只输出那一个 JSON 对象（需要改文件就写 files）。",
+                    },
+                ]
+                output, raw = await self._call_executor(
+                    run, step, client, endpoint, messages, stats=stats
+                )
 
         step.summary = output.summary
         step.handoff = output.handoff or output.summary
@@ -1507,6 +1544,106 @@ class Orchestrator:
             return ""
         step.skills_used = [item.id for item in picked]
         return build_skill_section(picked)
+
+    def _tools_section(self, run: Run) -> str:
+        """列出本步可以请求调用的 MCP 工具（只给名字 + 一句说明）。
+
+        只有"已启用 + 已确认信任"的服务器才会出现在这里——没确认过的服务器，
+        模型连它有什么工具都不该看到。
+        """
+
+        try:
+            servers = self.capabilities.active_for(run.project_id, kind="mcp")
+        except Exception:  # noqa: BLE001 - 能力层异常不该挡住执行
+            return ""
+        lines: list[str] = []
+        for server in servers:
+            if not server.meta.get("trusted"):
+                continue
+            tools = server.meta.get("tools") or []
+            if not tools:
+                lines.append(f"- 服务器 `{server.id}`（{server.name}）：工具清单还没拉取过")
+                continue
+            for tool in tools[:12]:
+                name = str(tool.get("name") or "")
+                if not name:
+                    continue
+                summary = " ".join(str(tool.get("description") or "").split())[:60]
+                lines.append(f"- `{server.id}` → `{name}`：{summary}")
+        if not lines:
+            return ""
+        example = (
+            '{"tool_calls": [{"capability_id": "mcp.xxx", "tool": "工具名", '
+            '"arguments": {}, "reason": "为什么要用"}]}'
+        )
+        return "\n".join(
+            [
+                "## 可用工具（MCP）",
+                "需要时按下面的格式提出请求，系统执行后会把结果回给你继续做（不要假装调用过）：",
+                example,
+                "",
+                *lines,
+            ]
+        )
+
+    async def _run_tool_calls(
+        self, run: Run, step: RunStep, calls: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """执行模型请求的工具调用；被闸门拦下也要如实回灌（让模型知道为什么没跑）。"""
+
+        results: list[dict[str, Any]] = []
+        for call in calls:
+            capability_id = str(call.get("capability_id") or "").strip()
+            tool = str(call.get("tool") or "").strip()
+            arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+            try:
+                capability = resolve_callable_mcp(
+                    self.capabilities, capability_id, project_id=run.project_id
+                )
+            except AppError as exc:
+                result = {
+                    "capability_id": capability_id,
+                    "tool": tool,
+                    "ok": False,
+                    "content": "",
+                    "error": exc.message,
+                    "duration_ms": 0,
+                    "truncated": False,
+                    "source": "mcp",
+                }
+            else:
+                outcome = await call_tool(
+                    capability, tool, arguments, transport=self._mcp_transport
+                )
+                result = outcome.as_dict()
+                self.capabilities.touch(capability_id)
+                self.capabilities.audit(
+                    {
+                        "event": "mcp_call",
+                        "id": capability_id,
+                        "tool": tool,
+                        "ok": outcome.ok,
+                        "duration_ms": outcome.duration_ms,
+                        "step_id": step.id,
+                        "run_id": run.id,
+                    }
+                )
+            results.append(result)
+            step.tool_results.append(result)
+            self.bus.publish(run.id, "tool_call", step_id=step.id, result=result)
+            self.store.save(run)
+        return results
+
+    @staticmethod
+    def _tool_results_block(results: list[dict[str, Any]]) -> str:
+        chunks = ["## 工具调用结果（系统已实际执行）"]
+        for item in results:
+            head = f"### {item.get('capability_id')} → {item.get('tool')}"
+            if item.get("ok"):
+                chunks.append(f"{head}\n{item.get('content') or '（工具没有返回内容）'}")
+            else:
+                chunks.append(f"{head}\n失败：{item.get('error') or '未知原因'}")
+        return "\n\n".join(chunks)
 
     async def _verify_with_repair(
         self,

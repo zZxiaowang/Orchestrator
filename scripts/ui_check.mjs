@@ -685,6 +685,82 @@ async function main() {
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
     await sleep(800);
 
+    // 1e4) MCP：预设添加 → 默认不启用/未信任 → 三道闸门 → 列工具 → 手动调用
+    const mcpFlow = await cdp.evaluate(`(async () => {
+      const call = (path, options) =>
+        fetch(path, options).then(async (response) => ({ status: response.status, body: await response.json() }));
+      const presets = await call("/api/v1/capabilities/mcp/presets");
+      const created = await call("/api/v1/capabilities/mcp/servers", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preset_id: "demo", name: "自检示例 MCP" }),
+      });
+      const id = created.body.capability.id;
+      const initial = {
+        enabled: created.body.capability.enabled,
+        trusted: created.body.capability.meta.trusted,
+      };
+      const blocked = await call("/api/v1/capabilities/" + id + "/mcp/tools");
+      await call("/api/v1/capabilities/" + id + "/enable", { method: "POST" });
+      const untrusted = await call("/api/v1/capabilities/" + id + "/mcp/call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tool: "echo", arguments: { text: "x" } }),
+      });
+      await call("/api/v1/capabilities/" + id + "/trust", { method: "POST" });
+      const tools = await call("/api/v1/capabilities/" + id + "/mcp/tools");
+      const called = await call("/api/v1/capabilities/" + id + "/mcp/call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tool: "echo", arguments: { text: "自检" } }),
+      });
+      return {
+        presets: (presets.body.presets || []).length,
+        initial,
+        blockedCode: blocked.body.error && blocked.body.error.code,
+        untrustedCode: untrusted.body.error && untrusted.body.error.code,
+        tools: (tools.body.tools || []).map((item) => item.name),
+        calledOk: called.body.result && called.body.result.ok,
+        calledContent: called.body.result && called.body.result.content,
+      };
+    })()`);
+    check(
+      "MCP：预设添加后默认不启用/未信任，三道闸门依次生效",
+      mcpFlow.presets >= 8 &&
+        mcpFlow.initial.enabled === false &&
+        mcpFlow.initial.trusted === false &&
+        mcpFlow.blockedCode === "mcp_disabled" &&
+        mcpFlow.untrustedCode === "mcp_needs_trust",
+      JSON.stringify(mcpFlow),
+    );
+    check(
+      "MCP：确认信任后能列出并调用工具",
+      JSON.stringify(mcpFlow.tools) === JSON.stringify(["echo", "now"]) &&
+        mcpFlow.calledOk === true &&
+        mcpFlow.calledContent === "echo: 自检",
+      JSON.stringify({ tools: mcpFlow.tools, content: mcpFlow.calledContent }),
+    );
+    // 能力中心 MCP 分页：有添加入口、列出了刚添加的服务器
+    await cdp.clickSelector("#capabilities-btn");
+    await sleep(700);
+    const mcpPanel = await cdp.evaluate(`(() => {
+      const tab = document.querySelector('#capability-kinds .tab[data-kind="mcp"]');
+      if (tab) tab.click();
+      const text = document.getElementById("capabilities-body").textContent || "";
+      return {
+        clicked: Boolean(tab),
+        hasAddForm: text.includes("添加 MCP 服务器"),
+        hasServer: text.includes("自检示例 MCP"),
+      };
+    })()`);
+    check(
+      "能力中心 MCP 分页有添加入口且列出服务器",
+      mcpPanel.clicked && mcpPanel.hasAddForm && mcpPanel.hasServer,
+      JSON.stringify(mcpPanel),
+    );
+    await cdp.clickSelector("#capabilities-close");
+    await sleep(250);
+
     // 1f) 旧链接重定向（前端路由层实现，替代原先的 navigation_migration 契约层）
     await cdp.evaluate(`location.hash = "#/runs/${seeded.id}"`);
     await sleep(1200);

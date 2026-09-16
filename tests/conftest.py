@@ -68,6 +68,8 @@ class FakeRelay:
         self.python_source = "VALUE = 1\n"
         #: 折叠历史触发的摘要调用次数
         self.summary_calls = 0
+        #: 执行段第一次调用时请求的工具调用（用于 MCP 闭环测试）
+        self.tool_call: dict[str, Any] | None = None
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
@@ -202,6 +204,17 @@ class FakeRelay:
     def _executor_text(self, body: dict[str, Any]) -> str:
         user = body["messages"][-1]["content"]
         self.executor_calls += 1
+        if self.tool_call and self.executor_calls == 1:
+            return json.dumps(
+                {
+                    "summary": "先调用工具拿点信息",
+                    "tool_calls": [self.tool_call],
+                    "files": [],
+                    "commands": [],
+                    "notes": ["等工具结果"],
+                },
+                ensure_ascii=False,
+            )
         if self.always_need_files:
             return json.dumps(
                 {"need_files": ["src/app.py"], "need_reason": "还要再看看"},

@@ -112,6 +112,8 @@ class StepOutput(BaseModel):
     #: 执行段发现上下文不足时，可以按路径索取文件（下一轮会补给它）
     need_files: list[str] = Field(default_factory=list)
     need_reason: str = ""
+    #: 模型请求调用外部工具（MCP）：应用执行后把结果回灌进同一步
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     blocked: bool = False
     block_reason: str = ""
     files: list[FileEdit] = Field(default_factory=list)
@@ -136,6 +138,29 @@ class StepOutput(BaseModel):
         if isinstance(raw_need, str):
             raw_need = [raw_need]
         data["need_files"] = [str(item) for item in raw_need if str(item).strip()]
+        raw_calls = data.get("tool_calls") or data.get("tools") or []
+        if isinstance(raw_calls, dict):
+            raw_calls = [raw_calls]
+        calls: list[dict[str, Any]] = []
+        for item in raw_calls if isinstance(raw_calls, list) else []:
+            if not isinstance(item, dict):
+                continue
+            tool = str(item.get("tool") or item.get("name") or "").strip()
+            if not tool:
+                continue
+            calls.append(
+                {
+                    "capability_id": str(
+                        item.get("capability_id") or item.get("server") or ""
+                    ).strip(),
+                    "tool": tool,
+                    "arguments": item.get("arguments")
+                    if isinstance(item.get("arguments"), dict)
+                    else {},
+                    "reason": str(item.get("reason") or ""),
+                }
+            )
+        data["tool_calls"] = calls
         data["notes"] = [str(n) for n in data["notes"]]
         if data.get("need_reason") is None:
             data["need_reason"] = ""

@@ -416,6 +416,28 @@
               <span>摘要超限时自动开新对话（关闭则只折叠并提示）</span>
             </label>
             <p class="hint" id="chat-context-status"></p>
+
+            <hr class="settings-divider" />
+            <h3 class="settings-group-title">MCP 工具调用</h3>
+            <p class="hint">
+              执行段可以在步骤里请求调用 MCP 工具（例如 filesystem / git / fetch），
+              系统执行后把结果回灌给它继续做。<b>工具本身仍要"已启用 + 已确认信任"</b>
+              （在「能力中心 → MCP」里操作），这里只是总开关与额度。
+            </p>
+            <label class="checkbox">
+              <input type="checkbox" id="f-mcp-enabled" />
+              <span>允许执行段请求调用 MCP 工具（默认开启）</span>
+            </label>
+            <div class="field-grid">
+              <label class="field">
+                <span>同一步最多回灌几轮工具结果</span>
+                <input id="f-mcp-rounds" type="number" min="0" max="5" />
+              </label>
+              <label class="field">
+                <span>一步最多执行几个工具调用</span>
+                <input id="f-mcp-max-calls" type="number" min="1" max="10" />
+              </label>
+            </div>
           </section>
 
           <section class="settings-section" data-section="integrations" hidden>

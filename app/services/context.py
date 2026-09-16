@@ -54,6 +54,8 @@ class ContextPacket:
     completed: str = ""
     #: 按触发词挑出来的 skill 指令（项目内启用、按需注入）
     skills: str = ""
+    #: 可用工具（MCP）：只给名字与一句说明，详细 schema 按需再问
+    tools: str = ""
     files: str = ""
     #: 文件树（每步都会变，放在最后）
     tree: str = ""
@@ -64,7 +66,15 @@ class ContextPacket:
     def user_content(self) -> str:
         # 顺序：稳定前缀 → 当前步骤 → 相关文件 → 已完成交接 → 文件树。
         # 后三项每一步都会变（工作区在改），放在最后，前面的稳定前缀才能命中缓存。
-        parts = [self.brief, self.current, self.skills, self.files, self.completed, self.tree]
+        parts = [
+            self.brief,
+            self.current,
+            self.skills,
+            self.tools,
+            self.files,
+            self.completed,
+            self.tree,
+        ]
         return "\n\n".join(part for part in parts if part)
 
     @property
@@ -154,6 +164,7 @@ class StepContextBuilder:
         brief_text: str = "",
         tree_full: bool = True,
         skills_section: str = "",
+        tools_section: str = "",
     ) -> ContextPacket:
         omitted: list[str] = []
         remaining = self.budget_chars - len(system)
@@ -183,6 +194,12 @@ class StepContextBuilder:
         if skills_section.strip():
             skills_block = clip(skills_section.strip(), min(2400, max(0, remaining)))
             remaining -= len(skills_block)
+
+        # ── 能力段：可用工具（只给名字 + 一句说明，别把 schema 全塞进来）──
+        tools_block = ""
+        if tools_section.strip():
+            tools_block = clip(tools_section.strip(), min(1200, max(0, remaining)))
+            remaining -= len(tools_block)
 
         # ── 变量段：当前步骤（永不裁剪） ──
         current_block = self._current_step(step)
@@ -236,6 +253,7 @@ class StepContextBuilder:
             current="\n\n".join(part for part in (notes_block, current_block) if part),
             completed=log_block,
             skills=skills_block,
+            tools=tools_block,
             files=files_block,
             tree=tree_block,
             omitted=omitted,
@@ -247,6 +265,7 @@ class StepContextBuilder:
                 "tree": len(tree_block),
                 "completed": len(log_block),
                 "skills": len(skills_block),
+                "tools": len(tools_block),
                 "current": len(current_block),
                 "files": len(files_block),
             },
