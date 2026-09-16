@@ -116,6 +116,25 @@ python -m py_compile app/schemas/project.py app/schemas/navigation.py
 python -m pytest tests/test_project_context_contract.py -q
 ```
 
+## 10. 落地状态（2026-09-16：从契约变成真实数据）
+
+契约本身在第 2 步就写好了，但直到这一步之前，界面上的「项目 / 普通对话 / 项目内模块」只是壳子：
+项目是从运行列表临时拼出来的候选、对话列表读的是没人写入的 `localStorage`、二级模块只是去点
+页面上某个 `data-view` 元素。现在这些全部接到真实数据上：
+
+| 能力 | 实现 | 接口 |
+| --- | --- | --- |
+| 项目容器（稳定 ID / 名称 / 状态 / 工作区绑定 / 最近活动） | `app/services/projects.py`（`data/projects.json`，原子写）+ `ProjectStore` | `GET/POST /api/v1/projects`、`GET/PUT/DELETE /api/v1/projects/{id}` |
+| 项目与工作区一一绑定 | 建项目时创建/校验 `root_path`；运行未指定 `target_dir` 时落在项目工作区 | `POST /api/v1/projects {root_path}` |
+| 运行归属项目 | `Run.project_id` + `context_type`，`GET /runs?project_id=` 过滤 | `POST /api/v1/runs {project_id}` |
+| 普通对话会话（多轮、带历史、流式） | `Run(context_type="chat")` + `Orchestrator.create_chat/send_chat_message` | `GET/POST /api/v1/chats`、`GET /api/v1/chats/{id}`、`POST /api/v1/chats/{id}/messages`、`GET /api/v1/chats/{id}/events` |
+| 项目内七个模块的真实数据 | `app/services/project_view.py` 按模块装配（概览 / 架构 / 计划 / 执行 / 验证 / 日志 / 设置） | `GET /api/v1/projects/{id}/modules/{module}` |
+| 上下文互斥 | 普通对话不能进编排（`not_a_project_run`）；项目运行不能当对话（`not_a_chat_session`） | 见 `tests/test_chat_sessions.py` |
+
+历史数据仍按本契约第 3 节处理：缺 `project_id` 的运行归到 `project:default`，`ProjectStore`
+启动时**保证默认项目存在**，但默认项目**不绑定工作区**，以免改变"没指定项目时在运行目录内新建工作区"
+的既有行为。
+
 ## 9. 非目标
 
 1. 不修改执行编排、重启、指标与既有 API 行为（第 5 步验收后再评估下线）。

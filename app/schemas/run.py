@@ -8,9 +8,15 @@ from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator
 
 from app.schemas.plan import ArchitecturePlan, CheckResult, StepCheck
+from app.schemas.project import (
+    DEFAULT_PROJECT_ID,
+    ContextType,
+    chat_context_id,
+    project_context_id,
+)
 
 
 def _now() -> datetime:
@@ -203,6 +209,10 @@ class Run(BaseModel):
     id: str
     title: str = ""
     task: str = ""
+    #: 所属项目：项目内的运行一律带稳定 project_id；历史数据缺省归到 default
+    project_id: str = DEFAULT_PROJECT_ID
+    #: 上下文类型：``project`` = 项目内运行；``chat`` = 普通对话（不进入编排）
+    context_type: ContextType = "project"
     #: 置顶（Codex 式任务列表管理）
     pinned: bool = False
     #: 归档：默认不出现在列表里，但记录保留
@@ -241,6 +251,25 @@ class Run(BaseModel):
         item = PhaseMetrics(phase=phase, step_id=step_id)
         self.metrics.append(item)
         return item
+
+    @property
+    def is_chat(self) -> bool:
+        """普通对话：只收发消息，没有纲领、步骤与工作区。"""
+
+        return self.context_type == "chat" or self.kind == "chat"
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def context_id(self) -> str:
+        """上下文标识：``project:<projectId>`` 或 ``chat:<sessionId>``。
+
+        用 ``computed_field`` 而不是普通属性：接口返回的 run JSON 里必须带上它，
+        界面才能据此判断"这条属于哪个项目 / 是不是普通对话"。
+        """
+
+        if self.context_type == "chat":
+            return chat_context_id(self.id)
+        return project_context_id(self.project_id)
 
     def metrics_summary(self) -> dict[str, Any]:
         """运行级指标汇总。
@@ -281,6 +310,10 @@ class Run(BaseModel):
             "id": self.id,
             "title": self.title,
             "task": self.task,
+            "kind": self.kind,
+            "project_id": self.project_id,
+            "context_type": self.context_type,
+            "context_id": self.context_id,
             "pinned": self.pinned,
             "archived": self.archived,
             "status": self.status.value,

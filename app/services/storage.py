@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,9 +70,53 @@ class RunStore:
         return Run.model_validate_json(path.read_text(encoding="utf-8"))
 
     def list_runs(
-        self, *, include_archived: bool = False, query: str = ""
+        self,
+        *,
+        include_archived: bool = False,
+        query: str = "",
+        project_id: str | None = None,
+        kind: str | None = None,
+        context_type: str | None = None,
     ) -> list[dict[str, object]]:
-        summaries: list[dict[str, object]] = []
+        """列出运行摘要。
+
+        ``project_id`` / ``kind`` 用于按项目边界与上下文类型过滤——左侧栏「项目 → 运行记录」
+        只能看到本项目的运行，普通对话只列 ``kind == "chat"`` 的会话。
+        """
+
+        summaries = [
+            run.summarize()
+            for run in self.iter_runs(
+                include_archived=include_archived,
+                query=query,
+                project_id=project_id,
+                kind=kind,
+                context_type=context_type,
+            )
+        ]
+        # 置顶优先，其次按更新时间倒序（Codex 式任务列表）
+        summaries.sort(
+            key=lambda item: (bool(item.get("pinned")), str(item.get("updated_at"))),
+            reverse=True,
+        )
+        return summaries
+
+    def iter_runs(
+        self,
+        *,
+        include_archived: bool = False,
+        query: str = "",
+        project_id: str | None = None,
+        kind: str | None = None,
+        context_type: str | None = None,
+    ) -> list[Run]:
+        """按过滤条件取出**完整运行记录**（项目模块装配需要纲领、步骤与验证明细）。
+
+        ``project_id`` 只匹配 **项目上下文** 的运行：普通对话不属于任何项目，
+        即使它的 ``project_id`` 还是默认值，也不该出现在项目的运行列表里。
+        """
+
+        runs: list[Run] = []
         for path in self.runs_dir.glob("*/run.json"):
             try:
                 run = Run.model_validate_json(path.read_text(encoding="utf-8"))
@@ -79,12 +124,24 @@ class RunStore:
                 continue
             if run.archived and not include_archived:
                 continue
+            if project_id is not None and (
+                run.context_type != "project" or run.project_id != project_id
+            ):
+                continue
+            if kind is not None and run.kind != kind:
+                continue
+            if context_type is not None and run.context_type != context_type:
+                continue
             if query and query.lower() not in f"{run.title}\n{run.task}".lower():
                 continue
-            summaries.append(run.summarize())
-        # 置顶优先，其次按更新时间倒序（Codex 式任务列表）
-        summaries.sort(
-            key=lambda item: (bool(item.get("pinned")), str(item.get("updated_at"))),
-            reverse=True,
-        )
-        return summaries
+            runs.append(run)
+        return runs
+
+    def delete(self, run_id: str) -> None:
+        """物理删除一条运行（含工作区与备份）。只给"删掉自己的对话"这类场景用。"""
+
+        directory = self.run_dir(run_id)
+        if not directory.is_dir():
+            raise NotFoundError(f"未找到该运行：{run_id}", details={"run_id": run_id})
+        with self._lock:
+            shutil.rmtree(directory, ignore_errors=False)

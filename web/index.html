@@ -49,6 +49,12 @@
           <div class="project-picker" id="project-picker" hidden>
             <input id="project-id-input" type="text" placeholder="输入项目 ID，回车打开…" />
             <div class="run-list" id="project-options"></div>
+            <div class="project-create">
+              <div class="section-label">新建项目</div>
+              <input id="project-name-input" type="text" placeholder="项目名称，例如：编排器自开发" />
+              <input id="project-root-input" type="text" placeholder="工作区目录（留空 = data/projects/<id>/workspace）" />
+              <button class="btn ghost small" id="project-create-btn" type="button">＋ 新建项目</button>
+            </div>
           </div>
           <div class="section-label">项目功能</div>
           <nav class="project-nav" id="project-nav" aria-label="项目功能"></nav>
@@ -130,7 +136,7 @@
             <textarea
               id="task-input"
               rows="3"
-              placeholder="描述目标，例如：为现有 FastAPI 项目补一套可回滚的数据迁移流程（Ctrl+Enter 发送）"
+              placeholder="描述目标，例如：为现有 FastAPI 项目补一套可回滚的数据迁移流程（Enter 发送，Shift+Enter 换行）"
             ></textarea>
             <div class="composer-bar">
               <div class="composer-hint" id="composer-hint"></div>
@@ -140,7 +146,7 @@
               </div>
             </div>
           </div>
-          <div class="composer-meta">
+          <div class="composer-meta" id="composer-meta">
             <label class="inline-field">
               <span>落地目录</span>
               <input id="target-dir" placeholder="留空 = 在运行目录内新建工作区" />

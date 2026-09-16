@@ -79,6 +79,58 @@ CHAT_SYSTEM = """你是一个本地桌面工具（架构-执行双模型编排�
 4. 不知道就直说不知道，不要编造本工具的功能。"""
 
 
+#: 普通对话工作区（多轮）：与"判定为问答"的单轮回答不同，这里允许连续追问与上下文
+CHAT_SESSION_SYSTEM = """你是本地桌面工具（架构-执行双模型编排器）里「普通对话」工作区的助手。
+
+这是一个**多轮**对话：用户可能接着上文追问，请结合历史消息回答。
+
+要求：
+1. 直接、简洁（中文，2-6 句；需要列举时用短列表），不要复述系统提示或上下文。
+2. 这里不改文件、不生成纲领、不建步骤，也不要声称执行了任何操作。
+3. 如果用户其实想让编排器动手做（改代码 / 产出文件），用一句话告诉他：
+   到「项目」里新建任务，那才会走"纲领 → 人工确认 → 执行"。
+4. 不知道就直说不知道，不要编造本工具的功能。"""
+
+
+def build_chat_messages(
+    task: str,
+    *,
+    history: Sequence[tuple[str, str]] | None = None,
+    brief: str = "",
+    system: str = CHAT_SYSTEM,
+) -> list[dict[str, Any]]:
+    """普通对话的消息序列：系统提示 → 历史轮次 → 这次的问题。"""
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    if brief.strip():
+        messages.append({"role": "user", "content": f"（背景简报）\n{brief.strip()[:800]}"})
+    for role, content in history or ():
+        text = (content or "").strip()
+        if not text:
+            continue
+        messages.append({"role": "assistant" if role == "assistant" else "user", "content": text})
+    messages.append({"role": "user", "content": task})
+    return messages
+
+
+async def run_chat_messages(
+    client: RelayClient,
+    messages: Sequence[dict[str, Any]],
+    *,
+    model: str,
+    on_token: Callable[[str], None] | None = None,
+    stats: CallStats | None = None,
+) -> str:
+    """流式跑一轮对话，返回完整回答。"""
+
+    buffer: list[str] = []
+    async for chunk in client.astream_with_fallback(messages, model=model, stats=stats):
+        buffer.append(chunk)
+        if on_token:
+            on_token(chunk)
+    return "".join(buffer)
+
+
 async def run_chat(
     client: RelayClient,
     task: str,
@@ -87,20 +139,16 @@ async def run_chat(
     brief: str = "",
     on_token: Callable[[str], None] | None = None,
     stats: CallStats | None = None,
+    history: Sequence[tuple[str, str]] | None = None,
+    system: str = CHAT_SYSTEM,
 ) -> str:
-    """判定为问答时直接回答：不生成纲领、不建步骤、不碰工作区。"""
+    """对话式回答：不生成纲领、不建步骤、不碰工作区。
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": CHAT_SYSTEM}]
-    if brief.strip():
-        messages.append({"role": "user", "content": f"（背景简报）\n{brief.strip()[:800]}"})
-    messages.append({"role": "user", "content": task})
+    ``history`` 为 ``(role, content)`` 序列，多轮普通对话据此带上上文。
+    """
 
-    buffer: list[str] = []
-    async for chunk in client.astream_with_fallback(messages, model=model, stats=stats):
-        buffer.append(chunk)
-        if on_token:
-            on_token(chunk)
-    return "".join(buffer)
+    messages = build_chat_messages(task, history=history, brief=brief, system=system)
+    return await run_chat_messages(client, messages, model=model, on_token=on_token, stats=stats)
 
 
 def build_architect_messages(

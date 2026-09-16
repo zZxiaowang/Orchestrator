@@ -49,6 +49,7 @@ from app.schemas.run import (
 )
 from app.schemas.step import StepOutput
 from app.services.architect import (
+    CHAT_SESSION_SYSTEM,
     build_architect_messages,
     build_continue_messages,
     run_architect,
@@ -61,6 +62,7 @@ from app.services.executor import EXECUTOR_SYSTEM, build_step_messages, run_step
 from app.services.gitguard import revert_paths, snapshot
 from app.services.intent import detect_intent
 from app.services.metrics import apply_call, route_of
+from app.services.projects import ProjectStore
 from app.services.storage import RunStore, new_run_id
 from app.services.verify import effective_checks, failure_text, run_checks, summarize
 from app.services.workspace import Workspace
@@ -84,11 +86,14 @@ class Orchestrator:
         *,
         settings_provider: Callable[[], Settings] = get_settings,
         transport: httpx.AsyncBaseTransport | None = None,
+        projects: ProjectStore | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
         self._settings_provider = settings_provider
         self._transport = transport
+        # 项目仓库与运行记录同级存放：data/projects.json + data/runs/<id>/
+        self.projects = projects or ProjectStore(Path(store.runs_dir).parent / "projects.json")
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancelled: set[str] = set()
 
@@ -102,19 +107,24 @@ class Orchestrator:
         target_dir: str = "",
         context: str = "",
         brief: str = "",
+        project_id: str = "",
     ) -> Run:
         task = (task or "").strip()
         if not task:
             raise AppError("任务描述不能为空。", code="invalid_request")
 
         settings = self._settings_provider()
+        # 项目边界：运行必须属于某个已注册项目（默认项目自动存在）
+        project = self.projects.require(project_id or "default")
         run_id = new_run_id()
-        workspace_path, target = self._resolve_workspace(run_id, target_dir)
+        workspace_path, target = self._resolve_workspace(run_id, target_dir, project=project)
 
         run = Run(
             id=run_id,
             title=title.strip() or task.splitlines()[0][:60],
             task=task,
+            project_id=project.project_id,
+            context_type="project",
             brief=brief.strip(),
             status=RunStatus.PLANNING,
             workspace_dir=str(workspace_path),
@@ -126,12 +136,26 @@ class Orchestrator:
             run.messages.append(RunMessage(role="user", phase="context", content=context.strip()))
             run.user_notes.append(context.strip())
         self.store.save(run)
+        self.projects.touch(project.project_id)
         return run
 
-    def _resolve_workspace(self, run_id: str, target_dir: str) -> tuple[Path, Path | None]:
+    def _resolve_workspace(
+        self, run_id: str, target_dir: str, *, project=None
+    ) -> tuple[Path, Path | None]:
+        """决定这次运行的工作区。
+
+        优先级：显式 ``target_dir`` → 项目绑定的工作区 → 运行目录内的临时工作区。
+        项目工作区是"项目与工作区一一绑定"的落点，所以项目内的运行默认改的是同一份代码。
+        """
+
         run_workspace = self.store.workspace_dir(run_id)
         raw = (target_dir or "").strip()
         if not raw:
+            project_root = getattr(getattr(project, "workspace", None), "root_path", "") or ""
+            if project_root:
+                candidate = Path(project_root).expanduser()
+                if candidate.is_dir():
+                    return candidate.resolve(), candidate.resolve()
             return run_workspace, None
         target = Path(raw).expanduser().resolve()
         if not target.exists() or not target.is_dir():
@@ -145,9 +169,136 @@ class Orchestrator:
             )
         return target, target
 
+    # ── 普通对话（chat）──
+    #
+    # 普通对话是独立工作区：只收发消息，不生成纲领、不建步骤、不碰工作区文件。
+    # 会话本身仍是一条记录（context_type="chat"），这样历史、流式与断线重连能复用同一套机制，
+    # 但它不属于任何项目，也不出现在项目的运行列表里。
+
+    def create_chat(self, title: str = "", *, first_message: str = "") -> Run:
+        settings = self._settings_provider()
+        run_id = new_run_id()
+        text = (first_message or "").strip()
+        run = Run(
+            id=run_id,
+            title=(title or "").strip()[:60] or (text.splitlines()[0][:60] if text else "新对话"),
+            task=text,
+            kind="chat",
+            context_type="chat",
+            status=RunStatus.DONE,
+            workspace_dir="",
+            route=self.describe_route(settings),
+        )
+        if text:
+            run.messages.append(RunMessage(role="user", phase="chat", content=text))
+        self.store.save(run)
+        self.bus.publish(run_id, "status", status=run.status.value)
+        return run
+
+    def send_chat_message(self, run_id: str, text: str) -> Run:
+        """往普通对话里追加一条消息，并让架构段模型给出回答（流式）。"""
+
+        message = (text or "").strip()
+        if not message:
+            raise AppError("消息不能为空。", code="invalid_request")
+        run = self.store.load(run_id)
+        if run.context_type != "chat":
+            raise AppError(
+                "这不是普通对话会话：项目内的交流请走运行的时间线。",
+                code="not_a_chat_session",
+            )
+        pending = self._tasks.get(run_id)
+        if pending is not None and not pending.done():
+            raise AppError("上一条消息还在回答中，等它说完再发。", code="chat_busy")
+
+        run.messages.append(RunMessage(role="user", phase="chat", content=message))
+        if not run.task:
+            run.task = message
+        if run.title in ("", "新对话"):
+            run.title = message.splitlines()[0][:60]
+        run.status = RunStatus.PLANNING  # 这里的含义是"正在回答"
+        run.error = None
+        self.store.save(run)
+        self.bus.publish(run_id, "status", status=run.status.value, message="正在回答…")
+        self._cancelled.discard(run_id)
+        self._tasks[run_id] = asyncio.create_task(self._chat_reply(run_id))
+        return self.store.load(run_id)
+
+    async def _chat_reply(self, run_id: str) -> None:
+        run = self.store.load(run_id)
+        settings = self._settings_provider()
+        endpoint = settings.resolve_architect()
+        try:
+            self._require_endpoint(endpoint)
+            client = self._runner(settings, PHASE_ARCHITECT, endpoint)
+            turns = [
+                ("user" if item.role == "user" else "assistant", item.content)
+                for item in run.messages
+                if item.phase == "chat" and item.content.strip()
+            ]
+            # 最后一条就是这次要回答的问题，其余作为历史轮次
+            question = turns.pop()[1] if turns else run.task
+            stats = CallStats()
+            try:
+                answer = await run_chat(
+                    client,
+                    question,
+                    model=endpoint.model,
+                    history=turns,
+                    system=CHAT_SESSION_SYSTEM,
+                    stats=stats,
+                    on_token=lambda text: self.bus.publish(
+                        run_id, "token", phase="chat", model=endpoint.model, text=text
+                    ),
+                )
+            finally:
+                self._record_metrics(
+                    run,
+                    stats,
+                    endpoint,
+                    phase=PHASE_ARCHITECT,
+                    context_chars=sum(len(item[1]) for item in turns) + len(question),
+                    runner=client,
+                )
+            run.messages.append(
+                RunMessage(role="assistant", phase="chat", model=endpoint.model, content=answer)
+            )
+            run.status = RunStatus.DONE
+            run.error = None
+            self.store.save(run)
+            self.bus.publish(
+                run_id,
+                "done",
+                status=run.status.value,
+                summary={**self._run_summary(run), "kind": "chat"},
+            )
+        except AppError as exc:
+            self._fail(run, exc)
+        except asyncio.CancelledError:  # pragma: no cover - 主动取消
+            raise
+        except Exception as exc:  # noqa: BLE001 - 兜底，避免后台任务静默失败
+            self._fail(run, AppError(f"普通对话回答异常：{exc}", code="chat_error"))
+
     # ── 架构段 ──
 
+    @staticmethod
+    def _require_project_run(run: Run, action: str) -> Run:
+        """项目专有动作不能落在普通对话上。
+
+        普通对话没有纲领、没有步骤，也不会改动文件；让它进编排只会产生一条"跑不通"的运行。
+        反向约束（项目运行不能当对话用）由 ``send_chat_message`` 负责。
+        """
+
+        if run.is_chat:
+            raise AppError(
+                f"普通对话不支持「{action}」：它只收发消息，没有纲领与步骤。"
+                "要做改动请到「项目」里新建任务。",
+                code="not_a_project_run",
+            )
+        return run
+
     def start_planning(self, run_id: str, *, feedback: str | None = None) -> None:
+        self._require_project_run(self.store.load(run_id), "重新规划纲领")
         self._cancelled.discard(run_id)
         self._tasks[run_id] = asyncio.create_task(self._plan(run_id, feedback=feedback))
 
@@ -294,6 +445,7 @@ class Orchestrator:
             )
         if not run.steps:
             raise AppError("这次运行还没有纲领，直接新开一个任务吧。", code="plan_missing")
+        self._require_project_run(run, "继续说下一步")
 
         run.messages.append(RunMessage(role="user", phase="context", content=text))
         run.user_notes.append(text)
@@ -466,6 +618,7 @@ class Orchestrator:
         )
 
     def start_execution(self, run_id: str) -> None:
+        self._require_project_run(self.store.load(run_id), "开始执行")
         self._cancelled.discard(run_id)
         self._tasks[run_id] = asyncio.create_task(self._execute(run_id))
 
@@ -784,6 +937,7 @@ class Orchestrator:
         可以顺带指定落地目录——"任务提到现有代码但没给目录"是最常见的阻塞原因。
         """
         run = self.store.load(run_id)
+        self._require_project_run(run, "补充信息并继续")
         note = (note or "").strip()
         raw_dir = (target_dir or "").strip()
         if raw_dir:
@@ -855,6 +1009,7 @@ class Orchestrator:
         默认只跑这一步就停下，避免顺手把后面的批次也带跑。
         """
         run = self.store.load(run_id)
+        self._require_project_run(run, "重做某一步")
         target = next((step for step in run.steps if step.id == step_id), None)
         if target is None:
             raise NotFoundError(f"未找到第 {step_id} 步", details={"step_id": step_id})
@@ -951,6 +1106,7 @@ class Orchestrator:
         """
         self._cancelled.discard(run_id)
         run = self.store.load(run_id)
+        self._require_project_run(run, "重试这次运行")
         if run.status in (RunStatus.PLANNING, RunStatus.EXECUTING):
             raise AppError(
                 "运行还在进行中，等它跑完或先点「停止」。",

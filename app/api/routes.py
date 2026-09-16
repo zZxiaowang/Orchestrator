@@ -34,6 +34,13 @@ from app.schemas.navigation import (
 )
 from app.services.git_service import GitService
 from app.services.orchestrator import Orchestrator
+from app.services.project_view import (
+    MODULE_ALIASES,
+    build_module_payload,
+    project_block,
+    run_summary,
+)
+from app.services.projects import ProjectStore
 from app.services.workspace import Workspace
 
 router = APIRouter(prefix="/api/v1")
@@ -46,10 +53,34 @@ logger = logging.getLogger("app.client")
 class CreateRunRequest(BaseModel):
     task: str = Field(..., min_length=1, description="需求描述")
     title: str = ""
+    project_id: str = Field("", description="所属项目；留空 = 默认项目")
     target_dir: str = Field("", description="落地目录；留空则在运行目录内新建工作区")
     context: str = Field("", description="补充说明/约束")
     brief: str = Field("", description="前期沟通简报（可与 context 并用，两段都会读到）")
     auto_execute: bool = Field(False, description="生成纲领后是否自动开始执行")
+
+
+class CreateProjectRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="项目名称")
+    project_id: str = Field("", description="可选：自定义稳定 ID（留空按名称生成）")
+    root_path: str = Field("", description="项目工作区根目录；留空用 data/projects/<id>/workspace")
+    description: str = Field("", description="可选描述")
+
+
+class UpdateProjectRequest(BaseModel):
+    name: str | None = None
+    root_path: str | None = None
+    description: str | None = None
+    status: str | None = Field(None, description="active / archived / deleted")
+
+
+class CreateChatRequest(BaseModel):
+    title: str = Field("", description="会话标题；留空按第一条消息生成")
+    message: str = Field("", description="可选：创建后直接发的第一句话")
+
+
+class ChatMessageRequest(BaseModel):
+    text: str = Field(..., min_length=1, description="要说的话")
 
 
 class ApproveRequest(BaseModel):
@@ -180,6 +211,20 @@ def _plugins(request: Request) -> PluginStore:
 
 def _catalog(request: Request) -> CatalogStore:
     return request.app.state.catalog_store  # type: ignore[no-any-return]
+
+
+def _projects(request: Request) -> ProjectStore:
+    store = getattr(request.app.state, "project_store", None)
+    if store is None:  # pragma: no cover - 测试里直接挂 app 时会缺，按需补一个
+        store = ProjectStore(Path(_orchestrator(request).store.runs_dir).parent / "projects.json")
+        request.app.state.project_store = store
+    return store
+
+
+def _project_runs(request: Request, project_id: str) -> list[Any]:
+    """本项目的运行（含已归档：项目模块要看全量历史，不再有全局聚合入口）。"""
+
+    return _orchestrator(request).store.iter_runs(project_id=project_id, include_archived=True)
 
 
 def _git(request: Request) -> GitService:
@@ -376,9 +421,25 @@ async def update_settings(patch: SettingsPatch, request: Request) -> dict[str, A
 
 @router.get("/runs")
 async def list_runs(
-    request: Request, include_archived: bool = False, q: str = ""
+    request: Request,
+    include_archived: bool = False,
+    q: str = "",
+    project_id: str | None = None,
+    kind: str | None = None,
+    context_type: str = "project",
 ) -> dict[str, Any]:
-    runs = _orchestrator(request).store.list_runs(include_archived=include_archived, query=q)
+    """运行列表：按项目与上下文类型过滤，不再有"全局运行"这个入口。
+
+    默认只列**项目上下文**的运行；普通对话走 ``/api/v1/chats``，不会混进项目列表。
+    """
+
+    runs = _orchestrator(request).store.list_runs(
+        include_archived=include_archived,
+        query=q,
+        project_id=None if project_id is None else project_id.strip(),
+        kind=None if kind is None else kind.strip(),
+        context_type=None if context_type in ("", "any") else context_type,
+    )
     return {"runs": runs, "total": len(runs)}
 
 
@@ -574,6 +635,7 @@ async def create_run(payload: CreateRunRequest, request: Request) -> dict[str, A
     run = orchestrator.create_run(
         payload.task,
         title=payload.title,
+        project_id=payload.project_id,
         target_dir=payload.target_dir,
         context=payload.context,
         brief=payload.brief,
@@ -1071,6 +1133,186 @@ def _empty_project_state(module_id: str) -> dict[str, Any]:
     }
 
 
+# ── 项目（真实容器：列表 / 新建 / 打开 / 改名换目录 / 归档）──
+
+
+def _project_card(request: Request, project) -> dict[str, Any]:
+    """项目列表项：进度概览 + 最近一次运行，供左侧栏与项目页共用。"""
+
+    runs = _project_runs(request, project.project_id)
+    ordered = sorted(runs, key=lambda item: item.updated_at, reverse=True)
+    latest = ordered[0] if ordered else None
+    steps = [step for run in ordered for step in run.steps]
+    return {
+        **project_block(project),
+        "runs": len(ordered),
+        "steps_total": len(steps),
+        "steps_done": sum(1 for step in steps if step.status.value == "done"),
+        "files_changed": sum(len(step.files) for step in steps),
+        "last_run": run_summary(latest) if latest else None,
+    }
+
+
+@router.get("/projects")
+async def list_projects(
+    request: Request, include_archived: bool = False, q: str = ""
+) -> dict[str, Any]:
+    """项目列表：一级入口「项目」的唯一数据来源。"""
+
+    store = _projects(request)
+    projects = store.list(include_archived=include_archived, query=q)
+    return {
+        "projects": [_project_card(request, item) for item in projects],
+        "default_project_id": "default",
+        "total": len(projects),
+    }
+
+
+@router.post("/projects", status_code=201)
+async def create_project(payload: CreateProjectRequest, request: Request) -> dict[str, Any]:
+    project = _projects(request).create(
+        payload.name,
+        project_id=payload.project_id,
+        root_path=payload.root_path,
+        description=payload.description,
+    )
+    return {"project": project_block(project), "card": _project_card(request, project)}
+
+
+@router.get("/projects/{project_id}")
+async def get_project(project_id: str, request: Request) -> dict[str, Any]:
+    project = _projects(request).require(project_id)
+    return {"project": project_block(project), "card": _project_card(request, project)}
+
+
+@router.put("/projects/{project_id}")
+async def update_project(
+    project_id: str, payload: UpdateProjectRequest, request: Request
+) -> dict[str, Any]:
+    project = _projects(request).update(
+        project_id,
+        name=payload.name,
+        root_path=payload.root_path,
+        description=payload.description,
+        status=payload.status,
+    )
+    return {"project": project_block(project), "card": _project_card(request, project)}
+
+
+@router.delete("/projects/{project_id}")
+async def archive_project(project_id: str, request: Request) -> dict[str, Any]:
+    """归档项目：运行记录与工作区都留着，随时可以恢复（不物理删除）。"""
+
+    project = _projects(request).archive(project_id)
+    return {"project": project_block(project), "archived": True}
+
+
+# ── 普通对话（chat 会话：只收发消息，不产生纲领与步骤）──
+
+
+def _chat_summary(run) -> dict[str, Any]:
+    last = next(
+        (item for item in reversed(run.messages) if item.content.strip()),
+        None,
+    )
+    return {
+        "id": run.id,
+        "title": run.title or "新对话",
+        "context_type": "chat",
+        "context_id": run.context_id,
+        "messages": len(run.messages),
+        "preview": " ".join((last.content if last else "").split())[:120],
+        "created_at": run.created_at.isoformat(),
+        "updated_at": run.updated_at.isoformat(),
+    }
+
+
+def _chat_detail(run) -> dict[str, Any]:
+    return {
+        **_chat_summary(run),
+        "status": run.status.value,
+        "error": (run.error or {}).get("message", "") if run.error else "",
+        "messages_list": [
+            {
+                "role": item.role,
+                "phase": item.phase,
+                "model": item.model,
+                "content": item.content,
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in run.messages
+        ],
+    }
+
+
+@router.get("/chats")
+async def list_chats(request: Request, q: str = "") -> dict[str, Any]:
+    """普通对话列表：只看**对话上下文**的会话。
+
+    "本该是任务、被判定成问答"的运行仍属于项目（``context_type=project``），
+    所以这里按上下文类型过滤，而不是按 ``kind``，免得它两边都出现。
+    """
+
+    runs = _orchestrator(request).store.iter_runs(
+        context_type="chat", include_archived=True, query=q
+    )
+    runs.sort(key=lambda item: item.updated_at, reverse=True)
+    return {"chats": [_chat_summary(run) for run in runs], "total": len(runs)}
+
+
+@router.post("/chats", status_code=201)
+async def create_chat(payload: CreateChatRequest, request: Request) -> dict[str, Any]:
+    orchestrator = _orchestrator(request)
+    run = orchestrator.create_chat(payload.title)
+    if payload.message.strip():
+        run = orchestrator.send_chat_message(run.id, payload.message)
+    return {"chat": _chat_detail(orchestrator.store.load(run.id))}
+
+
+@router.get("/chats/{chat_id}")
+async def get_chat(chat_id: str, request: Request) -> dict[str, Any]:
+    orchestrator = _orchestrator(request)
+    run = orchestrator.store.load(chat_id)
+    if not run.is_chat:
+        raise AppError("这不是普通对话会话。", code="not_a_chat_session")
+    return {
+        "chat": _chat_detail(run),
+        "event_seq": orchestrator.bus.current_seq(chat_id),
+    }
+
+
+@router.post("/chats/{chat_id}/messages", status_code=202)
+async def send_chat_message(
+    chat_id: str, payload: ChatMessageRequest, request: Request
+) -> dict[str, Any]:
+    orchestrator = _orchestrator(request)
+    run = orchestrator.send_chat_message(chat_id, payload.text)
+    return {"chat": _chat_detail(run), "accepted": True}
+
+
+@router.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: str, request: Request) -> dict[str, Any]:
+    orchestrator = _orchestrator(request)
+    run = orchestrator.store.load(chat_id)
+    if not run.is_chat:
+        raise AppError("只允许删除普通对话会话。", code="not_a_chat_session")
+    orchestrator.store.delete(chat_id)
+    return {"deleted": chat_id}
+
+
+@router.get("/chats/{chat_id}/events")
+async def chat_events(
+    chat_id: str, request: Request, since: int | None = None
+) -> StreamingResponse:
+    """普通对话的事件流（流式回答逐字送达，机制与运行事件一致）。"""
+
+    orchestrator = _orchestrator(request)
+    run = orchestrator.store.load(chat_id)
+    if run.context_type != "chat":
+        raise AppError("这不是普通对话会话。", code="not_a_chat_session")
+    return await run_events(chat_id, request, since=since)
+
+
 @router.get("/navigation/sidebar")
 async def navigation_sidebar() -> dict[str, Any]:
     """左侧栏契约：一级入口只有普通对话与项目，工程概念全部下沉到项目内。"""
@@ -1097,6 +1339,9 @@ async def navigation_chat_workspace() -> dict[str, Any]:
 @router.get("/navigation/project-modules/{module_id}")
 async def project_module_entry(module_id: str) -> Any:
     """未选中项目时点二级模块的落点：项目选择/创建引导，而不是全局运行数据。"""
+    # 旧模块名（steps / verify / events / context）按别名落到契约模块上，
+    # 历史链接不会因为改过名字就 404。
+    module_id = MODULE_ALIASES.get(module_id, module_id)
     try:
         module = ProjectModule(module_id)
     except ValueError:
@@ -1105,29 +1350,50 @@ async def project_module_entry(module_id: str) -> Any:
 
 
 @router.get("/projects/{project_id}/modules/{module_id}")
-async def project_module(project_id: str, module_id: str) -> Any:
-    """项目内部二级模块：上下文由 project_id 决定，刷新后据此恢复项目与模块。"""
-    normalized = (project_id or "").strip()
-    if not normalized:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "error": {
-                    "code": "missing_project_context",
-                    "message": "项目模块必须携带 project_id",
-                    "details": {"module_id": module_id},
-                }
-            },
-        )
+async def project_module(project_id: str, module_id: str, request: Request) -> Any:
+    """项目内部二级模块：**真实数据** + 上下文元信息。
+
+    概览 / 架构 / 计划 / 执行 / 步骤 / 验证 / 日志 / 设置各自装配本项目自己的运行数据；
+    项目不存在返回 404（``project_not_found``），模块名不认识返回 404（``project_module_not_found``）。
+    """
+
+    # 旧模块名（steps / verify / events / context）按别名落到契约模块上，历史链接不 404。
+    module_id = MODULE_ALIASES.get(module_id, module_id)
     try:
         module = ProjectModule(module_id)
     except ValueError:
         return _module_not_found(module_id)
-    context = project_module_context(module, normalized)
-    return {
-        "project_id": context.project_id,
-        "module": context.module,
-        "context_id": context.context_id,
-        "route": context.route,
-        "is_empty_state": False,
-    }
+    normalized = (project_id or "").strip()
+    if not normalized:
+        raise AppError(
+            "项目模块必须携带 project_id",
+            code="missing_project_context",
+            details={"module_id": module_id},
+        )
+    project = _projects(request).require(normalized)
+    context = project_module_context(module, project.project_id)
+    settings = _settings(request)
+    architect = settings.resolve_architect()
+    editor = settings.resolve_editor()
+    payload = build_module_payload(
+        module.value,
+        project=project,
+        runs=_project_runs(request, project.project_id),
+        models={
+            "architect": {
+                "model": architect.model,
+                "host": architect.host,
+                "label": architect.label,
+            },
+            "editor": {"model": editor.model, "host": editor.host, "label": editor.label},
+        },
+        route_path=context.route,
+    )
+    payload.update(
+        {
+            "project_id": context.project_id,
+            "module": context.module,
+            "context_id": context.context_id,
+        }
+    )
+    return payload

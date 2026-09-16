@@ -5,10 +5,14 @@ from __future__ import annotations
 import json
 import re
 import sys
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+
+from app.core.config import Settings, SettingsStore
+from app.main import create_app
 
 
 def plan_payload() -> dict[str, Any]:
@@ -114,7 +118,8 @@ class FakeRelay:
                 },
             )
 
-        if "本地桌面工具（架构-执行双模型编排器）的助手" in system:
+        # 判问答/普通对话：两套提示词（单轮问答、多轮普通对话）共用「本地桌面工具…助手」这一段
+        if "本地桌面工具" in system and "助手" in system:
             # 问答分支：直接给一段回答，不产出文件
             text = f"这是对「{body['messages'][-1]['content'][:20]}」的直接回答。"
             if body.get("stream"):
@@ -273,3 +278,37 @@ def _sse_response(content: str) -> httpx.Response:
 @pytest.fixture()
 def fake_relay() -> FakeRelay:
     return FakeRelay()
+
+
+def build_project_client(
+    tmp_path: Path,
+    relay: FakeRelay | None = None,
+    **settings_overrides: Any,
+):
+    """起一个只依赖临时目录的测试客户端（项目 / 普通对话 / 项目模块用例共用）。
+
+    运行记录、项目仓库、插件目录都在 ``tmp_path`` 里，绝不碰仓库里的 ``data/``。
+    """
+
+    from fastapi.testclient import TestClient
+
+    endpoint = relay or FakeRelay()
+    fields: dict[str, Any] = {
+        "relay_base_url": "https://relay.test/v1",
+        "relay_api_key": "sk-test-1234567890",
+        "relay_wire_api": "chat_completions",
+        "architect_model": "gpt-5",
+        "editor_model": "deepseek-v4",
+        "max_plan_steps": 2,
+    }
+    fields.update(settings_overrides)
+    settings = Settings(**fields)
+    store = SettingsStore(tmp_path / "settings.json")
+    app = create_app(
+        transport=endpoint.transport(),
+        settings_provider=lambda: settings,
+        runs_dir=tmp_path / "runs",
+        web_dir=tmp_path / "no-web",
+        settings_store_override=store,
+    )
+    return TestClient(app)

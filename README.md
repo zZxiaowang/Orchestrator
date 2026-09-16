@@ -292,6 +292,21 @@ Key 输入框的行为：**不会回显明文**（打开设置时是空的）；
 | `GET` | `/api/v1/runs/{id}/docs` | 读取 `plan.md` / `report.md` |
 | `GET` | `/api/v1/runs/{id}/metrics` | 运行指标：架构段一条 + 执行段每步一条 + 运行级汇总（token 未知时为 `null`） |
 | `GET` | `/api/v1/providers` | 列出全部配置 + 当前配置 + 内置地址预设 |
+
+项目与普通对话（真实数据，不再是界面壳子）：
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| `GET` | `/api/v1/projects` | 项目列表（含每次运行数 / 步数 / 文件改动 / 最近一次运行） |
+| `POST` | `/api/v1/projects` | 新建项目（`name`、可选 `project_id`、`root_path`、`description`）；`root_path` 留空则分配 `data/projects/<id>/workspace` |
+| `GET` / `PUT` / `DELETE` | `/api/v1/projects/{id}` | 读取 / 改名换目录 / 归档（归档不删数据） |
+| `GET` | `/api/v1/projects/{id}/modules/{module}` | 项目内模块真实数据（`overview`/`architecture`/`plan`/`execution`/`verification`/`logs`/`settings`；旧名 `steps`/`verify` 自动别名） |
+| `GET` | `/api/v1/runs?project_id=&kind=&context_type=` | 运行列表按项目与上下文过滤（默认只列项目运行） |
+| `GET` | `/api/v1/chats` | 普通对话会话列表（标题 / 消息数 / 摘要） |
+| `POST` | `/api/v1/chats` | 新建会话（可带第一句话） |
+| `GET` / `DELETE` | `/api/v1/chats/{id}` | 读取会话（含全部消息）/ 删除会话 |
+| `POST` | `/api/v1/chats/{id}/messages` | 发一条消息（多轮带上下文，回答流式返回） |
+| `GET` | `/api/v1/chats/{id}/events` | 普通对话的 SSE 事件流 |
 | `POST` | `/api/v1/providers` | 新建配置（`activate:false` = 先不切换） |
 | `PUT` / `DELETE` | `/api/v1/providers/{id}` | 修改 / 删除配置 |
 | `POST` | `/api/v1/providers/{id}/activate` | 切换为当前配置 |
@@ -338,7 +353,7 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 467 passed
+python -m pytest -q             # 482 passed
 python -m ruff check .          # All checks passed
 python -m ruff format --check . # 95 files already formatted
 ```
@@ -427,6 +442,22 @@ footArea
 一级导航只表达"用户要做什么"：**普通对话** 与 **项目**。
 架构 / 计划 / 执行 / 验证 / 日志 / 设置 不再是一级入口，而是**项目内部的二级模块**
 （普通对话上下文里访问不到它们，接口会明确拒绝，而不是静默落到默认项目）。
+
+### 这两块现在是真功能，不是壳子
+
+| 入口 | 真实行为 | 数据 |
+| --- | --- | --- |
+| 普通对话 | 新建会话 → 发消息 → 模型流式回答；**多轮带上下文**（接着说不用重复前文）；可搜索、可切换、可删除 | 会话存在 `data/runs/<id>/run.json`（`context_type=chat`），消息落库，刷新后还在 |
+| 项目 | 新建项目（名称 + 工作区目录）→ 项目列表 → 打开项目 → 七个二级模块 | 项目存 `data/projects.json`（名称 / 状态 / 工作区绑定 / 最近活动） |
+| 项目内模块 | **概览**（计数 + 最近运行）、**架构**（纲领目标 / 原则 / 组件 / 风险 + 原始输出）、**计划**（步骤与验收）、**执行**（运行时间线，可确认 / 停止 / 重试 / 回滚）、**验证**（逐步客观验收结果）、**日志**（消息与命令）、**设置**（改名 / 换工作区 / 归档） | `GET /api/v1/projects/{id}/modules/{module}` 现场装配，只含本项目数据 |
+
+关键约束：**运行属于项目**。项目里的运行按 `project_id` 过滤，项目和项目之间不串数据；
+普通对话**不产生纲领与步骤、不碰工作区、不能进执行流程**（接口返回 `not_a_project_run`），
+反向也成立——项目里的运行不能当对话用（`not_a_chat_session`）。
+项目与工作区一一绑定：没填"落地目录"时，项目内的运行直接落在项目的工作区里。
+
+地址栏也可以直接进：`#/chat`、`#/chat/<会话ID>`、`#/projects`、`#/projects/<项目ID>/<模块>`；
+旧的 `#/runs/<运行ID>`、`#/settings`、`#/plugins` 会自动重定向。
 
 约定与迁移：
 

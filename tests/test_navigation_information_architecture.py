@@ -21,6 +21,7 @@ import app.desktop as desktop
 from app.api import routes as api_routes
 from app.schemas.navigation import PROJECT_MODULES, PROJECT_ONLY_ACTIONS, ProjectModule
 from app.schemas.project import project_id_from_context_id
+from tests.conftest import build_project_client
 
 ROOT = Path(__file__).resolve().parents[1]
 DESKTOP_SOURCE = (ROOT / "app" / "desktop.py").read_text(encoding="utf-8")
@@ -72,29 +73,40 @@ def test_chat_workspace_has_no_project_controls():
     assert payload["shows_execution_controls"] is False
 
 
-def test_project_module_requires_project_id():
-    resp = run(api_routes.project_module("   ", "execution"))
-    assert resp.status_code == 400
-    body = json.loads(resp.body)
-    assert body["error"]["code"] == "missing_project_context"
+def test_project_module_requires_project_id(tmp_path: Path):
+    with build_project_client(tmp_path) as client:
+        resp = client.get("/api/v1/projects/%20%20/modules/execution")
+        assert resp.status_code == 400
+        assert resp.json()["error"]["code"] == "missing_project_context"
 
 
-def test_project_module_restores_project_id_and_module_from_url():
-    resp = run(api_routes.project_module("proj-42", "execution"))
-    assert resp["project_id"] == "proj-42"
-    assert resp["module"] == ProjectModule.EXECUTION.value
-    assert resp["context_id"] == "project:proj-42"
-    assert project_id_from_context_id(resp["context_id"]) == "proj-42"
-    assert resp["route"].startswith("#/")
-    assert "proj-42" in resp["route"]
+def test_project_module_restores_project_id_and_module_from_url(tmp_path: Path):
+    with build_project_client(tmp_path) as client:
+        created = client.post("/api/v1/projects", json={"name": "Alpha", "project_id": "alpha"})
+        assert created.status_code == 201
+
+        resp = client.get("/api/v1/projects/alpha/modules/execution")
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["project_id"] == "alpha"
+        assert payload["module"] == ProjectModule.EXECUTION.value
+        assert payload["context_id"] == "project:alpha"
+        assert project_id_from_context_id(payload["context_id"]) == "alpha"
+        assert payload["route"].startswith("#/")
+        assert "alpha" in payload["route"]
+        # 真实数据：模块带着本项目的运行列表与装配结果，而不是只有路由元信息
+        assert "execution" in payload and payload["execution"]["has_run"] is False
+        assert payload["counts"]["runs"] == 0
+        assert payload["project"]["name"] == "Alpha"
 
 
-def test_unknown_project_module_is_rejected():
-    resp = run(api_routes.project_module("proj-42", "not-a-module"))
-    assert resp.status_code == 404
-    body = json.loads(resp.body)
-    assert body["error"]["code"] == "project_module_not_found"
-    assert body["error"]["details"]["allowed"] == [module.value for module in PROJECT_MODULES]
+def test_unknown_project_module_is_rejected(tmp_path: Path):
+    with build_project_client(tmp_path) as client:
+        resp = client.get("/api/v1/projects/alpha/modules/not-a-module")
+        assert resp.status_code == 404
+        body = resp.json()
+        assert body["error"]["code"] == "project_module_not_found"
+        assert body["error"]["details"]["allowed"] == [module.value for module in PROJECT_MODULES]
 
 
 def test_project_module_without_project_returns_guidance_not_run_data():

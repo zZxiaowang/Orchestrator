@@ -153,6 +153,30 @@ body[data-panel="open"] .app {
   min-width: 0;
 }
 
+/* 项目 / 对话列表项复用同一套外观，但**不复用 .run-item 类名**：
+   界面自检与脚本按 .run-item 数"运行记录"，混在一起会误判。 */
+.list-item {
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  min-width: 0;
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  font: inherit;
+}
+
+.list-item:hover {
+  background: var(--panel-2);
+}
+
+.list-item.active {
+  background: var(--accent-soft);
+  border-color: rgba(79, 140, 255, 0.35);
+}
+
 .run-item:hover {
   background: var(--panel-2);
 }
@@ -2112,6 +2136,58 @@ textarea:focus {
 
 .project-picker input {
   width: 100%;
+}
+
+/* 新建项目：名称 + 工作区目录（真实创建，不再是"输入 ID 打开"） */
+.project-create {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 2px;
+}
+
+.project-create input {
+  width: 100%;
+}
+
+/* 项目模块里的列表（项目 / 运行）：一行一个可点条目 */
+.module-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.module-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+  font: inherit;
+}
+
+.module-row:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+/* 普通对话线程 */
+.chat-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.log-row {
+  border-left: 2px solid var(--border-soft);
+  padding-left: 8px;
+  margin-bottom: 8px;
 }
 
 .project-picker .run-list {

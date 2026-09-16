@@ -17,7 +17,17 @@ const CONTEXT_TYPES = [CONTEXT_CHAT, CONTEXT_PROJECT];
 const DEFAULT_CONTEXT_TYPE = CONTEXT_PROJECT;
 
 //: 项目内的二级导航能力，普通对话下不渲染
-const PROJECT_SECTIONS = ["architecture", "execution", "plan", "steps", "verify", "events"];
+//: 项目内二级模块（与后端 ProjectModule 契约一致：overview / architecture / plan /
+//: execution / verification / logs / settings）。旧名 steps / verify / events 由后端别名兼容。
+const PROJECT_SECTIONS = [
+  "overview",
+  "architecture",
+  "plan",
+  "execution",
+  "verification",
+  "logs",
+  "settings",
+];
 
 //: 上下文类型归一化：非法值 / 缺失值一律回落到默认归属
 function normalizeContextType(value) {
@@ -96,6 +106,8 @@ const state = {
   reconnectTimer: null,
   lastSeq: 0,
   buffers: {}, // key -> 流式文本缓冲区
+  //: 普通对话列表的搜索词（服务端过滤）
+  chatQuery: "",
   //: 步骤卡片的展开状态，key = `${runId}:${stepId}` → { status, open }。
   //: 已完成的步骤默认折叠：执行长任务时，视野留给"正在跑的那一步"。
   //: 记 status 是为了"某步被重跑（done → running）"时自动重新展开，而不是沿用旧选择。
@@ -238,6 +250,22 @@ const api = {
   gitProxyStatus: () => request("GET", "/api/v1/git/proxy"),
   gitProxySet: (proxyUrl) => request("POST", "/api/v1/git/proxy", { proxy_url: proxyUrl }),
   gitProxyClear: () => request("DELETE", "/api/v1/git/proxy"),
+  // ── 项目（真实容器）──
+  projects: (params = {}) => request("GET", `/api/v1/projects?${new URLSearchParams(params)}`),
+  project: (id) => request("GET", `/api/v1/projects/${encodeURIComponent(id)}`),
+  createProject: (body) => request("POST", "/api/v1/projects", body),
+  updateProject: (id, body) =>
+    request("PUT", `/api/v1/projects/${encodeURIComponent(id)}`, body),
+  archiveProject: (id) => request("DELETE", `/api/v1/projects/${encodeURIComponent(id)}`),
+  projectModule: (id, module) =>
+    request("GET", `/api/v1/projects/${encodeURIComponent(id)}/modules/${module}`),
+  // ── 普通对话（chat 会话）──
+  chats: (params = {}) => request("GET", `/api/v1/chats?${new URLSearchParams(params)}`),
+  chat: (id) => request("GET", `/api/v1/chats/${encodeURIComponent(id)}`),
+  createChat: (body) => request("POST", "/api/v1/chats", body),
+  sendChat: (id, text) =>
+    request("POST", `/api/v1/chats/${encodeURIComponent(id)}/messages`, { text }),
+  deleteChat: (id) => request("DELETE", `/api/v1/chats/${encodeURIComponent(id)}`),
 };
 
 const STATUS_TEXT = {
@@ -514,12 +542,20 @@ function safe(handler) {
 /* ── 运行列表 ── */
 
 async function refreshRuns() {
+  // 普通对话没有运行列表；项目的运行列表只列**本项目**的运行
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    state.runs = [];
+    renderRunList();
+    return;
+  }
   const token = ++state.tokens.runs;
   try {
-    const payload = await api.runs({
+    const params = {
       include_archived: state.showArchived,
       q: state.runQuery,
-    });
+    };
+    if (ProjectWorkspace.projectId) params.project_id = ProjectWorkspace.projectId;
+    const payload = await api.runs(params);
     if (token !== state.tokens.runs) return; // 有更新的请求在飞，丢弃旧响应
     state.runs = payload.runs || [];
   } catch (error) {
@@ -646,9 +682,10 @@ async function openRun(id) {
   }
 }
 
-function connectStream(id, since) {
+function connectStream(id, since, options = {}) {
   disconnectStream();
-  const url = `/api/v1/runs/${id}/events?since=${Number(since) || 0}`;
+  const base = options.chat ? `/api/v1/chats/${id}/events` : `/api/v1/runs/${id}/events`;
+  const url = `${base}?since=${Number(since) || 0}`;
   const source = new EventSource(url);
   state.es = source;
   source.onmessage = (event) => {
@@ -693,6 +730,12 @@ function handleEvent(event) {
       if (event.data.phase === "executor") {
         const card = document.querySelector(`[data-step="${event.data.step_id}"]`);
         if (card) card.dataset.status = "running";
+      }
+      if (event.data.phase === "chat" && ProjectWorkspace.contextType === CONTEXT_CHAT) {
+        // 普通对话：按帧合并重绘线程（和运行时间线同一套节流，避免逐 token 重排）
+        const chat = WorkspaceState.chatPayload;
+        if (chat && chat.status !== "planning") chat.status = "planning";
+        scheduleRender();
       }
       break;
     }
@@ -742,6 +785,11 @@ function handleEvent(event) {
       break;
     }
     case "status": {
+      if (ProjectWorkspace.contextType === CONTEXT_CHAT && WorkspaceState.chatPayload) {
+        WorkspaceState.chatPayload.status = event.data.status;
+        scheduleRender();
+        break;
+      }
       if (state.run) state.run.status = event.data.status;
       state.statusHint = event.data.message || "";
       if (["done", "failed", "cancelled", "blocked"].includes(event.data.status)) {
@@ -767,6 +815,14 @@ function handleEvent(event) {
       break;
     }
     case "done": {
+      // 普通对话会话的"回答完成"要把消息落进线程，而不是去拉运行详情
+      if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+        loadChatDetail(ProjectWorkspace.chatId).then(() => {
+          loadChats();
+          render();
+        });
+        break;
+      }
       refreshRun();
       break;
     }
@@ -843,6 +899,11 @@ function render() {
 function renderRunActions() {
   const host = document.getElementById("run-actions");
   if (!host) return;
+  // 普通对话没有运行操作（架构 / 执行 / 取消 / 重启都属于项目）
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    host.replaceChildren();
+    return;
+  }
   const run = state.run;
   const status = run ? run.status : "";
   const nodes = [];
@@ -906,6 +967,24 @@ function renderRunActions() {
 }
 
 function updateStatus() {
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    dom.statusPill.dataset.status = "chat";
+    const chat = WorkspaceState.chatPayload;
+    dom.statusPill.textContent = chat && chat.status === "planning" ? "正在回答" : "普通对话";
+    dom.runTitle.textContent = chat ? chat.title : "新对话";
+    return;
+  }
+  if (ProjectWorkspace.module !== "execution" || !ProjectWorkspace.projectId) {
+    const card = (WorkspaceState.projects || []).find(
+      (item) => item.project_id === ProjectWorkspace.projectId
+    );
+    dom.statusPill.dataset.status = "project";
+    dom.statusPill.textContent = PROJECT_SECTION_LABELS[ProjectWorkspace.module] || "项目";
+    dom.runTitle.textContent = card
+      ? `${card.name} · ${PROJECT_SECTION_LABELS[ProjectWorkspace.module] || ""}`
+      : "项目";
+    return;
+  }
   const status = state.run ? state.run.status : "idle";
   dom.statusPill.dataset.status = status;
   // 运行中优先显示后端说明：等待模型返回的那段时间里，用户得知道系统在干什么
@@ -963,6 +1042,18 @@ function updateRouteChips() {
 }
 
 function renderTimeline() {
+  // 主区内容取决于"现在在哪个工作区 / 哪个模块"：
+  // 普通对话 → 消息线程；项目 → 该模块的真实数据（执行模块走下面的运行时间线）。
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    lastTimelineSignature = "";
+    renderChatThread();
+    return;
+  }
+  if (ProjectWorkspace.module !== "execution" || !ProjectWorkspace.projectId) {
+    lastTimelineSignature = "";
+    renderModuleView();
+    return;
+  }
   const run = state.run;
   if (!run) {
     dom.timeline.replaceChildren(renderEmptyState());
@@ -1901,6 +1992,17 @@ function renderDocsInspector() {
 
 function updateComposer() {
   const ready = state.settings?.ready !== false;
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    dom.sendBtn.disabled = false;
+    dom.cancelBtn.hidden = true;
+    dom.taskInput.placeholder = "说点什么…（Enter 发送，Shift+Enter 换行）";
+    dom.composerHint.textContent = ready
+      ? "普通对话：Enter 发送 · 只收发消息，不产生纲领与步骤"
+      : "尚未配置中转地址 / Key：点右上角 ⚙ 填写并保存后即可对话。";
+    return;
+  }
+  dom.taskInput.placeholder =
+    "描述目标，例如：为现有 FastAPI 项目补一套可回滚的数据迁移流程（Enter 发送，Shift+Enter 换行）";
   const status = state.run?.status || "idle";
   const busy = status === "planning" || status === "executing";
   // 未配置时**不禁用**按钮：点击会给出"去哪儿配"的提示，而不是"点了没反应"
@@ -1928,6 +2030,20 @@ function updateComposer() {
 
 async function submitTask() {
   const task = dom.taskInput.value.trim();
+  // 普通对话：同一套输入框发消息，不建运行、不动文件
+  if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
+    if (!task) {
+      showToast("说点什么再发送。");
+      return;
+    }
+    if (state.settings && state.settings.ready === false) {
+      showToast("尚未配置中转地址 / Key：点右上角 ⚙ 填写并保存后再发送。");
+      return;
+    }
+    dom.taskInput.value = "";
+    await sendChatMessage(task);
+    return;
+  }
   const status = state.run?.status || "idle";
   const targetDir = dom.targetDir.value.trim();
   if (status === "planning" || status === "executing") {
@@ -1957,6 +2073,8 @@ async function submitTask() {
   try {
     const payload = await api.createRun({
       task,
+      // 运行必须属于某个项目：没选项目时落到默认项目（历史数据容器）
+      project_id: ProjectWorkspace.projectId || "default",
       target_dir: targetDir,
       context: "",
     });
@@ -4078,33 +4196,38 @@ function showToast(message) {
 
 boot().catch((error) => reportClientError("boot", error));
 
-/* ── 第 2 步：左侧栏一级入口（普通对话 / 项目）与工作区恢复 ──
-   左侧栏只暴露 CONTEXT_CHAT / CONTEXT_PROJECT 两个功能入口；
-   架构 / 执行 / 计划 / 步骤 / 验证 / 事件只作为项目内的二级导航出现。
-   上下文来源优先级：URL（?ctx=、?project=）> localStorage > DEFAULT_CONTEXT_TYPE。 */
-const URL_PARAM_CONTEXT = "ctx";
-const URL_PARAM_PROJECT = "project";
+/* ── 工作区：普通对话 / 项目 / 项目内模块 ──
+   左侧栏只暴露 CONTEXT_CHAT / CONTEXT_PROJECT 两个功能入口；架构 / 计划 / 执行 /
+   验证 / 日志 / 设置只作为项目内的二级导航出现。上下文由 **hash 路由** 决定，
+   localStorage 只记"上次看过的项目 / 模块"，用于没有 hash 时恢复。 */
 const STORE_CONTEXT_KEY = "orchestrator.contextType";
 const STORE_PROJECT_KEY = "orchestrator.projectId";
 const STORE_SECTION_KEY = "orchestrator.projectSection";
-const STORE_CHATS_KEY = "orchestrator.chats";
-const STORE_PROJECTS_KEY = "orchestrator.projects";
 
 //: 二级功能中文名；缺项时用英文标识兜底，新增 section 不会让导航崩掉
 const PROJECT_SECTION_LABELS = {
+  overview: "概览",
   architecture: "架构",
-  execution: "执行",
   plan: "计划",
-  steps: "步骤",
-  verify: "验证",
-  events: "事件",
-  context: "上下文",
+  execution: "执行",
+  verification: "验证",
+  logs: "日志",
+  settings: "设置",
 };
 
 const ProjectWorkspace = {
   contextType: DEFAULT_CONTEXT_TYPE,
   projectId: "",
-  section: PROJECT_SECTIONS[0],
+  module: PROJECT_SECTIONS[0],
+  chatId: "",
+};
+
+//: 真实数据缓存：项目列表、对话列表、当前模块载荷、当前会话详情
+const WorkspaceState = {
+  projects: [],
+  chats: [],
+  modulePayload: null,
+  chatPayload: null,
 };
 
 function safeReadStorage(key) {
@@ -4123,46 +4246,14 @@ function safeWriteStorage(key, value) {
   }
 }
 
-function readUrlWorkspace() {
-  let params = null;
-  try {
-    params = new URLSearchParams(window.location.search);
-  } catch (error) {
-    params = null;
-  }
-  const rawContext = (params && params.get(URL_PARAM_CONTEXT)) || "";
-  const rawProject = (params && params.get(URL_PARAM_PROJECT)) || "";
-  // 带项目标识的地址一律恢复项目工作区
-  return {
-    contextType: rawContext ? normalizeContextType(rawContext) : rawProject ? CONTEXT_PROJECT : "",
-    projectId: rawProject,
-  };
-}
-
-function syncUrlWorkspace() {
-  if (!window.history || typeof window.history.replaceState !== "function") return;
-  let url = null;
-  try {
-    url = new URL(window.location.href);
-  } catch (error) {
-    return;
-  }
-  url.searchParams.set(URL_PARAM_CONTEXT, ProjectWorkspace.contextType);
-  if (ProjectWorkspace.contextType === CONTEXT_PROJECT && ProjectWorkspace.projectId) {
-    url.searchParams.set(URL_PARAM_PROJECT, ProjectWorkspace.projectId);
-  } else {
-    url.searchParams.delete(URL_PARAM_PROJECT);
-  }
-  window.history.replaceState(null, "", url.toString());
-}
-
 function dispatchWorkspaceEvent(name) {
   document.dispatchEvent(
     new CustomEvent(name, {
       detail: {
         contextType: ProjectWorkspace.contextType,
         projectId: ProjectWorkspace.projectId,
-        section: ProjectWorkspace.section,
+        module: ProjectWorkspace.module,
+        chatId: ProjectWorkspace.chatId,
       },
     }),
   );
@@ -4172,8 +4263,9 @@ function renderProjectName() {
   const node = document.getElementById("project-name");
   if (!node) return;
   const id = ProjectWorkspace.projectId;
-  node.textContent = id || "默认项目";
-  node.title = id ? `当前项目：${id}` : "未指定项目 ID，当前为默认项目";
+  const card = (WorkspaceState.projects || []).find((item) => item.project_id === id);
+  node.textContent = card ? card.name : id || "未选择项目";
+  node.title = id ? `当前项目：${card ? card.name : id}（${id}）` : "还没有选择项目";
   node.dataset.projectId = id;
 }
 
@@ -4187,163 +4279,138 @@ function renderProjectNav() {
       btn.className = "project-nav-btn";
       btn.dataset.navSection = section;
       btn.textContent = PROJECT_SECTION_LABELS[section] || section;
-      btn.classList.toggle("active", section === ProjectWorkspace.section);
+      btn.classList.toggle("active", section === ProjectWorkspace.module);
+      btn.disabled = !ProjectWorkspace.projectId;
       btn.addEventListener("click", () => selectProjectSection(section));
       return btn;
     }),
   );
 }
 
-//: 二级导航切换：普通对话下不生效；项目内向既有视图做尽力而为的桥接（第 4 步收敛）
-function selectProjectSection(section) {
-  if (ProjectWorkspace.contextType !== CONTEXT_PROJECT) return;
-  if (!PROJECT_SECTIONS.includes(section)) return;
-  ProjectWorkspace.section = section;
-  safeWriteStorage(STORE_SECTION_KEY, section);
-  document.querySelectorAll("#project-nav .project-nav-btn").forEach((btn) => {
-    btn.classList.toggle("active", btn.dataset.navSection === section);
-  });
-  bridgeToProjectView(section);
-  dispatchWorkspaceEvent("orchestrator:section-change");
-}
-
-function bridgeToProjectView(section) {
-  const selectors = [`[data-view="${section}"]`, `[data-tab="${section}"]`, `[data-section="${section}"]`];
-  for (const selector of selectors) {
-    let node = null;
-    try {
-      node = document.querySelector(selector);
-    } catch (error) {
-      node = null;
-    }
-    if (!node) continue;
-    if (node.closest && node.closest("#project-nav")) continue;
-    if (typeof node.click === "function") {
-      node.click();
-      return true;
-    }
-  }
-  const label = PROJECT_SECTION_LABELS[section];
-  if (!label) return false;
-  const tabs = document.querySelectorAll('[role="tab"]');
-  for (const tab of tabs) {
-    if (tab.closest && tab.closest("#project-nav")) continue;
-    if ((tab.textContent || "").trim().startsWith(label)) {
-      tab.click();
-      return true;
-    }
-  }
-  return false;
-}
-
-function collectProjectCandidates() {
-  const out = [];
-  const seen = new Set();
-  const push = (id, label, meta) => {
-    const key = String(id || "").trim();
-    if (!key || seen.has(key)) return;
-    seen.add(key);
-    out.push({ id: key, label: label || key, meta: meta || "" });
-  };
-  const registered = Array.isArray(window.__orchestratorProjects) ? window.__orchestratorProjects : [];
-  registered.forEach((item) => {
-    if (!item) return;
-    if (typeof item === "string") push(item, item, "");
-    else push(item.id || item.projectId, item.name || item.label || item.id, item.meta || "");
-  });
-  try {
-    const stored = JSON.parse(safeReadStorage(STORE_PROJECTS_KEY) || "[]");
-    if (Array.isArray(stored)) {
-      stored.forEach((item) => {
-        if (typeof item === "string") push(item, item, "");
-        else if (item && typeof item === "object") push(item.id || item.projectId, item.name || item.id, item.meta || "");
-      });
-    }
-  } catch (error) {
-    /* 坏数据忽略 */
-  }
-  document.querySelectorAll("#run-list .run-item").forEach((item) => {
-    const id = item.dataset.id || item.dataset.runId || "";
-    const nameNode = item.querySelector(".run-name");
-    push(id, (nameNode && nameNode.textContent) || id, "运行记录");
-  });
-  return out;
-}
-
+/** 项目列表：来自 ``GET /api/v1/projects``（真实容器，不是从运行记录里拼出来的候选）。 */
 function renderProjectOptions() {
   const host = document.getElementById("project-options");
   if (!host) return;
-  const candidates = collectProjectCandidates();
-  if (!candidates.length) {
-    const hint = document.createElement("div");
-    hint.className = "chat-empty";
-    hint.textContent = "暂无可选项目：在上方输入项目 ID 回车即可打开。";
-    host.replaceChildren(hint);
+  const projects = WorkspaceState.projects || [];
+  if (!projects.length) {
+    host.replaceChildren(
+      h("div", { class: "chat-empty", text: "还没有项目：在上面填名称即可新建。" })
+    );
     return;
   }
   host.replaceChildren(
-    ...candidates.map((item) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "run-item";
-      btn.dataset.projectId = item.id;
-      btn.classList.toggle("active", item.id === ProjectWorkspace.projectId);
-      const name = document.createElement("div");
-      name.className = "run-name";
-      name.textContent = item.label;
-      btn.appendChild(name);
-      if (item.meta) {
-        const meta = document.createElement("div");
-        meta.className = "run-meta";
-        meta.textContent = item.meta;
-        btn.appendChild(meta);
-      }
-      btn.addEventListener("click", () => openProject(item.id));
+    ...projects.map((project) => {
+      const btn = h("button", {
+        type: "button",
+        class: "list-item project-item",
+        dataset: { projectId: project.project_id },
+      });
+      btn.classList.toggle("active", project.project_id === ProjectWorkspace.projectId);
+      btn.append(
+        h("div", { class: "run-name", text: project.name }),
+        h("div", {
+          class: "run-meta",
+          text: [
+            project.project_id === "default" ? "默认项目" : project.project_id,
+            `${project.runs || 0} 次运行`,
+            project.workspace?.root_path ? project.workspace.root_path : "未绑定工作区",
+          ].join(" · "),
+        })
+      );
+      btn.addEventListener("click", () => openProject(project.project_id).catch(showToast));
       return btn;
-    }),
+    })
   );
 }
 
+/** 普通对话列表：来自 ``GET /api/v1/chats``（会话真的存在后端，不再是 localStorage）。 */
 function renderChatList() {
   const host = document.getElementById("chat-list");
   if (!host) return;
-  let chats = [];
-  try {
-    const stored = JSON.parse(safeReadStorage(STORE_CHATS_KEY) || "[]");
-    if (Array.isArray(stored)) chats = stored.filter(Boolean);
-  } catch (error) {
-    chats = [];
-  }
+  const chats = WorkspaceState.chats || [];
   if (!chats.length) {
-    const hint = document.createElement("div");
-    hint.className = "chat-empty";
-    hint.textContent = "普通对话是轻量工作区：不产生运行、计划、步骤与验证记录。点「＋ 新对话」开始。";
-    host.replaceChildren(hint);
+    host.replaceChildren(
+      h("div", {
+        class: "chat-empty",
+        text: "普通对话是轻量工作区：只收发消息，不产生纲领、步骤与验证记录。点「＋ 新对话」开始。",
+      })
+    );
     return;
   }
   host.replaceChildren(
     ...chats.map((chat) => {
-      const node = document.createElement("div");
-      node.className = "run-item";
-      if (chat.id) node.dataset.chatId = chat.id;
-      const name = document.createElement("div");
-      name.className = "run-name";
-      name.textContent = chat.title || chat.name || "未命名对话";
-      node.appendChild(name);
-      const meta = document.createElement("div");
-      meta.className = "run-meta";
-      meta.textContent = chat.updatedAt || chat.createdAt || "";
-      node.appendChild(meta);
+      const node = h("button", {
+        type: "button",
+        class: "list-item chat-item",
+        dataset: { chatId: chat.id },
+      });
+      node.classList.toggle("active", chat.id === ProjectWorkspace.chatId);
+      node.append(
+        h("div", { class: "run-name", text: chat.title || "未命名对话" }),
+        h("div", {
+          class: "run-meta",
+          text: `${chat.messages || 0} 条消息${chat.preview ? ` · ${chat.preview}` : ""}`,
+        })
+      );
+      node.addEventListener("click", () => enterChat(chat.id).catch(showToast));
       return node;
-    }),
+    })
   );
 }
 
 function applyWorkspaceContext(contextType, options = {}) {
-  const type = normalizeContextType(contextType);
-  ProjectWorkspace.contextType = type;
-  if (typeof options.projectId === "string") ProjectWorkspace.projectId = options.projectId;
+  return switchWorkspace(contextType, options);
+}
 
+/* ── 工作区：普通对话 / 项目 / 项目内模块（真实数据 + hash 路由）────────────
+   路由：#/chat、#/chat/<chatId>、#/projects、#/projects/<projectId>[/<module>]。
+   旧链接（#/runs/<id>、#/settings、#/plugins）按契约重定向到项目内模块。 */
+
+function chatRoute(chatId) {
+  return chatId ? `#/chat/${encodeURIComponent(chatId)}` : "#/chat";
+}
+
+function projectRoute(projectId, module) {
+  if (!projectId) return "#/projects";
+  const base = `#/projects/${encodeURIComponent(projectId)}`;
+  return module && module !== "overview" ? `${base}/${module}` : base;
+}
+
+let suppressHashChange = false;
+
+function setRouteHash(route) {
+  if (!route) return;
+  const next = route.startsWith("#") ? route : `#${route}`;
+  if (location.hash === next) return;
+  suppressHashChange = true;
+  location.hash = next;
+}
+
+function parseRoute(hash = location.hash) {
+  const raw = String(hash || "").replace(/^#\/?/, "");
+  const parts = raw
+    .split("?")[0]
+    .split("/")
+    .filter(Boolean)
+    .map((item) => decodeURIComponent(item));
+  if (!parts.length) return { kind: "projects" };
+  if (parts[0] === "chat") return { kind: "chat", chatId: parts[1] || "" };
+  if (parts[0] === "projects") {
+    if (!parts[1]) return { kind: "projects" };
+    return {
+      kind: "project",
+      projectId: parts[1],
+      module: PROJECT_SECTIONS.includes(parts[2]) ? parts[2] : "overview",
+    };
+  }
+  if (parts[0] === "runs" && parts[1]) return { kind: "legacy-run", runId: parts[1] };
+  if (parts[0] === "settings" || parts[0] === "plugins") return { kind: "legacy-settings" };
+  return { kind: "projects" };
+}
+
+/** 界面上与"现在看哪儿"有关的一切：两个工作区面板、导航高亮、上下文相关的控件。 */
+function syncWorkspaceChrome() {
+  const type = ProjectWorkspace.contextType;
   const projectPane = document.getElementById("project-pane");
   const chatPane = document.getElementById("chat-pane");
   const navChat = document.getElementById("nav-chat");
@@ -4359,27 +4426,265 @@ function applyWorkspaceContext(contextType, options = {}) {
     navProject.setAttribute("aria-pressed", type === CONTEXT_PROJECT ? "true" : "false");
   }
   document.body.dataset.contextType = type;
+  // 普通对话没有落地目录，也没有运行明细面板——项目控件一个都不渲染
+  const meta = document.getElementById("composer-meta");
+  if (meta) meta.hidden = type === CONTEXT_CHAT;
+  const inspectorToggle = document.getElementById("inspector-toggle");
+  if (inspectorToggle) inspectorToggle.hidden = type === CONTEXT_CHAT;
+  if (type === CONTEXT_CHAT && state.panelOpen) setPanelOpen(false);
 
   safeWriteStorage(STORE_CONTEXT_KEY, type);
   if (type === CONTEXT_PROJECT && ProjectWorkspace.projectId) {
     safeWriteStorage(STORE_PROJECT_KEY, ProjectWorkspace.projectId);
   }
-
   renderProjectName();
   renderProjectNav();
   renderChatList();
-  syncUrlWorkspace();
   dispatchWorkspaceEvent("orchestrator:context-change");
-  return type;
 }
 
-function openProject(projectId) {
+/** 加载项目列表（左侧栏 + 项目选择器都用它）。 */
+async function loadProjects() {
+  try {
+    const payload = await api.projects();
+    WorkspaceState.projects = payload.projects || [];
+  } catch (error) {
+    reportClientError("projects", error);
+    WorkspaceState.projects = [];
+  }
+  renderProjectOptions();
+  return WorkspaceState.projects;
+}
+
+/** 加载普通对话列表。 */
+async function loadChats() {
+  try {
+    const payload = await api.chats({ q: state.chatQuery || "" });
+    WorkspaceState.chats = payload.chats || [];
+  } catch (error) {
+    reportClientError("chats", error);
+    WorkspaceState.chats = [];
+  }
+  renderChatList();
+  return WorkspaceState.chats;
+}
+
+/** 项目列表页：左侧栏给项目，主区给"选一个项目 / 新建项目"。 */
+async function showProjects({ navigate = true } = {}) {
+  ProjectWorkspace.contextType = CONTEXT_PROJECT;
+  ProjectWorkspace.projectId = "";
+  WorkspaceState.modulePayload = null;
+  if (navigate) setRouteHash("#/projects");
+  syncWorkspaceChrome();
+  render();
+}
+
+/** 进入某个项目的某个模块：拉模块真实数据 + 选中该项目最近一次运行。 */
+async function enterProject(projectId, module = "overview", { navigate = true } = {}) {
   const id = String(projectId || "").trim();
+  ProjectWorkspace.contextType = CONTEXT_PROJECT;
   ProjectWorkspace.projectId = id;
+  ProjectWorkspace.module = PROJECT_SECTIONS.includes(module) ? module : "overview";
+  if (navigate) setRouteHash(projectRoute(id, ProjectWorkspace.module));
+  syncWorkspaceChrome();
+
+  WorkspaceState.modulePayload = null;
+  await loadModulePayload();
+
+  // 执行模块要有一条"当前运行"：优先沿用已在看的，否则取最近一次
+  const runs = WorkspaceState.modulePayload?.runs || [];
+  const known = state.run && runs.some((item) => item.id === state.run.id);
+  const targetId = known ? state.run.id : runs[0]?.id || "";
+  if (targetId && (!state.run || state.run.id !== targetId)) {
+    await openRun(targetId).catch(() => {});
+  } else if (!targetId) {
+    state.run = null;
+    state.buffers = {};
+    disconnectStream();
+  }
+  render();
+}
+
+/** 进入普通对话：没给 id 就停在"新对话"空态，发第一条消息时会真的建会话。 */
+async function enterChat(chatId = "", { navigate = true } = {}) {
+  ProjectWorkspace.contextType = CONTEXT_CHAT;
+  ProjectWorkspace.chatId = String(chatId || "");
+  if (navigate) setRouteHash(chatRoute(ProjectWorkspace.chatId));
+  WorkspaceState.chatPayload = null;
+  state.run = null;
+  state.buffers = {};
+  disconnectStream();
+  syncWorkspaceChrome();
+  if (ProjectWorkspace.chatId) await loadChatDetail(ProjectWorkspace.chatId);
+  render();
+}
+
+/** 打开一个已有会话（列表点击 / 深链）。 */
+async function openChat(chatId, { navigate = true } = {}) {
+  return enterChat(chatId, { navigate });
+}
+
+async function loadChatDetail(chatId) {
+  try {
+    const payload = await api.chat(chatId);
+    WorkspaceState.chatPayload = payload.chat;
+    connectStream(chatId, payload.event_seq || 0, { chat: true });
+  } catch (error) {
+    reportClientError("chat", error);
+    WorkspaceState.chatPayload = null;
+    showToast(error.message);
+  }
+}
+
+async function loadModulePayload() {
+  const projectId = ProjectWorkspace.projectId;
+  if (!projectId) {
+    WorkspaceState.modulePayload = null;
+    return null;
+  }
+  try {
+    WorkspaceState.modulePayload = await api.projectModule(projectId, ProjectWorkspace.module);
+  } catch (error) {
+    WorkspaceState.modulePayload = null;
+    reportClientError("project-module", error);
+    showToast(error.message);
+  }
+  return WorkspaceState.modulePayload;
+}
+
+/** 按 hash 决定看哪儿（刷新、深链、浏览器前进后退都走这里）。 */
+async function applyRoute(hash = location.hash) {
+  const route = parseRoute(hash);
+  if (route.kind === "chat") {
+    await enterChat(route.chatId, { navigate: false });
+    return;
+  }
+  if (route.kind === "project") {
+    await enterProject(route.projectId, route.module, { navigate: false });
+    return;
+  }
+  if (route.kind === "legacy-run") {
+    // 旧运行链接：解析出项目后重定向进项目的执行模块（普通对话会话则进对话）
+    try {
+      const payload = await api.run(route.runId);
+      const run = payload.run;
+      if (run?.context_type === "chat") {
+        await enterChat(route.runId);
+        return;
+      }
+      state.run = run;
+      state.lastSeq = payload.event_seq || 0;
+      await enterProject(run.project_id || "default", "execution");
+      return;
+    } catch (error) {
+      showToast("这条运行记录不存在或已被清理。");
+      await showProjects();
+      return;
+    }
+  }
+  if (route.kind === "legacy-settings") {
+    await showProjects();
+    openSettings();
+    return;
+  }
+  await showProjects({ navigate: false });
+}
+
+async function openProject(projectId, module = "") {
+  const id = String(projectId || "").trim();
   const picker = document.getElementById("project-picker");
   if (picker) picker.hidden = true;
-  applyWorkspaceContext(CONTEXT_PROJECT, { projectId: id });
+  if (!id) return showProjects();
+  await enterProject(id, module || ProjectWorkspace.module || "overview");
   dispatchWorkspaceEvent("orchestrator:project-open");
+}
+
+/** 项目内模块切换（二级导航）。 */
+async function selectProjectSection(module) {
+  if (ProjectWorkspace.contextType !== CONTEXT_PROJECT) return;
+  if (!PROJECT_SECTIONS.includes(module)) return;
+  ProjectWorkspace.module = module;
+  safeWriteStorage(STORE_SECTION_KEY, module);
+  document.querySelectorAll("#project-nav .project-nav-btn").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.navSection === module);
+  });
+  if (!ProjectWorkspace.projectId) {
+    await showProjects({ navigate: false });
+    render();
+    return;
+  }
+  setRouteHash(projectRoute(ProjectWorkspace.projectId, module));
+  await loadModulePayload();
+  render();
+  dispatchWorkspaceEvent("orchestrator:section-change");
+}
+
+/** 新建项目：名称 + 工作区目录（留空则由后端分配 data/projects/<id>/workspace）。 */
+async function createProjectFromForm() {
+  const nameInput = document.getElementById("project-name-input");
+  const rootInput = document.getElementById("project-root-input");
+  const name = (nameInput?.value || "").trim();
+  if (!name) {
+    showToast("先给项目起个名字。");
+    nameInput?.focus();
+    return;
+  }
+  const button = document.getElementById("project-create-btn");
+  if (button) button.disabled = true;
+  try {
+    const payload = await api.createProject({
+      name,
+      root_path: (rootInput?.value || "").trim(),
+    });
+    if (nameInput) nameInput.value = "";
+    if (rootInput) rootInput.value = "";
+    await loadProjects();
+    showToast(`已新建项目「${payload.project.name}」`);
+    await openProject(payload.project.project_id, "overview");
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/** 新建普通对话：先建空会话再进入（发第一条消息时才会请求模型）。 */
+async function createChatSession() {
+  const button = document.getElementById("new-chat-btn");
+  if (button) button.disabled = true;
+  try {
+    const payload = await api.createChat({});
+    await loadChats();
+    await enterChat(payload.chat.id);
+    document.getElementById("task-input")?.focus();
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+/** 普通对话里发消息：没有会话就先建一个，然后交给后端流式回答。 */
+async function sendChatMessage(text) {
+  const message = (text || "").trim();
+  if (!message) return;
+  let chatId = ProjectWorkspace.chatId;
+  try {
+    if (!chatId) {
+      const created = await api.createChat({});
+      chatId = created.chat.id;
+      ProjectWorkspace.chatId = chatId;
+      setRouteHash(chatRoute(chatId));
+    }
+    state.buffers.chat = "";
+    const payload = await api.sendChat(chatId, message);
+    WorkspaceState.chatPayload = payload.chat;
+    connectStream(chatId, state.lastSeq, { chat: true });
+    await loadChats();
+    render();
+  } catch (error) {
+    showToast(error.message);
+  }
 }
 
 function bindPrimaryNav() {
@@ -4387,21 +4692,22 @@ function bindPrimaryNav() {
   const navProject = document.getElementById("nav-project");
   if (navChat) {
     navChat.addEventListener("click", () => {
-      applyWorkspaceContext(CONTEXT_CHAT);
+      const remembered = ProjectWorkspace.chatId || "";
+      enterChat(remembered).catch(showToast);
     });
   }
   if (navProject) {
     navProject.addEventListener("click", () => {
       const remembered = ProjectWorkspace.projectId || safeReadStorage(STORE_PROJECT_KEY) || "";
-      applyWorkspaceContext(CONTEXT_PROJECT, { projectId: remembered });
+      if (remembered) enterProject(remembered, ProjectWorkspace.module).catch(showToast);
+      else showProjects().catch(showToast);
     });
   }
   const newChat = document.getElementById("new-chat-btn");
-  if (newChat) {
-    newChat.addEventListener("click", () => {
-      applyWorkspaceContext(CONTEXT_CHAT);
-      dispatchWorkspaceEvent("orchestrator:chat-new");
-    });
+  if (newChat) newChat.addEventListener("click", () => createChatSession().catch(showToast));
+  const createProject = document.getElementById("project-create-btn");
+  if (createProject) {
+    createProject.addEventListener("click", () => createProjectFromForm().catch(showToast));
   }
   const toggle = document.getElementById("project-picker-btn");
   const picker = document.getElementById("project-picker");
@@ -4423,42 +4729,565 @@ function bindPrimaryNav() {
       event.preventDefault();
       const value = input.value.trim();
       input.value = "";
-      if (value) openProject(value);
+      if (value) openProject(value).catch(showToast);
     });
   }
   const chatSearch = document.getElementById("chat-search");
   const chatList = document.getElementById("chat-list");
   if (chatSearch && chatList) {
     chatSearch.addEventListener("input", () => {
-      const keyword = chatSearch.value.trim().toLowerCase();
-      chatList.querySelectorAll(".run-item").forEach((item) => {
-        const text = (item.textContent || "").toLowerCase();
-        item.hidden = Boolean(keyword) && !text.includes(keyword);
-      });
+      state.chatQuery = chatSearch.value.trim();
+      loadChats().catch(() => {});
     });
   }
+  window.addEventListener("hashchange", () => {
+    if (suppressHashChange) {
+      suppressHashChange = false;
+      return;
+    }
+    applyRoute().catch(showToast);
+  });
+}
+
+/** 门面：切换工作区（左侧栏一级入口 / window.OrchestratorContext.switchTo 都用它）。 */
+function switchWorkspace(contextType, options = {}) {
+  const type = normalizeContextType(contextType);
+  if (type === CONTEXT_CHAT) {
+    ProjectWorkspace.projectId = "";
+    enterChat(options.chatId || ProjectWorkspace.chatId || "").catch(showToast);
+    return type;
+  }
+  const remembered = options.projectId || ProjectWorkspace.projectId || "";
+  if (remembered) {
+    enterProject(remembered, options.module || ProjectWorkspace.module).catch(showToast);
+  } else {
+    showProjects().catch(showToast);
+  }
+  return type;
+}
+
+/* ── 主区渲染：对话线程 / 项目模块（真实数据）──────────────────────── */
+
+function cardBlock(title, ...children) {
+  return h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-head" }, h("strong", { text: title })),
+    h("div", { class: "card-body" }, ...children)
+  );
+}
+
+function kvLine(label, value) {
+  return h(
+    "div",
+    { class: "kv" },
+    h("h3", { text: label }),
+    h("div", { text: value || "—" })
+  );
+}
+
+/** 没选项目时的主区：明确告诉用户去哪儿选 / 新建。 */
+function renderProjectListView() {
+  const projects = WorkspaceState.projects || [];
+  const nodes = [
+    cardBlock(
+      "项目",
+      h("p", {
+        text: "架构、计划、执行、验证都在项目内部进行；项目与工作区一一绑定，运行记录按项目隔离。",
+      })
+    ),
+  ];
+  if (!projects.length) {
+    nodes.push(
+      cardBlock(
+        "还没有项目",
+        h("p", {
+          class: "muted",
+          text: "点当前项目旁的 ▾ 展开项目面板，填一个名字即可新建（工作区目录可留空）。",
+        })
+      )
+    );
+  } else {
+    const list = h("div", { class: "module-list" });
+    for (const project of projects) {
+      const row = h(
+        "button",
+        { class: "module-row", type: "button", dataset: { projectId: project.project_id } },
+        h("div", { class: "run-name", text: project.name }),
+        h("div", {
+          class: "run-meta",
+          text: [
+            project.project_id,
+            `${project.runs || 0} 次运行`,
+            `${project.steps_done || 0}/${project.steps_total || 0} 步`,
+            project.workspace?.root_path || "未绑定工作区",
+          ].join(" · "),
+        })
+      );
+      row.addEventListener("click", () => openProject(project.project_id).catch(showToast));
+      list.append(row);
+    }
+    nodes.push(cardBlock("全部项目", list));
+  }
+  dom.timeline.replaceChildren(...nodes);
+}
+
+function chatMessageNode(message) {
+  const isUser = message.role === "user";
+  const body = message.streaming
+    ? h("pre", { class: "stream", text: message.content || "…" })
+    : h("div", { class: "card-body", text: message.content });
+  return h(
+    "div",
+    { class: `card ${isUser ? "msg-user" : "msg-assistant"}` },
+    h(
+      "div",
+      { class: "card-head" },
+      h("div", { class: "avatar", text: isUser ? "你" : "答" }),
+      h("strong", { text: isUser ? "你" : "回答" }),
+      h("span", { class: "muted", text: message.model || "" })
+    ),
+    body
+  );
+}
+
+/** 普通对话线程：消息只属于本会话，没有纲领 / 步骤 / 验收。 */
+function renderChatThread() {
+  const chat = WorkspaceState.chatPayload;
+  if (!chat) {
+    dom.timeline.replaceChildren(
+      cardBlock(
+        "开始一段新对话",
+        h("p", {
+          text: "普通对话不绑定项目：只收发消息，不生成纲领与步骤，也不改动任何文件。",
+        }),
+        h("p", { class: "muted", text: "在下面的输入框里说点什么，回车发送。" })
+      )
+    );
+    return;
+  }
+  const streaming = state.buffers.chat || "";
+  const nodes = (chat.messages_list || []).map((message) => chatMessageNode(message));
+  const answering = chat.status === "planning";
+  if (answering) {
+    nodes.push(
+      chatMessageNode({ role: "assistant", content: streaming, streaming: true, model: "" })
+    );
+  }
+  const thread = h("div", { class: "chat-thread" }, ...nodes);
+  const extras = [];
+  if (chat.error) extras.push(h("div", { class: "error-box", text: `回答失败：${chat.error}` }));
+  dom.timeline.replaceChildren(thread, ...extras);
+  dom.timeline.scrollTop = dom.timeline.scrollHeight;
+}
+
+/** 项目模块头：项目名 + 模块名 + 计数 + 主行动。 */
+function moduleHeader(payload) {
+  const project = payload.project || {};
+  const counts = payload.counts || {};
+  const actions = h("div", { class: "approval-actions" });
+  const newRun = h("button", {
+    class: "btn primary small",
+    type: "button",
+    text: "＋ 新建任务",
+  });
+  newRun.addEventListener(
+    "click",
+    safe(() => {
+      selectProjectSection("execution");
+      document.getElementById("task-input")?.focus();
+    })
+  );
+  actions.append(newRun);
+  return h(
+    "div",
+    { class: "card" },
+    h(
+      "div",
+      { class: "card-head" },
+      h("div", { class: "avatar", text: "◈" }),
+      h("strong", { text: `${project.name || project.project_id} · ${payload.label || ""}` }),
+      h("span", {
+        class: "muted",
+        text: `${counts.runs || 0} 次运行 · ${counts.steps_done || 0}/${counts.steps_total || 0} 步完成 · ${counts.files_changed || 0} 个文件改动`,
+      })
+    ),
+    h(
+      "div",
+      { class: "card-body" },
+      h("p", {
+        class: "muted",
+        text: project.workspace?.root_path
+          ? `工作区：${project.workspace.root_path}`
+          : "该项目未绑定工作区（历史数据容器）",
+      }),
+      actions
+    )
+  );
+}
+
+function runRows(payload) {
+  const runs = payload.runs || [];
+  if (!runs.length) {
+    return h("p", { class: "muted", text: "这个项目还没有运行记录。" });
+  }
+  const list = h("div", { class: "module-list" });
+  for (const run of runs) {
+    const row = h(
+      "button",
+      { class: "module-row", type: "button", dataset: { runId: run.id } },
+      h("div", { class: "run-name", text: run.title || run.id }),
+      h("div", {
+        class: "run-meta",
+        text: `${run.status} · ${run.steps?.done || 0}/${run.steps?.total || 0} 步 · ${run.updated_at || ""}`,
+      })
+    );
+    row.addEventListener(
+      "click",
+      safe(async () => {
+        await selectProjectSection("execution");
+        await openRun(run.id);
+        render();
+      })
+    );
+    list.append(row);
+  }
+  return list;
+}
+
+function overviewNodes(payload) {
+  const nodes = [];
+  const latest = payload.current_run;
+  nodes.push(
+    cardBlock(
+      "最近一次运行",
+      latest
+        ? h(
+            "div",
+            {},
+            h("p", { text: `${latest.title}（${latest.status}）` }),
+            h("p", {
+              class: "muted",
+              text: `${latest.steps?.done || 0}/${latest.steps?.total || 0} 步完成 · ${latest.updated_at || ""}`,
+            })
+          )
+        : h("p", { class: "muted", text: "还没有运行：点上面的「新建任务」开始。" })
+    )
+  );
+  nodes.push(cardBlock("运行记录", runRows(payload)));
+  return nodes;
+}
+
+function architectureNodes(payload) {
+  const data = payload.architecture || {};
+  if (!data.has_plan) {
+    return [
+      cardBlock(
+        "尚未生成架构",
+        h("p", { class: "muted", text: "在「执行」里新建任务，架构段会先产出纲领与验收标准。" })
+      ),
+    ];
+  }
+  const nodes = [
+    cardBlock(
+      "纲领目标",
+      h("p", { class: "plan-goal", text: data.goal || "（未写目标）" }),
+      h("p", { text: data.summary || "" }),
+      h("p", {
+        class: "muted",
+        text: `模型 ${data.metrics?.model || "—"} · ${(data.metrics?.duration_ms || 0) / 1000} 秒${
+          typeof data.metrics?.total_tokens === "number" ? ` · ${data.metrics.total_tokens} tokens` : ""
+        }`,
+      })
+    ),
+  ];
+  if (data.principles?.length) {
+    nodes.push(
+      cardBlock("设计原则", h("ul", { class: "list" }, ...data.principles.map((item) => h("li", { text: item }))))
+    );
+  }
+  if (data.components?.length) {
+    nodes.push(
+      cardBlock(
+        "组件与职责",
+        h(
+          "ul",
+          { class: "list" },
+          ...data.components.map((item) =>
+            h("li", { text: `${item.name}：${item.responsibility}${item.interfaces?.length ? `（接口：${item.interfaces.join("、")}）` : ""}` })
+          )
+        )
+      )
+    );
+  }
+  if (data.risks?.length) {
+    nodes.push(cardBlock("风险", h("ul", { class: "list" }, ...data.risks.map((item) => h("li", { text: item })))));
+  }
+  if (data.open_questions?.length) {
+    nodes.push(
+      cardBlock("待澄清", h("ul", { class: "list" }, ...data.open_questions.map((item) => h("li", { text: item }))))
+    );
+  }
+  if (data.raw) {
+    const details = h("details", {}, h("summary", { text: "架构段原始输出" }), h("pre", { class: "stream", text: data.raw }));
+    nodes.push(h("div", { class: "card" }, h("div", { class: "card-body" }, details)));
+  }
+  return nodes;
+}
+
+function planNodes(payload) {
+  const data = payload.plan || {};
+  if (!data.has_plan) {
+    return [
+      cardBlock("尚无计划", h("p", { class: "muted", text: "计划来自架构段的纲领：在「执行」里新建任务即可生成。" })),
+    ];
+  }
+  const nodes = [
+    cardBlock(
+      "计划",
+      h("p", { class: "plan-goal", text: data.goal || "" }),
+      h("p", { class: "muted", text: `共 ${data.steps?.length || 0} 步 · 修订第 ${data.plan_revision || 1} 版` })
+    ),
+  ];
+  for (const step of data.steps || []) {
+    nodes.push(
+      h(
+        "div",
+        { class: "card step", dataset: { step: step.id, status: step.status } },
+        h(
+          "div",
+          { class: "card-head" },
+          h("div", { class: "step-index", text: step.id }),
+          h("strong", { text: step.title || `第 ${step.id} 步` }),
+          h("span", { class: "muted", text: STEP_STATUS_TEXT[step.status] || step.status })
+        ),
+        h(
+          "div",
+          { class: "card-body" },
+          h("p", { text: step.goal || "" }),
+          step.deliverables?.length
+            ? h("p", { class: "muted", text: `交付物：${step.deliverables.join("、")}` })
+            : null,
+          step.acceptance?.length
+            ? h("ul", { class: "list" }, ...step.acceptance.map((item) => h("li", { text: item })))
+            : null,
+          step.checks?.length
+            ? h(
+                "p",
+                { class: "muted", text: `客观检查：${step.checks.map((item) => item.type).join("、")}` }
+              )
+            : null
+        )
+      )
+    );
+  }
+  return nodes;
+}
+
+function verificationNodes(payload) {
+  const data = payload.verification || {};
+  if (!data.has_run) {
+    return [cardBlock("暂无验证结果", h("p", { class: "muted", text: "执行过步骤之后，这里会列出每一步的客观验收。" }))];
+  }
+  const totals = data.totals || {};
+  const nodes = [
+    cardBlock(
+      "验证汇总",
+      h("p", {
+        text: `共 ${totals.total || 0} 条检查：通过 ${totals.passed || 0}，未通过 ${totals.failed || 0}${
+          totals.unverified ? "（本步没有可自动判定的检查项）" : ""
+        }`,
+      }),
+      data.unverified_steps?.length
+        ? h("p", { class: "muted", text: `未验证的步骤：${data.unverified_steps.join("、")}` })
+        : null
+    ),
+  ];
+  for (const step of data.steps || []) {
+    const items = (step.items || []).map((item) =>
+      h("li", {
+        class: item.ok ? "verify-ok" : "verify-fail",
+        text: `${item.ok ? "✓" : "✗"} ${item.label || item.path}${item.detail ? ` — ${item.detail}` : ""}`,
+      })
+    );
+    nodes.push(
+      cardBlock(
+        `第 ${step.id} 步 · ${step.title || ""}`,
+        items.length ? h("ul", { class: "verify-list" }, ...items) : h("p", { class: "muted", text: "没有可自动判定的检查项（未验证）" })
+      )
+    );
+  }
+  return nodes;
+}
+
+function logsNodes(payload) {
+  const data = payload.logs || {};
+  if (!data.has_run) {
+    return [cardBlock("暂无日志", h("p", { class: "muted", text: "这个项目还没有运行记录。" }))];
+  }
+  const nodes = [
+    cardBlock(
+      "运行指标",
+      h("p", {
+        class: "muted",
+        text: `调用 ${data.metrics?.architect?.calls || 0} + ${data.metrics?.executor?.calls || 0} 次 · 耗时 ${(
+          ((data.metrics?.architect?.duration_ms || 0) + (data.metrics?.executor?.duration_ms || 0)) / 1000
+        ).toFixed(1)} 秒`,
+      })
+    ),
+  ];
+  const messages = (data.messages || []).map((item) =>
+    h(
+      "div",
+      { class: "log-row" },
+      h("div", { class: "run-meta", text: `${item.phase} · ${item.role}${item.model ? ` · ${item.model}` : ""} · ${item.created_at}` }),
+      h("pre", { class: "stream", text: item.content })
+    )
+  );
+  nodes.push(cardBlock("事件与消息", ...(messages.length ? messages : [h("p", { class: "muted", text: "暂无消息。" })])));
+  if (data.commands?.length) {
+    nodes.push(
+      cardBlock(
+        "验证命令",
+        h(
+          "ul",
+          { class: "list" },
+          ...data.commands.map((item) =>
+            h("li", { text: `第 ${item.step_id} 步 ${item.skipped ? "（未执行）" : item.ok ? "✓" : "✗"} ${item.cmd}` })
+          )
+        )
+      )
+    );
+  }
+  return nodes;
+}
+
+function settingsNodes(payload) {
+  const data = payload.settings || {};
+  const project = payload.project || {};
+  const nameInput = h("input", { type: "text", id: "project-name-edit", value: project.name || "" });
+  const dirInput = h("input", {
+    type: "text",
+    id: "project-root-edit",
+    value: project.workspace?.root_path || "",
+    placeholder: "项目工作区根目录",
+  });
+  const descInput = h("input", {
+    type: "text",
+    id: "project-desc-edit",
+    value: project.description || "",
+    placeholder: "项目描述（可选）",
+  });
+  const save = h("button", { class: "btn primary small", type: "button", text: "保存项目设置" });
+  save.addEventListener(
+    "click",
+    safe(async () => {
+      save.disabled = true;
+      try {
+        await api.updateProject(project.project_id, {
+          name: nameInput.value.trim(),
+          description: descInput.value,
+          root_path: dirInput.value.trim() || undefined,
+        });
+        await loadProjects();
+        await loadModulePayload();
+        showToast("项目设置已保存");
+        render();
+      } catch (error) {
+        showToast(error.message);
+      } finally {
+        save.disabled = false;
+      }
+    })
+  );
+  const archive = h("button", { class: "btn ghost small", type: "button", text: "归档项目" });
+  archive.addEventListener(
+    "click",
+    safe(async () => {
+      const ok = await appConfirm({
+        title: "归档项目",
+        message: "归档后项目从列表里收起，运行记录与工作区都保留，可随时恢复。",
+        confirmText: "归档",
+      });
+      if (!ok) return;
+      await api.archiveProject(project.project_id);
+      await loadProjects();
+      await showProjects();
+      showToast("项目已归档");
+    })
+  );
+  return [
+    cardBlock(
+      "项目设置",
+      h("label", { class: "inline-field" }, h("span", { text: "名称" }), nameInput),
+      h("label", { class: "inline-field" }, h("span", { text: "工作区" }), dirInput),
+      h("label", { class: "inline-field" }, h("span", { text: "描述" }), descInput),
+      h("div", { class: "approval-actions" }, save, archive),
+      h("p", { class: "muted", text: `项目 ID：${project.project_id}（稳定标识，不可修改）` })
+    ),
+    cardBlock(
+      "模型路由（全局设置）",
+      h("p", {
+        text: `架构段 ${data.models?.architect?.model || "—"}${data.models?.architect?.host ? ` @ ${data.models.architect.host}` : ""}`,
+      }),
+      h("p", {
+        text: `执行段 ${data.models?.editor?.model || "—"}${data.models?.editor?.host ? ` @ ${data.models.editor.host}` : ""}`,
+      }),
+      h("p", { class: "muted", text: "改模型 / 中转请用右上角标签或 ⚙ 设置：那是全局配置，不随项目变化。" })
+    ),
+  ];
+}
+
+/** 项目模块主区：概览 / 架构 / 计划 / 验证 / 日志 / 设置（执行模块走运行时间线）。 */
+function renderModuleView() {
+  if (!ProjectWorkspace.projectId) return renderProjectListView();
+  const payload = WorkspaceState.modulePayload;
+  if (!payload) {
+    dom.timeline.replaceChildren(
+      h("div", { class: "empty", text: "正在加载项目模块…" })
+    );
+    return;
+  }
+  const module = ProjectWorkspace.module;
+  let nodes = [moduleHeader(payload)];
+  if (module === "overview") nodes = nodes.concat(overviewNodes(payload));
+  else if (module === "architecture") nodes = nodes.concat(architectureNodes(payload));
+  else if (module === "plan") nodes = nodes.concat(planNodes(payload));
+  else if (module === "verification") nodes = nodes.concat(verificationNodes(payload));
+  else if (module === "logs") nodes = nodes.concat(logsNodes(payload));
+  else if (module === "settings") nodes = nodes.concat(settingsNodes(payload));
+  dom.timeline.replaceChildren(...nodes);
 }
 
 function initWorkspace() {
-  const fromUrl = readUrlWorkspace();
-  const storedType = safeReadStorage(STORE_CONTEXT_KEY);
-  const storedProject = safeReadStorage(STORE_PROJECT_KEY);
   const storedSection = safeReadStorage(STORE_SECTION_KEY);
-  const contextType = fromUrl.contextType || (storedType ? normalizeContextType(storedType) : DEFAULT_CONTEXT_TYPE);
-  const projectId = fromUrl.projectId || storedProject || "";
-  ProjectWorkspace.section = PROJECT_SECTIONS.includes(storedSection) ? storedSection : PROJECT_SECTIONS[0];
-
+  ProjectWorkspace.module = PROJECT_SECTIONS.includes(storedSection)
+    ? storedSection
+    : PROJECT_SECTIONS[0];
   bindPrimaryNav();
-  applyWorkspaceContext(contextType, { projectId });
-
-  // #run-list 由运行状态驱动、随时重排，项目候选项跟随刷新
-  const runList = document.getElementById("run-list");
-  if (runList && typeof MutationObserver === "function") {
-    const picker = document.getElementById("project-picker");
-    new MutationObserver(() => {
-      if (picker && !picker.hidden) renderProjectOptions();
-    }).observe(runList, { childList: true, subtree: true });
-  }
+  return (async () => {
+    await loadProjects();
+    await loadChats();
+    // 没有 hash 时按"上次看过的项目"落地，实在没有就停在项目列表
+    if (!location.hash) {
+      const remembered = safeReadStorage(STORE_PROJECT_KEY) || "";
+      const storedType = safeReadStorage(STORE_CONTEXT_KEY);
+      if (storedType === CONTEXT_CHAT) {
+        await enterChat(ProjectWorkspace.chatId, { navigate: false });
+        return;
+      }
+      if (remembered && (WorkspaceState.projects || []).some((p) => p.project_id === remembered)) {
+        await enterProject(remembered, ProjectWorkspace.module, { navigate: false });
+        return;
+      }
+      await showProjects({ navigate: false });
+      return;
+    }
+    await applyRoute();
+  })().catch((error) => {
+    reportClientError("workspace", error);
+    showToast(error.message);
+  });
 }
 
 //: 给后续步骤（项目能力边界 / 兼容验证）用的统一门面
@@ -4481,12 +5310,31 @@ window.OrchestratorContext = {
   get projectId() {
     return ProjectWorkspace.projectId;
   },
-  get section() {
-    return ProjectWorkspace.section;
+  get module() {
+    return ProjectWorkspace.module;
   },
-  switchTo: applyWorkspaceContext,
+  get chatId() {
+    return ProjectWorkspace.chatId;
+  },
+  get projects() {
+    return WorkspaceState.projects;
+  },
+  get chats() {
+    return WorkspaceState.chats;
+  },
+  switchTo: switchWorkspace,
   selectSection: selectProjectSection,
   openProject,
+  openChat: enterChat,
+  createProject: createProjectFromForm,
+  createChat: createChatSession,
+  sendChatMessage,
+  reload: async () => {
+    await loadProjects();
+    await loadChats();
+    await loadModulePayload();
+    render();
+  },
   refresh: initWorkspace,
 };
 

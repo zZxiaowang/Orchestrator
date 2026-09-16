@@ -299,6 +299,124 @@ async function main() {
       check(`元素可点击：${item.id}`, item.found && item.hit, detail);
     }
 
+    // 1a) 工作区导航：一级入口只有两个，项目内二级模块七个（且都能点）
+    await cdp.evaluate(`location.hash = "#/projects"`);
+    await sleep(800);
+    const shell = await cdp.evaluate(`(() => ({
+      primary: Array.from(document.querySelectorAll("#primary-nav .nav-entry")).map(
+        (el) => el.querySelector("strong")?.textContent.trim() || "",
+      ),
+      modules: Array.from(document.querySelectorAll("#project-nav .project-nav-btn")).map(
+        (el) => el.textContent.trim(),
+      ),
+      projects: document.querySelectorAll("#project-options .project-item").length,
+      chatPaneHidden: document.getElementById("chat-pane").hidden,
+      projectPaneShown: !document.getElementById("project-pane").hidden,
+    }))()`);
+    check(
+      "一级入口只有「普通对话 / 项目」，项目内七个二级模块",
+      JSON.stringify(shell.primary) === JSON.stringify(["普通对话", "项目"]) &&
+        JSON.stringify(shell.modules) ===
+          JSON.stringify(["概览", "架构", "计划", "执行", "验证", "日志", "设置"]) &&
+        shell.projects >= 1 &&
+        shell.chatPaneHidden &&
+        shell.projectPaneShown,
+      JSON.stringify(shell),
+    );
+
+    // 选中一个项目并进入「执行」模块：后面所有运行相关检查都在这个上下文里
+    const picked = await cdp.evaluate(`(() => {
+      document.getElementById("project-picker-btn").click();
+      const first = document.querySelector("#project-options .project-item");
+      if (first) first.click();
+      return first ? first.textContent.slice(0, 40) : "";
+    })()`);
+    await sleep(900);
+    await cdp.clickSelector('#project-nav [data-nav-section="execution"]');
+    await sleep(900);
+    const projectRoute = await cdp.evaluate(`location.hash`);
+    check(
+      "选项目后进入其「执行」模块（路由带 projectId）",
+      Boolean(picked) && /#\/projects\/[^/]+\/execution$/.test(projectRoute),
+      `项目=${picked} hash=${projectRoute}`,
+    );
+
+    // 1b) 项目模块不只是导航：架构 / 计划 / 验证 / 日志 / 设置各自渲染真实内容
+    const probeModule = async (module, marker) => {
+      await cdp.clickSelector(`#project-nav [data-nav-section="${module}"]`);
+      await sleep(700);
+      return cdp.evaluate(`(() => {
+        const host = document.getElementById("timeline");
+        return {
+          hash: location.hash,
+          marker: (host.textContent || "").includes(${JSON.stringify(marker)}),
+          cards: host.querySelectorAll(".card").length,
+        };
+      })()`);
+    };
+    for (const [module, marker] of [
+      ["architecture", "纲领目标"],
+      ["plan", "交付物"],
+      ["verification", "验证汇总"],
+      ["logs", "事件与消息"],
+      ["settings", "项目设置"],
+    ]) {
+      const state = await probeModule(module, marker);
+      check(
+        `项目「${module}」模块渲染真实内容`,
+        state.hash.includes(`/${module}`) && state.marker && state.cards > 1,
+        JSON.stringify(state),
+      );
+    }
+    // 回到执行模块（后面的运行列表 / 时间线检查依赖它）
+    await cdp.clickSelector('#project-nav [data-nav-section="execution"]');
+    await sleep(700);
+
+    // 1c) 普通对话：真实会话（新建 → 发消息 → 拿到回答 → 进列表），且不渲染项目控件
+    await cdp.evaluate(`location.hash = "#/chat"`);
+    await sleep(800);
+    const chatShell = await cdp.evaluate(`(() => ({
+      projectPaneHidden: document.getElementById("project-pane").hidden,
+      metaHidden: document.getElementById("composer-meta").hidden,
+      runActions: document.getElementById("run-actions").children.length,
+    }))()`);
+    check(
+      "普通对话不渲染项目控件（没有落地目录 / 运行操作）",
+      chatShell.projectPaneHidden && chatShell.metaHidden && chatShell.runActions === 0,
+      JSON.stringify(chatShell),
+    );
+
+    await cdp.clickSelector("#new-chat-btn");
+    await sleep(700);
+    await cdp.evaluate(`document.getElementById("task-input").focus()`);
+    await cdp.send("Input.insertText", { text: "你是哪个模型" });
+    await cdp.pressKey({ key: "Enter", code: "Enter", virtualKeyCode: 13 });
+    let chatAnswer = null;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      chatAnswer = await cdp.evaluate(`(() => ({
+        hash: location.hash,
+        assistant: document.querySelectorAll("#timeline .card.msg-assistant").length,
+        question: document.querySelectorAll("#timeline .card.msg-user").length,
+      }))()`);
+      if (chatAnswer.assistant >= 1) break;
+      await sleep(300);
+    }
+    check(
+      "普通对话能发消息并拿到回答（会话落到后端）",
+      chatAnswer.hash.startsWith("#/chat/") &&
+        chatAnswer.assistant >= 1 &&
+        chatAnswer.question >= 1,
+      JSON.stringify(chatAnswer),
+    );
+    const chatListed = await cdp.evaluate(
+      `document.querySelectorAll("#chat-list .chat-item").length`,
+    );
+    check("新对话出现在对话列表里", chatListed >= 1, `对话数=${chatListed}`);
+
+    // 回到项目的执行模块
+    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+    await sleep(900);
+
     const modalHidden = await cdp.evaluate(
       `(() => { const m = document.getElementById("settings-modal");
         return { hidden: m.hidden, display: getComputedStyle(m).display }; })()`,
@@ -933,7 +1051,7 @@ async function main() {
       search.value = "不存在的关键词zzz";
       search.dispatchEvent(new Event("input", { bubbles: true }));
       await new Promise((done) => setTimeout(done, 800));
-      const filtered = document.querySelectorAll(".run-item").length;
+      const filtered = document.querySelectorAll("#run-list .run-item").length;
       search.value = "";
       search.dispatchEvent(new Event("input", { bubbles: true }));
       await new Promise((done) => setTimeout(done, 800));

@@ -34,6 +34,7 @@ from app.core.logging import configure_logging, get_logger
 from app.core.plugins import PluginStore
 from app.services.events import EventBus
 from app.services.orchestrator import Orchestrator
+from app.services.projects import ProjectStore
 from app.services.storage import RunStore
 
 logger = get_logger("app.main")
@@ -94,11 +95,15 @@ def create_app(
         app.state.catalog_store = CatalogStore(plugins_root)
         app.state.asset_version = asset_version
         app.state.bus = EventBus()
+        # 项目仓库与运行记录同级（``data/projects.json``）：项目是长期容器，
+        # 运行是账本，两者分开存但都落在同一个数据目录里。
+        app.state.project_store = ProjectStore(Path(store_dir).parent / "projects.json")
         app.state.orchestrator = Orchestrator(
             RunStore(store_dir),
             app.state.bus,
             settings_provider=provider,
             transport=transport,
+            projects=app.state.project_store,
         )
         # 上次进程被杀/重启时留下的"执行中"运行，启动时统一收敛为"已暂停"
         recovered = app.state.orchestrator.recover_interrupted()

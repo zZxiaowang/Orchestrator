@@ -86,3 +86,20 @@
 - 架构、执行、步骤、验证四个以上项目二级模块各自可达且各有独立空状态。
 - `#/runs/:runId`、`#/settings`、`#/plugins` 均按第 5 节重定向。
 - 缺 `context_type` 的历史运行仍能在项目执行模块打开。
+
+### 6.1 落地状态（2026-09-16）
+
+前端已按第 1 节实现 hash 路由（`web/app.js` 的 `parseRoute / applyRoute / setRouteHash`）：
+
+| 路由 | 行为 |
+| --- | --- |
+| `#/chat`、`#/chat/<chatId>` | 普通对话工作区；会话列表来自 `GET /api/v1/chats`，消息经 `POST /api/v1/chats/{id}/messages` 流式返回 |
+| `#/projects` | 项目列表（`GET /api/v1/projects`）+ 新建项目表单 |
+| `#/projects/<projectId>[/<module>]` | 项目内模块；模块数据来自 `GET /api/v1/projects/{id}/modules/{module}` |
+| `#/runs/<runId>` | 重定向：解析出项目后进 `#/projects/<id>/execution`；若是普通对话会话则进 `#/chat/<id>` |
+| `#/settings`、`#/plugins` | 重定向到项目列表并打开设置弹窗 |
+
+模块名以契约的 `overview / architecture / plan / execution / verification / logs / settings` 为准；
+旧名 `steps / verify / events / context` 由后端别名（`project_view.MODULE_ALIASES`）兼容，不会 404。
+界面自检（`scripts/ui_check.mjs`）覆盖：一级入口只有两个、七个二级模块、每个模块渲染出真实内容、
+普通对话不渲染任何项目控件、选项目后路由带 `projectId`。
