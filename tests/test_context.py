@@ -8,7 +8,9 @@ from app.services.context import (
     StepContextBuilder,
     clip,
     clip_head_tail,
+    parse_file_request,
     plan_digest,
+    slice_lines,
 )
 
 
@@ -153,6 +155,41 @@ def test_few_but_long_handoffs_do_not_crash():
 def test_clip_helper():
     assert clip("abc", 10) == "abc"
     assert clip("abcdef", 3).startswith("abc")
+
+
+def test_parse_file_request_understands_line_ranges():
+    """``路径:起始行-结束行`` 是给大文件用的：只看那一段，而不是又给一遍头尾。"""
+
+    assert parse_file_request("app/services/verify.py") == ("app/services/verify.py", None)
+    assert parse_file_request("app/services/verify.py:120-200") == (
+        "app/services/verify.py",
+        (120, 200),
+    )
+    # 只写起始行：默认往后带一段
+    path, span = parse_file_request("app/x.py:10")
+    assert path == "app/x.py"
+    assert span is not None and span[0] == 10 and span[1] > 10
+    # 盘符路径不会被误判成区间
+    assert parse_file_request("C:/work/x.py") == ("C:/work/x.py", None)
+    assert parse_file_request("app/x.py:0-5") == ("app/x.py:0-5", None)
+
+
+def test_slice_lines_gives_exact_original_text():
+    """行区间给的是**原文**（不带行号前缀），edits 的 search 才能命中。"""
+
+    content = "line1\nline2\nline3\nline4\n"
+
+    body, note = slice_lines(content, (2, 3), max_chars=100, path="a.txt")
+
+    assert body == "line2\nline3"
+    assert "第 2-3 行" in note and "共 4 行" in note
+
+
+def test_slice_lines_clamps_out_of_range_requests():
+    body, note = slice_lines("a\nb\nc", (2, 99), max_chars=100, path="a.txt")
+
+    assert body == "b\nc"
+    assert "第 2-3 行" in note
 
 
 def test_files_share_budget_equally_instead_of_first_come_first_served():

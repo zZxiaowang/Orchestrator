@@ -231,7 +231,8 @@ function renderChatThread() {
   const nodes = (chat.messages_list || []).map((message) => chatMessageNode(message));
   // 承接链与上下文账：这段对话从哪来、折叠了多少、上一轮实际发了多少字符
   const contextBits = [];
-  if (chat.folded_turns) contextBits.push(`已折叠 ${chat.folded_turns} 轮为摘要`);
+  // 折叠计数按"条"算（一次折叠会把整批消息并进摘要），换算成轮更符合直觉
+  if (chat.folded_turns) contextBits.push(`已折叠 ${Math.ceil(chat.folded_turns / 2)} 轮为摘要`);
   if (chat.summary_chars) contextBits.push(`摘要 ${chat.summary_chars} 字`);
   if (chat.last_context_chars) contextBits.push(`上一轮发送 ${chat.last_context_chars} 字符`);
   if (contextBits.length || chat.prev_session_id || chat.next_session_id) {

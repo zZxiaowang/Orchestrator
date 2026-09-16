@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import threading
+import time
 from collections import deque
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,7 +26,7 @@ from app.core.config import OVERRIDABLE_FIELDS, Settings, get_settings, settings
 from app.core.errors import AppError, NotFoundError
 from app.core.plugins import PluginStore
 from app.core.providers import KIND_PRESETS
-from app.core.relay import RelayClient
+from app.core.relay import CallStats, RelayClient
 from app.schemas.navigation import (
     PROJECT_LIST_ROUTE,
     PROJECT_MODULE_LABELS,
@@ -162,6 +164,7 @@ class SettingsPatch(BaseModel):
     command_timeout_seconds: float | None = None
     step_command_rounds: int | None = None
     request_timeout_seconds: float | None = None
+    stream_ttfb_seconds: float | None = None
     # 普通对话的长上下文管理（省 token）
     chat_context_enabled: bool | None = None
     chat_window_turns: int | None = None
@@ -290,6 +293,7 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "command_timeout_seconds": settings.command_timeout_seconds,
         "step_command_rounds": settings.step_command_rounds,
         "request_timeout_seconds": settings.request_timeout_seconds,
+        "stream_ttfb_seconds": settings.stream_ttfb_seconds,
         # 普通对话的长上下文管理（省 token）：开关 + 可选项
         "chat_context_enabled": settings.chat_context_enabled,
         "chat_window_turns": settings.chat_window_turns,
@@ -494,41 +498,22 @@ async def update_run_meta(run_id: str, payload: RunMetaRequest, request: Request
 
 @router.post("/settings/test")
 async def test_settings(request: Request) -> dict[str, Any]:
-    """连通性自检：对架构段/执行段各发一次 ``GET /models``（不消耗额度）。"""
+    """连通性自检：架构段/执行段各做一次「模型列表 + 最小生成（非流式/流式）」。
+
+    只测 ``/models`` 会漏掉"列表通、生成不通"的网关（真实事故就是这样），
+    所以这里与 ``/providers/{id}/test`` 共用同一套探针。
+    """
     settings = _settings(request)
     transport = getattr(request.app.state, "relay_transport", None)
     results: dict[str, Any] = {}
     for endpoint in (settings.resolve_architect(), settings.resolve_editor()):
-        if not endpoint.configured:
-            missing = [
-                name
-                for name, value in (
-                    ("base_url", endpoint.base_url),
-                    ("api_key", endpoint.api_key),
-                    ("model", endpoint.model),
-                )
-                if not str(value).strip()
-            ]
-            results[endpoint.role] = {
-                "ok": False,
-                "message": f"配置不完整，缺少：{', '.join(missing)}",
-            }
-            continue
-
-        client = RelayClient(
-            endpoint.base_url,
-            endpoint.api_key,
+        results[endpoint.role] = await _ping_endpoint(
+            base_url=endpoint.base_url,
+            api_key=endpoint.api_key,
             wire_api=endpoint.wire_api,
-            timeout=20,
+            model=endpoint.model,
             transport=transport,
-            model_hint=endpoint.model,
         )
-        try:
-            result = await client.aping()
-        except AppError as exc:
-            result = {"ok": False, "message": exc.message, **exc.details}
-        result["model"] = endpoint.model
-        results[endpoint.role] = result
     return {"results": results, "ok": all(item.get("ok") for item in results.values())}
 
 
@@ -639,8 +624,16 @@ async def _ping_endpoint(
     wire_api: str,
     model: str,
     transport,
+    probe_generation: bool = True,
 ) -> dict[str, Any]:
-    """对一个端点做一次不消耗额度的连通性探测。"""
+    """端点自检：``GET /models`` + 两次**最小生成**（非流式 / 流式）。
+
+    为什么不能只看 ``/models``：真实事故里网关的模型列表 0.8 秒就返回，
+    但 ``/responses`` 的**流式**请求连响应头都不给（一直挂到超时）——
+    只测 ``/models`` 时"测试连接"永远显示绿的，用户要等到跑任务才发现。
+    因此这里各发一次 ``max_tokens=1`` 的生成请求（花费可忽略），
+    把"能不能生成 / 流式能不能出第一个字"直接测出来。
+    """
     missing = [
         name
         for name, value in (("base_url", base_url), ("api_key", api_key), ("model", model))
@@ -666,7 +659,118 @@ async def _ping_endpoint(
     except AppError as exc:
         result = {"ok": False, "message": exc.message, **exc.details}
     result["model"] = model
+    if probe_generation and result.get("ok"):
+        checks = [_probe_row("模型列表", result.get("url", ""), True, 0, "")]
+        checks.append(await _probe_generate(client, model, stream=False))
+        checks.append(await _probe_generate(client, model, stream=True))
+        result["checks"] = checks
+        failed = [item for item in checks if item["level"] == "fail"]
+        result["warnings"] = [item["detail"] for item in checks if item["level"] == "warn"]
+        result["ok"] = not failed
+        if failed:
+            result["message"] = failed[0]["detail"]
     return result
+
+
+#: 生成探针的超时：首字节正常在 1-3 秒，20 秒还没动静就已经是"坏了"，
+#: 也避免用户点一次"测试连接"要等好几分钟。
+PROBE_TIMEOUT_SECONDS = 20.0
+
+
+def _probe_row(
+    name: str,
+    url: str,
+    ok: bool,
+    duration_ms: int,
+    detail: str,
+    *,
+    level: str = "",
+) -> dict[str, Any]:
+    """一条自检结果。
+
+    ``level`` 比 ``ok`` 多一档：``warn`` 表示"能跑，但明显有毛病"
+    （最典型的是流式被网关拒绝、静默降级成一次性请求——用户会觉得"它怎么这么慢"）。
+    """
+
+    grade = level or ("ok" if ok else "fail")
+    return {
+        "name": name,
+        "ok": grade != "fail",
+        "level": grade,
+        "duration_ms": duration_ms,
+        "detail": detail,
+        "url": url,
+    }
+
+
+async def _probe_generate(client: RelayClient, model: str, *, stream: bool) -> dict[str, Any]:
+    """发一次最小生成请求，返回 ``{name, ok, level, duration_ms, detail}``。"""
+
+    name = "生成（流式）" if stream else "生成（非流式）"
+    messages = [{"role": "user", "content": "ping"}]
+    started = time.perf_counter()
+    stats = CallStats()
+    try:
+        if stream:
+            text = await asyncio.wait_for(
+                _drain_stream(client, messages, model, stats=stats), PROBE_TIMEOUT_SECONDS
+            )
+        else:
+            result = await asyncio.wait_for(
+                client.acomplete(
+                    messages, model=model, max_tokens=1, temperature=0.0, stats=stats
+                ),
+                PROBE_TIMEOUT_SECONDS,
+            )
+            text = result.text
+    except TimeoutError:
+        return _probe_row(
+            name,
+            "",
+            False,
+            _elapsed_ms(started),
+            f"{PROBE_TIMEOUT_SECONDS:.0f} 秒内没有任何响应：这个协议/流式组合不可用，"
+            "请在设置里改成「chat_completions」或关掉流式。",
+        )
+    except AppError as exc:
+        return _probe_row(name, "", False, _elapsed_ms(started), exc.message)
+    except Exception as exc:  # noqa: BLE001 - 自检绝不能把接口打成 500
+        return _probe_row(name, "", False, _elapsed_ms(started), f"{exc.__class__.__name__}: {exc}")
+    duration = _elapsed_ms(started)
+    if stream and stats.fell_back_to_sync:
+        # 流式没成，但客户端自己降级成一次性请求跑通了：连接是好的，慢是真的
+        return _probe_row(
+            name,
+            "",
+            True,
+            duration,
+            f"网关不接受流式，已自动降级为非流式（{duration} 毫秒）："
+            "对话会「整段等完才显示」，建议把协议改成 chat_completions 或换配置。",
+            level="warn",
+        )
+    if not (text or "").strip() and not stream:
+        # 非流式拿到空文本：网关回 200 但没内容，同样算不通
+        return _probe_row(name, "", False, duration, "接口返回 200，但没有任何内容。")
+    if not (text or "").strip():
+        return _probe_row(
+            name, "", False, duration, "流式请求结束了，但一个字都没有返回。"
+        )
+    return _probe_row(name, "", True, duration, f"整段用时 {duration} 毫秒")
+
+
+async def _drain_stream(
+    client: RelayClient, messages: list[dict[str, str]], model: str, *, stats: CallStats
+) -> str:
+    """把流式输出收干（自检只关心"有没有东西出来"）。"""
+
+    chunks: list[str] = []
+    async for piece in client.astream_with_fallback(messages, model=model, stats=stats):
+        chunks.append(piece)
+    return "".join(chunks)
+
+
+def _elapsed_ms(started: float) -> int:
+    return max(0, int(round((time.perf_counter() - started) * 1000)))
 
 
 @router.post("/runs", status_code=201)

@@ -11,6 +11,7 @@ from pathlib import Path
 from app.schemas.plan import StepCheck
 from app.services import verify as verify_module
 from app.services.verify import (
+    MAX_SYNTAX_CHECKS,
     derive_checks,
     derive_syntax_checks,
     effective_checks,
@@ -122,6 +123,33 @@ def test_effective_checks_reserves_room_so_compile_is_never_starved():
     )
     assert [item.type for item in checks][-2:] == ["py_compile", "py_compile"]
     assert len(checks) == 4
+
+
+def test_effective_checks_compiles_every_changed_python_file():
+    """写代码类步骤改了多少个 .py，就得过多少次「能编译」——不再被纲领检查挤掉。"""
+
+    declared = [
+        StepCheck(type="file_contains", path=f"docs/a{i}.md", text=f"marker-{i}") for i in range(8)
+    ]
+    changed = [f"src/m{i}.py" for i in range(6)]
+
+    checks = effective_checks(declared, [], changed_paths=changed)
+
+    assert [item.path for item in checks if item.type == "py_compile"] == changed
+    # 纲领声明的检查让位，但仍保底留下 MIN_DECLARED_CHECKS 条
+    assert sum(1 for item in checks if item.type == "file_contains") == 2
+
+
+def test_effective_checks_caps_compile_checks_but_not_at_two():
+    """上限从 2/6 提到 10：一步写 10 个 .py 也能全部过「能编译」。"""
+
+    changed = [f"src/m{i}.py" for i in range(30)]
+
+    checks = effective_checks(None, [], changed_paths=changed)
+
+    compiled = [item for item in checks if item.type == "py_compile"]
+    assert len(compiled) == MAX_SYNTAX_CHECKS
+    assert len(compiled) > 6
 
 
 # ── 逐类检查 ─────────────────────────────────────────────────────────────

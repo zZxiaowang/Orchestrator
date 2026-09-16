@@ -16,6 +16,7 @@ from app.schemas.project import (
     ensure_same_project,
 )
 from app.schemas.step import StepOutput
+from app.services.step_feedback import parse_error_block
 
 EXECUTOR_SYSTEM = """你是一名执行工程师，负责把已经定稿的**纲领**落地成具体产出。
 
@@ -29,7 +30,7 @@ JSON 结构：
 {
   "summary": "这一步实际做了什么（1-3 句）",
   "handoff": "给下一步的接力说明（≤200 字）：改了哪些文件、定下了什么约定、还欠什么",
-  "need_files": ["需要查看的文件路径（可含 * 通配）"],
+  "need_files": ["需要查看的文件路径（可含 * 通配，或「路径:起始行-结束行」）"],
   "need_reason": "为什么需要这些文件",
   "blocked": false,
   "block_reason": "若 blocked 为 true，说明缺什么信息或权限",
@@ -53,7 +54,9 @@ JSON 结构：
   一律会被判不通过，而且会把失败原因回灌给你）。
 - **上下文不足时先索取，不要猜**：如果缺少必读文件的内容，只输出
   `{"need_files": ["路径"], "need_reason": "原因"}`，系统会把文件内容补给你后再继续。
-- `need_files` 要精准（1-3 个文件为宜），不要一次索取整个仓库。
+- `need_files` 要精准（1-3 个文件为宜），不要一次索取整个仓库，也不要重复索取
+  已经给过的文件。大文件只给了「结构索引 + 头尾节选」，要看中间某一段就按结构索引
+  里的行号索取，例如 `app/services/verify.py:120-200`。
 - **新建文件**用 action="create" + content（给出完整内容，不要省略、不要用省略号）。
 - **修改已有文件**优先用 action="update" + edits，search 必须是文件中真实存在的原文片段（含缩进），一次替换一处。
 - 只有整文件重写才明显更安全时才用 content 全量覆盖。
@@ -93,7 +96,8 @@ async def run_step(
         if on_token:
             on_token("\n\n[执行段输出不是合法 JSON，正在强制重试…]\n")
         retry = list(messages)
-        retry.append({"role": "assistant", "content": raw})
+        # 只给头尾片段：执行段的原始输出可能有几十 KB，整段回灌会让重试本身变得很慢
+        retry.append({"role": "assistant", "content": parse_error_block(raw)})
         retry.append(
             {
                 "role": "user",

@@ -97,6 +97,45 @@ class CallStats:
 
         return {key: self.usage_totals.get(key) for key in USAGE_KEYS}
 
+    def snapshot(self) -> CallStats:
+        """复制一份当前进度，用来**之后**算增量（原对象会被继续写入）。"""
+
+        clone = CallStats(
+            calls=self.calls,
+            attempts=self.attempts,
+            duration_ms=self.duration_ms,
+            retries=self.retries,
+            protocol=self.protocol,
+            streamed=self.streamed,
+            fell_back_to_sync=self.fell_back_to_sync,
+            usage_calls=self.usage_calls,
+            output_chars=self.output_chars,
+        )
+        clone.usage_totals = dict(self.usage_totals)
+        return clone
+
+    def since(self, base: CallStats) -> CallStats:
+        """相对 :meth:`snapshot` 的增量。
+
+        用途：同一步里"验收没过 → 再补一轮"的调用发生在第一次记账之后。
+        直接再记一次会把前面的调用**重复累加**，所以这里只取增量补记。
+        """
+
+        delta = CallStats(protocol=self.protocol)
+        delta.calls = max(0, self.calls - base.calls)
+        delta.attempts = max(0, self.attempts - base.attempts)
+        delta.duration_ms = max(0, self.duration_ms - base.duration_ms)
+        delta.retries = max(0, self.retries - base.retries)
+        delta.streamed = self.streamed and not base.streamed
+        delta.fell_back_to_sync = self.fell_back_to_sync and not base.fell_back_to_sync
+        delta.usage_calls = max(0, self.usage_calls - base.usage_calls)
+        delta.output_chars = max(0, self.output_chars - base.output_chars)
+        for key, value in self.usage_totals.items():
+            diff = int(value) - int(base.usage_totals.get(key, 0))
+            if diff:
+                delta.usage_totals[key] = diff
+        return delta
+
 
 @dataclass
 class RelayResult:
@@ -194,6 +233,7 @@ class RelayClient:
         *,
         wire_api: str = "chat_completions",
         timeout: float = 300.0,
+        ttfb_seconds: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         model_hint: str = "",
     ) -> None:
@@ -205,6 +245,9 @@ class RelayClient:
         self.api_key = key
         self.wire_api = wire_api
         self.timeout = timeout
+        #: 流式的"首字节超时"：这段网关常见"收下请求但一直不吐字"，
+        #: 只靠总超时（默认 300 秒）会让用户干等几分钟。设了它就按它来判定"这次尝试失败"。
+        self.ttfb_seconds = float(ttfb_seconds) if ttfb_seconds else None
         self._transport = transport
         #: 仅用于连通性自检时核对"目标模型是否在网关的模型列表里"
         self.model_hint = (model_hint or "").strip()
@@ -287,6 +330,7 @@ class RelayClient:
         ``stats`` 传入时，本次逻辑调用的次数 / HTTP 次数 / 耗时 / usage 都会记进账本。
         """
         emitted = False
+        produced_any = False
         started = time.perf_counter()
         if stats is not None:
             stats.calls += 1
@@ -296,13 +340,23 @@ class RelayClient:
                 messages, model=model, temperature=temperature, stats=stats
             ):
                 emitted = True
+                produced_any = True
                 if stats is not None:
                     # 统计模型产出的字符数：提供方不给 usage 时用它估算 completion tokens
                     stats.output_chars += len(chunk)
                 yield chunk
+            if not produced_any:
+                # 网关 200 但一个 delta 都没给（静默空流）：等同于这次尝试失败，
+                # 否则调用方会拿到"空回答"却以为成功。
+                raise RelayError(
+                    "网关返回了空流（没有收到任何内容）。",
+                    hint="已自动改用一次性请求重试。",
+                )
             return
         except RelayError as exc:
-            if emitted or exc.status_code is None:
+            # 已经有内容输出时不能再重试（会重复输出）；没内容时一律降级到一次性请求：
+            # 超时（首字节超时）、空流、以及"网关拒绝流式"都属于这一类。
+            if emitted or exc.status_code in (401, 403):
                 raise
         finally:
             if stats is not None:
@@ -533,7 +587,7 @@ class RelayClient:
                     stats.attempts += 1
                 try:
                     async with (
-                        self._client() as client,
+                        self._stream_client() as client,
                         client.stream("POST", path, json=current, headers=self._headers()) as resp,
                     ):
                         if resp.status_code in (404, 405):
@@ -695,6 +749,19 @@ class RelayClient:
     def _client(self) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             timeout=self.timeout,
+            transport=self._transport,
+            follow_redirects=True,
+        )
+
+    def _stream_client(self) -> httpx.AsyncClient:
+        """流式专用客户端：读超时用首字节超时（网关不吐字就快速失败）。"""
+
+        if not self.ttfb_seconds:
+            return self._client()
+        return httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                self.timeout, connect=min(15.0, self.ttfb_seconds), read=self.ttfb_seconds
+            ),
             transport=self._transport,
             follow_redirects=True,
         )

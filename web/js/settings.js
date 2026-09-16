@@ -49,6 +49,8 @@ function openSettings(section = "model") {
   document.getElementById("f-mcp-rounds").value = settings.mcp_call_rounds ?? 2;
   document.getElementById("f-mcp-max-calls").value = settings.mcp_max_calls_per_step ?? 3;
   // 上下文预算与验收补轮
+  document.getElementById("f-stream-ttfb").value = settings.stream_ttfb_seconds ?? 30;
+  document.getElementById("f-request-timeout").value = settings.request_timeout_seconds ?? 300;
   document.getElementById("f-verify-rounds").value = settings.step_verify_rounds ?? 2;
   document.getElementById("f-context-budget").value = settings.context_budget_chars ?? 24000;
   document.getElementById("f-file-max").value = settings.file_context_max_chars ?? 2400;
@@ -442,6 +444,8 @@ async function saveProviderForm() {
     mcp_call_rounds: Number(document.getElementById("f-mcp-rounds").value) || 2,
     mcp_max_calls_per_step: Number(document.getElementById("f-mcp-max-calls").value) || 3,
     // 上下文预算与验收补轮
+    stream_ttfb_seconds: Number(document.getElementById("f-stream-ttfb").value) || 30,
+    request_timeout_seconds: Number(document.getElementById("f-request-timeout").value) || 300,
     step_verify_rounds: Number(document.getElementById("f-verify-rounds").value) || 0,
     context_budget_chars: Number(document.getElementById("f-context-budget").value) || 24000,
     file_context_max_chars: Number(document.getElementById("f-file-max").value) || 2400,
@@ -526,22 +530,38 @@ async function testConnection() {
     selectProvider(savedId, true);
     document.getElementById("f-relay-key").value = typedKey;
     const payload = await api.testProvider(savedId);
-    const lines = Object.values(payload.results).map((item) => {
-      const who = item.model ? `${item.model}` : "端点";
-      if (item.ok) {
-        const count = item.model_count ? `${item.model_count} 个模型` : "已连通";
-        const missing = item.has_target_model === false ? "，但模型列表中没有该模型" : "";
-        return `✓ ${who}：${count}${missing}`;
-      }
-      return `✗ ${who}：${item.message || "失败"}`;
-    });
-    result.style.color = payload.ok ? "var(--ok)" : "var(--danger)";
+    const lines = Object.values(payload.results).flatMap((item) => describeProbe(item));
+    const warned = Boolean(
+      payload.warnings?.length ||
+        Object.values(payload.results).some((item) => item.warnings?.length)
+    );
+    result.style.color = !payload.ok ? "var(--danger)" : warned ? "var(--warn)" : "var(--ok)";
     result.textContent = lines.join("　|　");
     renderSettingsStatus(state.settings, payload.ok ? "测试通过 · " : "");
   } catch (error) {
     result.style.color = "var(--danger)";
     result.textContent = error.message;
   }
+}
+
+// 自检结果按条展示：模型列表 / 生成（非流式）/ 生成（流式）。
+// 只报一句"已连通"会漏掉"列表通、生成不通"或"流式被降级"这两类真问题。
+function describeProbe(item) {
+  const who = item.model ? `${item.model}` : "端点";
+  if (!item.checks?.length) {
+    if (item.ok) {
+      const count = item.model_count ? `${item.model_count} 个模型` : "已连通";
+      const missing = item.has_target_model === false ? "，但模型列表中没有该模型" : "";
+      return [`✓ ${who}：${count}${missing}`];
+    }
+    return [`✗ ${who}：${item.message || "失败"}`];
+  }
+  return item.checks.map((row) => {
+    const mark = row.level === "warn" ? "!" : row.ok ? "✓" : "✗";
+    const tail = row.ok ? `${row.duration_ms || 0} 毫秒` : row.detail || "失败";
+    const detail = row.level === "warn" ? `${row.detail}` : tail;
+    return `${mark} ${who} · ${row.name}：${detail}`;
+  });
 }
 
 /* ── 配置的增删与切换 ── */

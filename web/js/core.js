@@ -119,6 +119,10 @@ const state = {
   //: 已完成的步骤默认折叠：执行长任务时，视野留给"正在跑的那一步"。
   //: 记 status 是为了"某步被重跑（done → running）"时自动重新展开，而不是沿用旧选择。
   stepOpen: {},
+  //: 正在执行的步骤：本地的"开始时间 + 索取文件/验收补轮次数"。
+  //: 后端要等一步跑完才落账（指标是完成才写的），这里用事件流做**实时**进度，
+  //: 否则长篇步骤跑起来界面只有一行"执行中"，用户不知道它是不是卡住了。
+  stepLive: {},
   //: 普通折叠卡片（概览里的运行、架构/计划的卡片、架构段原始输出）的展开状态。
   //: 只记用户显式点过的；没点过就按"是否还在输出"决定的默认值走。
   cardOpen: {},
@@ -371,6 +375,12 @@ function streamKeyFor(event) {
 async function boot() {
   bindEvents();
   applySidebarMode();
+  // 运行中每秒走一次：让步骤卡上的「已用 N 秒 / 已生成 X KB」真的在动。
+  // 1 秒一次、且只在有 running 步骤时才重绘，不会回到"逐 token 重排"的老路上。
+  setInterval(() => {
+    const steps = state.run?.steps || [];
+    if (steps.some((step) => step.status === "running")) scheduleRender();
+  }, 1000);
   // 明细面板默认收起；只恢复用户上次的显式选择
   setPanelOpen(localStorage.getItem(PANEL_KEY) === "1");
   try {
@@ -594,4 +604,3 @@ function safe(handler) {
     }
   };
 }
-

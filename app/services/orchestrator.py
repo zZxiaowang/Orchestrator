@@ -51,6 +51,7 @@ from app.schemas.run import (
     StepStatus,
 )
 from app.schemas.step import StepOutput
+from app.services import plan_gate
 from app.services.architect import (
     CHAT_SESSION_SYSTEM,
     build_architect_messages,
@@ -66,13 +67,20 @@ from app.services.chat_context import (
     plan_chat_context,
 )
 from app.services.commands import failure_block, run_allowed
-from app.services.context import StepContextBuilder, clip, clip_head_tail
+from app.services.context import (
+    StepContextBuilder,
+    clip,
+    clip_head_tail,
+    parse_file_request,
+    slice_lines,
+)
 from app.services.events import EventBus
 from app.services.executor import EXECUTOR_SYSTEM, build_step_messages, run_step
 from app.services.gitguard import revert_paths, snapshot
 from app.services.intent import detect_intent
 from app.services.metrics import apply_call, route_of
 from app.services.projects import ProjectStore
+from app.services.step_feedback import clip_raw, output_digest, step_digest
 from app.services.storage import RunStore, new_run_id
 from app.services.verify import effective_checks, failure_text, run_checks, summarize
 from app.services.workspace import Workspace
@@ -364,7 +372,7 @@ class Orchestrator:
                     run_id,
                     "context_folded",
                     **plan.as_event(),
-                    message=f"已把 {plan.folded_now} 轮历史折叠进摘要"
+                    message=f"已把 {plan.folded_now} 条较早消息折叠进摘要"
                     + ("（摘要模型不可用，用了原样折叠）" if plan.degraded else ""),
                 )
             run.messages.append(
@@ -489,6 +497,19 @@ class Orchestrator:
                 }
             )
             plan.normalize()
+
+            # 纲领质量门：把"这一步没法判定 / 粒度失控"的问题在执行前就说清楚。
+            # 只告警不拦截——写进 open_questions，用户能在「架构」模块里看到，
+            # 执行段也能在上下文里看到（自己少写了一条可判定的验收）。
+            gate_warnings = plan_gate.review(plan)
+            if gate_warnings:
+                plan.open_questions = [*plan.open_questions, *gate_warnings]
+                self.bus.publish(
+                    run_id,
+                    "status",
+                    status=run.status.value,
+                    message=f"纲领质量门：{len(gate_warnings)} 条提醒已写入「架构」模块。",
+                )
 
             if run.plan_revision == 0:
                 run.plan_revision = 1
@@ -873,12 +894,22 @@ class Orchestrator:
             )
             messages = [
                 *messages,
-                {"role": "assistant", "content": raw},
+                {
+                    "role": "assistant",
+                    # 只回灌摘要 + 头尾片段：上一轮的原始输出可能有几十 KB，整段塞回去
+                    # 会让这一轮的输入膨胀到几万 token（"看起来卡住"的主因之一）
+                    "content": "（我上一轮的输出，摘要如下）\n"
+                    + output_digest(output)
+                    + "\n```\n"
+                    + clip_raw(raw)
+                    + "\n```",
+                },
                 {
                     "role": "user",
                     "content": self._requested_files_block(workspace, requested, settings)
                     + f"\n\n请继续完成第 {step.id} 步，仍然只输出那一个 JSON 对象。"
-                    "若已足够，请直接给出 files/commands。",
+                    "若已足够，请直接给出 files/commands。"
+                    + self._last_fetch_hint(rounds, settings.step_fetch_rounds),
                 },
             ]
             output, raw = await self._call_executor(
@@ -910,7 +941,14 @@ class Orchestrator:
                 )
                 messages = [
                     *messages,
-                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "assistant",
+                        "content": "（我上一轮的输出，摘要如下）\n"
+                        + output_digest(output)
+                        + "\n```\n"
+                        + clip_raw(raw)
+                        + "\n```",
+                    },
                     {
                         "role": "user",
                         "content": self._tool_results_block(results)
@@ -976,9 +1014,31 @@ class Orchestrator:
                 changed_paths=self._changed_paths(step),
             )
 
+        # 记下验收前的账本：验收没过会在同一步再补一轮调用，那些调用同样是真金白银，
+        # 必须补记进指标（以前这几次调用完全没进账，看板上的 calls/token/耗时都偏小）。
+        before_verify = stats.snapshot()
         results, verdict, verify_rounds = await self._verify_with_repair(
             run, step, workspace, build_checks, client, endpoint, settings, messages, raw, stats
         )
+        if verify_rounds:
+            entry = self._record_metrics(
+                run,
+                stats.since(before_verify),
+                endpoint,
+                phase=PHASE_EXECUTOR,
+                step_id=step.id,
+                context_chars=packet.chars,
+                context_stats=packet.stats,
+                rounds={
+                    "initial": 1,
+                    "fetch": int(fetch_rounds),
+                    "repair": int(command_rounds_used),
+                    "verify": int(verify_rounds),
+                },
+                runner=client,
+            )
+            if entry is not None:
+                step.retries = int(entry.retries or 0)
 
         if output.blocked:
             step.status = StepStatus.BLOCKED
@@ -1044,13 +1104,7 @@ class Orchestrator:
                 continue
             for step in run.steps:
                 if step.status == StepStatus.RUNNING:
-                    step.status = StepStatus.PENDING
-                    step.error = ""
-                    step.summary = ""
-                    step.files = []
-                    step.commands = []
-                    step.fetched_files = []
-                    step.context_chars = 0
+                    step.reset_for_rerun()
             run.status = RunStatus.PAUSED
             run.error = {
                 "code": "interrupted",
@@ -1096,13 +1150,7 @@ class Orchestrator:
 
         for step in run.steps:
             if step.status in (StepStatus.BLOCKED, StepStatus.FAILED):
-                step.status = StepStatus.PENDING
-                step.error = ""
-                step.summary = ""
-                step.notes = []
-                step.commands = []
-                step.files = []
-                step.fetched_files = []
+                step.reset_for_rerun()
         run.error = None
         run.status = RunStatus.EXECUTING
         # 续跑默认一路跑完；需要继续分批就显式再给一个停靠点
@@ -1161,15 +1209,7 @@ class Orchestrator:
             run.user_notes.append(note)
             run.messages.append(RunMessage(role="user", phase="context", content=note))
 
-        target.status = StepStatus.PENDING
-        target.error = ""
-        target.summary = ""
-        target.handoff = ""
-        target.notes = []
-        target.commands = []
-        target.files = []
-        target.fetched_files = []
-        target.context_chars = 0
+        target.reset_for_rerun()
         run.error = None
         run.stop_after_step = step_id if stop_after else None
         run.status = RunStatus.EXECUTING
@@ -1212,20 +1252,7 @@ class Orchestrator:
         if paths:
             summary = revert_paths(workspace.root, paths).as_dict()
 
-        step.status = StepStatus.PENDING
-        step.error = ""
-        step.summary = ""
-        step.handoff = ""
-        step.notes = []
-        step.commands = []
-        step.command_results = []
-        step.files = []
-        step.verification = []
-        step.fetched_files = []
-        step.context_chars = 0
-        step.retries = 0
-        step.started_at = None
-        step.finished_at = None
+        step.reset_for_rerun()
         run.status = RunStatus.PAUSED
         run.error = None
         self.store.save(run)
@@ -1273,8 +1300,7 @@ class Orchestrator:
         # 执行阶段失败：把悬挂在 running 的步骤退回 pending，再从失败处继续
         for step in run.steps:
             if step.status in (StepStatus.RUNNING, StepStatus.BLOCKED, StepStatus.FAILED):
-                step.status = StepStatus.PENDING
-                step.error = ""
+                step.reset_for_rerun()
         run.error = None
         return self.resume(run_id, note="")
 
@@ -1293,9 +1319,14 @@ class Orchestrator:
             # 正在执行的步骤退回 pending：否则会出现"运行已取消、步骤仍显示执行中"的悬挂状态
             for step in run.steps:
                 if step.status == StepStatus.RUNNING:
+                    # 取消 ≠ 回滚：保留 files / git_snapshot（「回滚这一步」还要用它们），
+                    # 只清掉"这一轮没跑完"的结论性字段
                     step.status = StepStatus.PENDING
                     step.error = ""
                     step.summary = ""
+                    step.verification = []
+                    step.started_at = None
+                    step.finished_at = None
             self.store.save(run)
         self.bus.publish(run_id, "status", status=run.status.value, message="已取消。")
         return run
@@ -1315,6 +1346,7 @@ class Orchestrator:
             endpoint.api_key,
             wire_api=endpoint.wire_api,
             timeout=settings.request_timeout_seconds,
+            ttfb_seconds=settings.stream_ttfb_seconds,
             transport=self._transport,
             model_hint=endpoint.model,
         )
@@ -1700,7 +1732,11 @@ class Orchestrator:
             )
             retry_messages = [
                 *messages,
-                {"role": "assistant", "content": raw},
+                {
+                    "role": "assistant",
+                    "content": "（我上一轮的输出，摘要如下；完整 JSON 已省略，按需重发即可）\n"
+                    + step_digest(step),
+                },
                 {
                     "role": "user",
                     "content": self._verify_repair_block(workspace, results)
@@ -1801,7 +1837,11 @@ class Orchestrator:
             )
             retry_messages = [
                 *messages,
-                {"role": "assistant", "content": raw},
+                {
+                    "role": "assistant",
+                    "content": "（我上一轮的输出，摘要如下；完整 JSON 已省略，按需重发即可）\n"
+                    + step_digest(step),
+                },
                 {
                     "role": "user",
                     "content": (
@@ -1833,32 +1873,69 @@ class Orchestrator:
     def _resolve_requested_files(
         workspace: Workspace, patterns: list[str], *, limit: int
     ) -> list[str]:
-        """解析执行段索要的文件：支持精确路径与 ``*`` 通配，全部限定在工作区内。"""
+        """解析执行段索要的文件：精确路径 / ``*`` 通配 / ``路径:起始行-结束行``。
+
+        行区间是给大文件用的：上下文里只给结构索引与头尾节选，模型要改中间段时
+        必须能精确拿到那几行的原文（否则 ``edits`` 里的 search 只能靠猜）。
+        """
+
         tree = workspace.tree(limit=400, max_depth=8)
         matched: list[str] = []
         for raw in patterns:
             pattern = str(raw).strip().replace("\\", "/").lstrip("./")
             if not pattern:
                 continue
+            path, span = parse_file_request(pattern)
+            if span is not None:
+                # 区间写法：只认"文件确实存在"的，并原样保留区间给回灌那一步用
+                if path in tree or workspace.exists(path):
+                    matched.append(f"{path}:{span[0]}-{span[1]}")
+                continue
             if any(ch in pattern for ch in "*?["):
-                for path in tree:
-                    if fnmatch(path, pattern) or fnmatch(path.rsplit("/", 1)[-1], pattern):
-                        matched.append(path)
+                for candidate in tree:
+                    if fnmatch(candidate, pattern) or fnmatch(
+                        candidate.rsplit("/", 1)[-1], pattern
+                    ):
+                        matched.append(candidate)
             elif pattern in tree or workspace.exists(pattern):
                 matched.append(pattern)
         return list(dict.fromkeys(matched))[:limit]
 
     @staticmethod
     def _requested_files_block(workspace: Workspace, paths: list[str], settings: Settings) -> str:
+        """回灌索要的文件；``路径:起始行-结束行`` 只给那一段（行号写在说明里）。"""
+
         chunks: list[str] = []
-        for path in paths:
+        for item in paths:
+            path, span = parse_file_request(item)
             try:
                 content = workspace.read(path)
             except AppError:
                 continue
+            if span is not None:
+                piece, note = slice_lines(
+                    content, span, max_chars=settings.file_context_max_chars, path=path
+                )
+                chunks.append(f"### {note}\n```\n{piece}\n```")
+                continue
             piece = clip_head_tail(content, settings.file_context_max_chars, path=path)
             chunks.append(f"### {path}\n```\n{piece}\n```")
         return "## 你索要的文件\n" + ("\n\n".join(chunks) or "（这些文件当前不存在）")
+
+    @staticmethod
+    def _last_fetch_hint(rounds: int, max_rounds: int) -> str:
+        """最后一轮索取文件时把话说死：别再"再看看"，要就给产出或说清为什么卡住。
+
+        没有这句提醒时，模型会在最后一个名额里继续 `need_files`，白花一轮上下文，
+        最后还是走到"未产出任何改动"的阻塞上——用户看到的就是"它一直在看文件"。
+        """
+
+        if max_rounds <= 0 or rounds < max_rounds - 1:
+            return ""
+        return (
+            "\n（这是最后一次补文件的机会：这一轮请直接给出 files，"
+            "确实缺信息就给 blocked + block_reason，不要再索取文件。）"
+        )
 
     def _write_plan_doc(self, run: Run) -> None:
         if not run.plan:

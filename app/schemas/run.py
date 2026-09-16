@@ -196,6 +196,35 @@ class RunStep(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
+    def reset_for_rerun(self) -> None:
+        """把这一步退回「从未执行」：清掉上一轮留下的**所有派生状态**。
+
+        为什么集中成一个方法：重做这一步 / 补充信息继续 / 恢复被中断的运行 /
+        回滚这一步 都要求"这一步从零再来"。以前四处的清理字段各写了一份，
+        于是出现了自相矛盾的记录——``files`` 清空了、``verification`` 还留着
+        （界面上"0 个文件却有 8 条验收"），``started_at``/``finished_at`` 也
+        残留上一轮的时间（出现 finished_at < started_at）。
+        """
+
+        self.status = StepStatus.PENDING
+        self.error = ""
+        self.summary = ""
+        self.handoff = ""
+        self.notes = []
+        self.commands = []
+        self.command_results = []
+        self.files = []
+        self.verification = []
+        self.fetched_files = []
+        self.skills_used = []
+        self.tool_results = []
+        self.context_chars = 0
+        self.retries = 0
+        #: 锚点会在这一步真正开始执行时重新拍一张，旧的锚点留着只会误导回滚
+        self.git_snapshot = {}
+        self.started_at = None
+        self.finished_at = None
+
 
 class RunMessage(BaseModel):
     model_config = ConfigDict(extra="ignore")

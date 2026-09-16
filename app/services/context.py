@@ -127,6 +127,57 @@ def clip_head_tail(text: str, max_chars: int, *, path: str) -> str:
     return result[:max_chars] if len(result) > max_chars else result
 
 
+#: ``need_files`` 里的「路径:起始行-结束行」写法（行号从 1 开始，结束行可省略）
+FILE_RANGE = re.compile(r"^(?P<path>.+?):(?P<start>\d+)(?:-(?P<end>\d*))?$")
+
+#: 只写起始行（``app/x.py:120``）时默认往后带多少行
+DEFAULT_RANGE_LINES = 120
+
+
+def parse_file_request(raw: str) -> tuple[str, tuple[int, int] | None]:
+    """解析执行段索要的文件：``app/x.py`` 或 ``app/x.py:120-200``。
+
+    为什么需要行区间：大文件在上下文里只给「结构索引 + 头尾节选」，中间段看不到，
+    而修改已有文件又要求 ``edits`` 里的 search 是**原文片段**——模型只能靠猜。
+    有了区间写法，它能先看结构索引，再精确索取那一段。
+
+    只有「冒号后确实是行号」才算区间，所以 ``C:/x.py`` 这类路径不受影响。
+    """
+
+    text = str(raw or "").strip()
+    match = FILE_RANGE.match(text)
+    if not match:
+        return text, None
+    start = int(match.group("start"))
+    if start < 1:
+        return text, None
+    end_raw = match.group("end")
+    end = int(end_raw) if end_raw else start + DEFAULT_RANGE_LINES - 1
+    return match.group("path"), (start, max(start, end))
+
+
+def slice_lines(
+    content: str, span: tuple[int, int], *, max_chars: int, path: str = ""
+) -> tuple[str, str]:
+    """取指定行区间，返回 ``(原文, 说明)``。
+
+    刻意**不加行号前缀**：``edits`` 的 search 必须与文件原文一致，
+    加了前缀反而会让模型把前缀一起写进 search。行号放在说明里。
+    """
+
+    lines = content.splitlines()
+    total = len(lines)
+    start, end = span
+    start = max(1, min(start, total) if total else 1)
+    end = max(start, min(end, total) if total else start)
+    body = "\n".join(lines[start - 1 : end])
+    note = f"{path or '文件'} 的第 {start}-{end} 行（本文件共 {total} 行）"
+    if len(body) > max_chars:
+        body = clip(body, max_chars)
+        note += "；这一段太长，只给了前一部分，可以再要更小的区间"
+    return body, note
+
+
 class StepContextBuilder:
     """按预算装配单步上下文。"""
 
@@ -222,7 +273,13 @@ class StepContextBuilder:
 
         sections: list[str] = []
         if files_body:
-            sections.append(f"## 相关文件当前内容\n{files_body}")
+            # 索取方式只说一次（每个文件都说一遍纯属浪费 token）：
+            # 长文件给「结构索引 + 头尾节选」，中间段按行号索取。
+            sections.append(
+                "## 相关文件当前内容\n（长文件给「结构索引 + 头尾节选」；"
+                "要看中间某段，用 need_files 索取 `路径:起始行-结束行`，行号见结构索引）\n"
+                + files_body
+            )
         if omitted:
             marker = OMIT_MARK.format(count=len(omitted))
             sections.append(marker + "：" + "、".join(dict.fromkeys(omitted))[:400])

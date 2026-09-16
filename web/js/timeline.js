@@ -899,7 +899,7 @@ function renderStepCard(step) {
     h("span", {
       class: "muted",
       text:
-        (STEP_STATUS_TEXT[status] || status) +
+        (status === "running" ? stepLiveText(step) : STEP_STATUS_TEXT[status] || status) +
         (spent ? ` · ${spent}` : "") +
         (step.verification?.length
           ? ` · 验收 ${step.verification.filter((item) => item.ok).length}/${step.verification.length}`
@@ -1151,4 +1151,3 @@ function renderDocsInspector() {
     )
   );
 }
-

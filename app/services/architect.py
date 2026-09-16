@@ -12,6 +12,7 @@ from app.core.errors import PlanParseError
 from app.core.jsonx import extract_json_object
 from app.core.relay import CallStats, RelayClient, unwrap_result
 from app.schemas.plan import ArchitecturePlan
+from app.services.step_feedback import parse_error_block
 
 ARCHITECT_SYSTEM = """你是一名资深架构师，负责把需求转成**纲领性架构**，交给另一位工程师（执行段）落地。
 
@@ -62,6 +63,11 @@ ARCHITECT_SYSTEM = """你是一名资深架构师，负责把需求转成**纲�
   `.py` 文件补一条 py_compile，所以**不需要**重复写它们。
   每步 1-3 条为宜，只写真正能证明"这一步做成了"的检查。
   绝对不要写命令类检查（pytest、npm 等）——系统不会执行命令。
+- 一步的 deliverables 不要超过 6 个：单步产出越多越容易失控
+  （真实事故里一步写了 40–150KB 的产物，最后谁都无法验收）。
+- 交付物是**新建的 .py 模块**时，除了 file_exists 再补一条 `py_import`
+  （例如 {"type": "py_import", "path": "app/foo.py"}）：语法对不等于能用，
+  导入一次才知道"模块级写错了名字""依赖不存在"这类问题。
 - 不要写具体实现代码，也不要指定具体库版本；这些属于执行段的职责。
 - 如果需求信息不足，先在 open_questions 里列出问题，同时给出**可执行的默认方案**，不要因此拒绝输出架构。
 
@@ -329,11 +335,12 @@ async def _retry_as_json(
     """首次流式输出不是合法 JSON 时，改用 JSON 模式重试一次。"""
     retry_messages = list(messages)
     if raw.strip():
-        retry_messages.append({"role": "assistant", "content": raw})
+        # 同执行段：只回头尾片段，避免"为了修 JSON 反而把输入翻好几倍"
+        retry_messages.append({"role": "assistant", "content": parse_error_block(raw)})
     retry_messages.append(
         {
             "role": "user",
-            "content": "上面的输出不是合法 JSON。请只输出那一个 JSON 对象，不要任何其他字符。",
+            "content": "请只输出那一个 JSON 对象，不要任何其他字符（不必复原刚才被省略的中间部分）。",
         }
     )
     if on_token:

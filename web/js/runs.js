@@ -221,6 +221,13 @@ function handleEvent(event) {
         const step = (state.run.steps || []).find((item) => item.id === event.data.step_id);
         if (step) step.status = "running";
       }
+      noteStepLive(event.data.step_id, { startedAt: Date.now(), fetch: 0, verify: 0 });
+      scheduleRender();
+      break;
+    }
+    case "fetch": {
+      // 执行段按需索取文件：这是"第几轮"的实时信号之一
+      noteStepLive(event.data.step_id, { bumpFetch: 1 });
       scheduleRender();
       break;
     }
@@ -266,6 +273,8 @@ function handleEvent(event) {
         const step = (state.run.steps || []).find((item) => item.id === event.data.step_id);
         if (step) step.verification = event.data.results || [];
       }
+      // 第一次 verify 是常规验收，之后每次都是"补一轮"，单独计数
+      noteStepLive(event.data.step_id, { bumpVerify: 1 });
       scheduleRender();
       break;
     }
@@ -342,6 +351,42 @@ function handleEvent(event) {
   }
 }
 
+/** 记录"这一步进行到哪了"：本地开始时间 + 索取文件 / 验收补轮次数。
+ *
+ *  指标（耗时 / token / 轮次）是**跑完才落账**的，长步骤跑起来界面上只有一行
+ *  "执行中"，用户无从判断它是真在干活还是卡住了。这里用事件流做实时进度。
+ */
+function noteStepLive(stepId, patch) {
+  const key = String(stepId);
+  const current = state.stepLive[key] || { startedAt: 0, fetch: 0, verify: 0 };
+  const next = {
+    startedAt: patch.startedAt || current.startedAt || Date.now(),
+    fetch: current.fetch + (patch.bumpFetch || 0),
+    verify: current.verify + (patch.bumpVerify || 0),
+  };
+  state.stepLive[key] = next;
+}
+
+/** 运行中那一步的实时一句话：已生成多少 / 已用多久 / 索取与补轮次数。 */
+function stepLiveText(step) {
+  const live = state.stepLive[String(step.id)] || {};
+  const generated = (state.buffers[`step:${step.id}`] || "").length;
+  const startedAt = Date.parse(step.started_at || "") || live.startedAt || 0;
+  const seconds = startedAt ? Math.max(0, (Date.now() - startedAt) / 1000) : 0;
+  const parts = [`已生成 ${(generated / 1024).toFixed(1)} KB`];
+  if (startedAt) {
+    parts.push(
+      seconds < 60 ? `已用 ${seconds.toFixed(0)} 秒` : `已用 ${Math.floor(seconds / 60)}m${Math.round(seconds % 60)}s`
+    );
+  }
+  const fetchRounds = live.fetch || 0;
+  if (fetchRounds) parts.push(`索取文件 ${fetchRounds} 轮`);
+  // 第一次 verify 是常规验收，第 2 次起才是"补一轮"
+  const repairRounds = Math.max(0, (live.verify || 0) - 1);
+  if (repairRounds) parts.push(`验收补轮 ${repairRounds} 次`);
+  return `执行中 · ${parts.join(" · ")}`;
+}
+
 async function refreshRun() {
   if (!state.run) return;
   try {
@@ -356,4 +401,3 @@ async function refreshRun() {
     showToast(error.message);
   }
 }
-

@@ -335,6 +335,24 @@
             </div>
             <div class="modal-status" id="backup-status"></div>
           </details>
+
+          <hr class="settings-divider" />
+          <h3 class="settings-group-title">超时与重试</h3>
+          <p class="hint">
+            「首字节超时」是判断网关"收下请求却不吐字"的关键：超过它就认定这次尝试失败，
+            立刻改用一次性请求或切换备用配置。<b>没有它的话只能等满总超时</b>，
+            一次卡几分钟就是这样来的。
+          </p>
+          <div class="field-grid">
+            <label class="field">
+              <span>首字节超时（秒，流式）</span>
+              <input id="f-stream-ttfb" type="number" min="5" max="600" />
+            </label>
+            <label class="field">
+              <span>单次请求总超时（秒）</span>
+              <input id="f-request-timeout" type="number" min="5" max="3600" />
+            </label>
+          </div>
           </section>
 
           <section class="settings-section" data-section="command" hidden>

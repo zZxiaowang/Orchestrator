@@ -71,6 +71,33 @@ def test_run_records_architect_and_step_metrics(tmp_path: Path):
         assert all(step["retries"] == 0 for step in run["steps"])
 
 
+def test_verify_repair_round_is_counted_in_metrics(tmp_path: Path):
+    """验收没通过后自动补的那一轮也是真调用，必须进账本。
+
+    历史问题：指标只在"命令执行完、验收之前"记一次，验收补轮的调用、
+    耗时与 token 全部漏记，看板上的数字比实际小。
+    """
+
+    relay = FakeRelay()
+    relay.verify_marker = "MUST_HAVE_TOKEN"
+    relay.plan_checks = [
+        {"type": "file_contains", "path": "steps/step-1.md", "text": "MUST_HAVE_TOKEN"}
+    ]
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post("/api/v1/runs", json={"task": "建立骨架"}).json()["run"]["id"]
+        run = _execute_once(client, run_id)
+        assert run["status"] == "done", run.get("error")
+
+        entry = next(
+            item for item in run["metrics"] if item["phase"] == "executor" and item["step_id"] == 1
+        )
+        assert entry["rounds"]["verify"] >= 1, entry
+        # 首轮 + 补轮 = 至少两次调用（每轮各记 18 total_tokens）
+        assert entry["calls"] >= 2, entry
+        assert (entry["total_tokens"] or 0) >= 36, entry
+        assert entry["route"]["model"] == "deepseek-v4"
+
+
 def test_metrics_endpoint_returns_contract_shape(tmp_path: Path):
     relay = FakeRelay()
     with build_client(tmp_path, relay) as client:

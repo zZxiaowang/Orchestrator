@@ -49,6 +49,8 @@ class FakeRelay:
 
     def __init__(self, *, fence_plan: bool = False, garbage_first_stream: bool = False) -> None:
         self.need_files_once = False
+        #: 覆盖 need_files 里的索取内容（用于验证行区间等写法）
+        self.need_files_request: list[str] | None = None
         self.block_first_executor = False
         self.always_need_files = False
         #: 意图分流的结果（"task" / "chat"）；真实模型判断，测试里固定
@@ -73,6 +75,8 @@ class FakeRelay:
         self.requests: list[dict[str, Any]] = []
         self.fence_plan = fence_plan
         self.garbage_first_stream = garbage_first_stream
+        #: 模拟"网关不接受流式"（连接自检应当降级成告警，而不是报失败）
+        self.reject_stream = False
         self.stream_calls = 0
         self.executor_calls = 0
 
@@ -162,6 +166,10 @@ class FakeRelay:
 
         if body.get("stream"):
             self.stream_calls += 1
+            if self.reject_stream:
+                return httpx.Response(
+                    400, json={"error": {"message": "stream is not supported by this gateway"}}
+                )
             if self.garbage_first_stream and self.stream_calls == 1:
                 content = "我先说说思路，不打算给 JSON。"
             return _sse_response(content)
@@ -217,7 +225,10 @@ class FakeRelay:
             )
         if self.always_need_files:
             return json.dumps(
-                {"need_files": ["src/app.py"], "need_reason": "还要再看看"},
+                {
+                    "need_files": list(self.need_files_request or ["src/app.py"]),
+                    "need_reason": "还要再看看",
+                },
                 ensure_ascii=False,
             )
         if self.block_first_executor and self.executor_calls == 1:
@@ -232,7 +243,7 @@ class FakeRelay:
         if self.need_files_once and self.executor_calls == 1:
             return json.dumps(
                 {
-                    "need_files": ["src/app.py"],
+                    "need_files": list(self.need_files_request or ["src/app.py"]),
                     "need_reason": "需要查看现有实现才能改",
                 },
                 ensure_ascii=False,

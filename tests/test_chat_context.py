@@ -72,17 +72,65 @@ def test_plan_folds_a_batch_and_reports_it():
             history,
             settings=_settings(chat_window_turns=4, chat_fold_batch=4, chat_window_chars=10000),
             previous_summary="旧摘要",
-            total_folded=2,
+            total_folded=0,
             summarize=summarize,
         )
     )
     assert calls == [("旧摘要", 8)]  # 8 条溢出 = 4 轮，正好一批
     assert plan.folded_now == 8
-    assert plan.total_folded == 10
+    assert plan.total_folded == 8
     assert plan.summary.startswith("合并摘要")
     assert len(plan.history) == 8  # 只发窗口内的 4 轮
     assert plan.overflow == history[:8]
     assert plan.degraded is False
+
+
+def test_plan_does_not_re_summarize_the_same_history():
+    """水位线：已经折进摘要的历史不再重复摘要（否则越聊越贵，摘要也会越压越失真）。"""
+
+    calls: list[tuple[str, int]] = []
+
+    async def summarize(previous: str, turns):
+        calls.append((previous, len(turns)))
+        return f"摘要（{len(turns)} 条）"
+
+    history = _history(8, chars=10)  # 16 条
+    settings = _settings(chat_window_turns=4, chat_fold_batch=4, chat_window_chars=10000)
+
+    first = asyncio.run(
+        plan_chat_context(history, settings=settings, total_folded=0, summarize=summarize)
+    )
+    assert first.total_folded == 8
+    assert len(calls) == 1
+
+    # 历史没变：一条都不该再摘
+    again = asyncio.run(
+        plan_chat_context(
+            history,
+            settings=settings,
+            previous_summary=first.summary,
+            total_folded=first.total_folded,
+            summarize=summarize,
+        )
+    )
+    assert len(calls) == 1, "同一批历史被重复摘要了"
+    assert again.folded_now == 0
+    assert again.summary == first.summary
+
+    # 又聊了两条（新的一轮）：只摘那两条新挤出来的
+    grew = [*history, ("user", "新问题"), ("assistant", "新回答")]
+    third = asyncio.run(
+        plan_chat_context(
+            grew,
+            settings=_settings(chat_window_turns=4, chat_fold_batch=2, chat_window_chars=10000),
+            previous_summary=first.summary,
+            total_folded=first.total_folded,
+            summarize=summarize,
+        )
+    )
+    assert calls[-1] == (first.summary, 2)
+    assert third.total_folded == 10
+    assert third.overflow == history[8:10]
 
 
 def test_plan_keeps_everything_when_batch_is_not_reached():

@@ -11,6 +11,9 @@
 关键取舍：
 
 * **折叠是批量的**（默认每次 4 轮）：每轮都调一次摘要模型既贵又抖；
+* **有水位线**：已经折进摘要的那几条不再重复摘要——历史只追加，所以
+  "已折叠条数"就是一个稳定前缀长度。没有它，每一轮都会把同一批老历史重摘一遍，
+  越聊越贵，摘要也越压越失真；
 * **不够一批就先带着发**，宁可这一轮稍贵，也不要平白丢掉上下文；
 * **摘要失败不阻断回答**：退化为确定性折叠（每条取前 200 字），并在提示里写明；
 * **开新会话是摘要撑不住时的重启阀**（摘要累计 > 上限），不是主要省 token 手段——
@@ -37,11 +40,11 @@ class ChatContextPlan:
     history: list[tuple[str, str]] = field(default_factory=list)
     #: 合并后的承接摘要（可能来自上一轮）
     summary: str = ""
-    #: 本次新折叠的轮数（0 = 没有折叠）
+    #: 本次新折叠的**条数**（0 = 没有折叠）
     folded_now: int = 0
-    #: 累计折叠轮数
+    #: 累计折叠条数（同时是"哪几条已经进摘要了"的水位线）
     total_folded: int = 0
-    #: 本次被折叠掉的轮次（供界面展开查看）
+    #: 本次被折叠掉的条数（供界面展开查看）
     overflow: list[tuple[str, str]] = field(default_factory=list)
     #: 摘要生成失败，用了确定性折叠
     degraded: bool = False
@@ -132,13 +135,17 @@ async def plan_chat_context(
         window_turns=getattr(settings, "chat_window_turns", 12),
         window_chars=getattr(settings, "chat_window_chars", 6000),
     )
+    # 水位线：``total_folded`` 是"已经被折进摘要的历史条数"。历史只追加、窗口只保留最新，
+    # 所以它就是溢出部分的前缀长度——只摘前缀之后新增的那些。
+    watermark = max(0, min(int(total_folded or 0), len(overflow)))
+    pending = overflow[watermark:]
     batch = max(1, int(getattr(settings, "chat_fold_batch", 4)))
-    if len(overflow) < batch:
+    if len(pending) < batch:
         # 不够一批就先带着发：宁可这一轮稍贵，也不平白丢上下文
         return ChatContextPlan(
             history=[*overflow, *kept],
             summary=previous_summary,
-            total_folded=total_folded,
+            total_folded=watermark,
             enabled=True,
         )
 
@@ -147,21 +154,21 @@ async def plan_chat_context(
     generated = ""
     if summarize is not None:
         try:
-            generated = await summarize(previous_summary, overflow)
+            generated = await summarize(previous_summary, pending)
         except Exception:  # noqa: BLE001 - 摘要失败绝不能阻断回答
             generated = ""
     if not generated:
         degraded = True
-        summary = fallback_digest(previous_summary, overflow)
+        summary = fallback_digest(previous_summary, pending)
     else:
         summary = generated
 
     return ChatContextPlan(
         history=kept,
         summary=summary,
-        folded_now=len(overflow),
-        total_folded=total_folded + len(overflow),
-        overflow=overflow,
+        folded_now=len(pending),
+        total_folded=watermark + len(pending),
+        overflow=pending,
         degraded=degraded,
         enabled=True,
     )

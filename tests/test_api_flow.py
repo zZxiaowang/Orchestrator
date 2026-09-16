@@ -209,6 +209,35 @@ def test_settings_test_endpoint_reports_connectivity(tmp_path: Path):
             assert "deepseek-v4" in result["models"]
 
 
+def test_connectivity_probe_really_generates(tmp_path: Path):
+    """只测 ``/models`` 会漏掉"列表通、生成不通"的网关，所以必须真的生成一次。"""
+
+    relay = FakeRelay()
+    with build_client(tmp_path, relay) as client:
+        payload = client.post("/api/v1/settings/test").json()
+
+        assert payload["ok"] is True
+        checks = payload["results"]["architect"]["checks"]
+        assert [row["name"] for row in checks] == ["模型列表", "生成（非流式）", "生成（流式）"]
+        assert all(row["level"] == "ok" for row in checks), checks
+
+
+def test_connectivity_probe_warns_when_streaming_is_refused(tmp_path: Path):
+    """网关拒绝流式：连接算通（会自动降级），但要明确告警——这正是"慢"的来源。"""
+
+    relay = FakeRelay()
+    relay.reject_stream = True
+    with build_client(tmp_path, relay) as client:
+        payload = client.post("/api/v1/settings/test").json()
+
+        result = payload["results"]["architect"]
+        assert payload["ok"] is True, result
+        stream_row = result["checks"][2]
+        assert stream_row["level"] == "warn", stream_row
+        assert "自动降级" in stream_row["detail"]
+        assert result["warnings"], result
+
+
 def test_health_reports_config_problems(tmp_path: Path):
     """Key 栏填成地址时，health 也必须报"未就绪"，两个接口口径一致。"""
     relay = FakeRelay()
@@ -570,6 +599,66 @@ def test_step_without_output_is_blocked_not_done(tmp_path: Path):
         assert "未产出任何改动" in step["error"]
         # 已经补过文件（说明循环确实跑了）
         assert step["fetched_files"] == ["src/app.py"]
+
+
+def test_need_files_can_ask_for_a_line_range(tmp_path: Path):
+    """大文件看不到中间段：模型可以按行号索取那一段，回灌的是那几行原文。"""
+
+    project = tmp_path / "project"
+    project.mkdir()
+    body = "\n".join(f"L{number}" for number in range(1, 21))
+    (project / "big.py").write_text(body + "\n", encoding="utf-8")
+
+    relay = FakeRelay()
+    relay.need_files_once = True
+    relay.need_files_request = ["big.py:7-9"]
+    with build_client(tmp_path, relay) as client:
+        run_id = client.post(
+            "/api/v1/runs", json={"task": "改造现有项目", "target_dir": str(project)}
+        ).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        run = wait_for_status(client, run_id, TERMINAL)
+
+        step = run["steps"][0]
+        assert step["fetched_files"] == ["big.py:7-9"], step["fetched_files"]
+
+        # 回灌里带着"第 7-9 行"的说明与那三行原文，而不是又一次头尾节选
+        followups = [
+            item
+            for item in relay.requests
+            if "你索要的文件" in item["body"]["messages"][-1]["content"]
+        ]
+        assert followups, "应当有一轮把索要的文件回灌给执行段"
+        block = followups[-1]["body"]["messages"][-1]["content"]
+        assert "第 7-9 行" in block
+        assert "L7\nL8\nL9" in block
+        assert "L1\n" not in block
+
+
+def test_last_fetch_round_tells_the_model_to_stop_asking(tmp_path: Path):
+    """最后一个补文件名额要把话说死，否则它会继续"再看看"，白烧一轮上下文。"""
+
+    project = tmp_path / "project"
+    (project / "src").mkdir(parents=True)
+    (project / "src" / "app.py").write_text("ORIGINAL = 1\n", encoding="utf-8")
+
+    relay = FakeRelay()
+    relay.always_need_files = True
+    with build_client(tmp_path, relay, settings_overrides={"step_fetch_rounds": 1}) as client:
+        run_id = client.post(
+            "/api/v1/runs", json={"task": "改造现有项目", "target_dir": str(project)}
+        ).json()["run"]["id"]
+        wait_for_status(client, run_id, {"awaiting_approval"})
+        client.post(f"/api/v1/runs/{run_id}/approve", json={"feedback": ""})
+        wait_for_status(client, run_id, TERMINAL)
+
+        asks = [
+            item
+            for item in relay.requests
+            if "最后一次补文件的机会" in item["body"]["messages"][-1]["content"]
+        ]
+        assert asks, "最后一个补文件名额应当带上明确提示"
 
 
 def test_retry_step_can_redo_one_step_then_resume(tmp_path: Path):

@@ -41,13 +41,15 @@ MAX_INSPECT_CHARS = 2_000_000
 #: 一步最多自动跑多少条检查，防止纲领里塞进几十条把执行拖慢
 MAX_CHECKS_PER_STEP = 8
 
-#: 给"本步真的写过的 .py 文件"预留的「能编译」名额。
-#: 为什么要预留：纲领自己声明的检查排在前面，一旦把名额占满，语法错误这类
-#: 最该拦住的问题反而永远排不上——而这一步恰好是"写代码类步骤"的最低门槛。
-SYNTAX_CHECKS_RESERVE = 2
+#: 一步最多补多少条「能编译」检查。
+#: 「能编译」是写代码类步骤的最低门槛，且只做 compile、不执行任何代码，
+#: 所以名额给得比一般检查宽：写了 10 个文件就该过 10 个（再多也还有上限）。
+MAX_SYNTAX_CHECKS = 10
 
-#: 一步最多补多少条语法检查（写了 20 个 .py 也不必验 20 次）
-MAX_SYNTAX_CHECKS = 6
+#: 就算这一步写了一堆 .py，也至少给纲领自己声明的检查留这么多条。
+#: （以前「能编译」和纲领检查共用 8 个名额、只预留 2 条：一步改 6 个文件，
+#: 纲领声明的检查就被挤光了。现在改成两笔独立预算。）
+MIN_DECLARED_CHECKS = 2
 
 #: 导入检查的超时（秒）：导入会执行模块顶层代码，必须有上限
 IMPORT_TIMEOUT_SECONDS = 30.0
@@ -169,8 +171,12 @@ def effective_checks(
     syntax = [
         check for check in derive_syntax_checks(changed_paths) if _check_key(check) not in seen
     ]
-    room = max(1, limit - min(len(syntax), SYNTAX_CHECKS_RESERVE)) if syntax else limit
-    return [*merged[:room], *syntax][: max(1, limit)]
+    if not syntax:
+        return merged[: max(1, limit)]
+    # 「能编译」单独占预算：纲领声明的检查最多让到 limit - len(syntax) 条，
+    # 但至少保住 MIN_DECLARED_CHECKS 条，避免整步只剩语法检查。
+    room = max(MIN_DECLARED_CHECKS, limit - len(syntax))
+    return [*merged[:room], *syntax]
 
 
 def run_checks(

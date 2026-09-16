@@ -123,6 +123,7 @@ OVERRIDABLE_FIELDS = (
     "command_timeout_seconds",
     "step_command_rounds",
     "step_verify_rounds",
+    "stream_ttfb_seconds",
     "request_timeout_seconds",
     "context_budget_chars",
     "file_context_max_chars",
@@ -202,6 +203,9 @@ class Settings(BaseSettings):
 
     # ── 行为 ──
     request_timeout_seconds: float = 300.0
+    #: 流式的"首字节超时"（秒）：网关收下请求却一直不吐字时，按它判定这次尝试失败并切换
+    #: （没有它的话只能等满 request_timeout_seconds，用户体感就是"卡住"）
+    stream_ttfb_seconds: float = 30.0
     max_plan_steps: int = 8
     #: 默认**不**自动执行模型给出的命令，避免不可控副作用
     allow_command_execution: bool = False
@@ -321,6 +325,15 @@ class Settings(BaseSettings):
                 details={
                     "field": "request_timeout_seconds",
                     "value": self.request_timeout_seconds,
+                },
+            )
+
+        if not 5 <= self.stream_ttfb_seconds <= 600:
+            raise ConfigurationError(
+                "STREAM_TTFB_SECONDS 必须在 5~600 之间（流式的首字节超时）。",
+                details={
+                    "field": "stream_ttfb_seconds",
+                    "value": self.stream_ttfb_seconds,
                 },
             )
 
