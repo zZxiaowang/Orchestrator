@@ -488,11 +488,13 @@ footArea
 ├── sidebar-route（当前配置 · 地址）
 ├── quick-switch（切换中转 / 个人 Key 直连）
 ├── footer-actions   ← 槽位 data-slot="sidebar.footer.action"
-│     market（插件市场） / plugins（已装插件） / updates（版本） + 插件贡献的入口
+│     capabilities（能力中心） / git（Git） / updates（版本） + 插件贡献的入口
 └── settings-area    ← 槽位 data-slot="sidebar.settings" → settings
 ```
 
-- 每个入口带稳定锚点：`data-entry="market|plugins|updates"`、`data-seat="settings"`，插件入口用 `data-entry="<plugin-id>"`。
+- 每个入口带稳定锚点：`data-entry="capabilities|git|updates"`、`data-seat="settings"`，插件入口用 `data-entry="<plugin-id>"`。
+- **插件市场与已装插件已并进「能力中心」**（插件分页里有「打开插件市场（legacy）」入口）：
+  侧栏底部不再为历史形态单独占两个按钮。
 - **可折叠成图标栏**：点折叠按钮后 `#sidebar[data-wide="false"]`，宽度 60px，只留图标与运行状态点；
   折叠态**保留展开按钮**（否则就成了单向门）；状态记忆在 localStorage。
 - 位置调整：设置入口从顶栏移到底部（与 dsh 一致），顶栏只保留标题、路由徽章。

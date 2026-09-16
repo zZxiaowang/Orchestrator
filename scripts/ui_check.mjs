@@ -395,11 +395,12 @@ async function main() {
 
     // 1b2) 架构 / 计划里的卡片：默认折叠，点标题行原地展开（不跳模块）
     const collapsedModules = {};
-    for (const module of ["architecture", "plan"]) {
+    // 折叠规则统一：架构 / 计划 / 验证 / 日志 的条目默认都收起来（点标题原地展开）
+    for (const module of ["architecture", "plan", "verification", "logs"]) {
       await cdp.clickSelector(`#project-nav [data-nav-section="${module}"]`);
       await sleep(600);
       collapsedModules[module] = await cdp.evaluate(`(() => {
-        const cards = Array.from(document.querySelectorAll("#timeline > .card"));
+        const cards = Array.from(document.querySelectorAll("#timeline .card"));
         // 第一个 card 是模块头（不可折叠），所以按"有可折叠标题行"来挑
         const heads = cards
           .map((card) => card.querySelector('.card-head[role="button"]'))
@@ -424,7 +425,7 @@ async function main() {
         return { before, after };
       })()`);
     }
-    for (const module of ["architecture", "plan"]) {
+    for (const module of ["architecture", "plan", "verification", "logs"]) {
       const state = collapsedModules[module];
       check(
         `「${module}」卡片默认折叠、点标题原地展开（不跳转）`,
@@ -480,6 +481,25 @@ async function main() {
     // 回到执行模块（后面的运行列表 / 时间线检查依赖它）
     await cdp.clickSelector('#project-nav [data-nav-section="execution"]');
     await sleep(700);
+
+    // 1b4) 四态：项目不存在时给错误态 + 重试（而不是一直"正在加载"）
+    await cdp.evaluate(`location.hash = "#/projects/not-exist-project/execution"`);
+    await sleep(1300);
+    const errorState = await cdp.evaluate(`(() => {
+      const text = document.getElementById("timeline").textContent || "";
+      const buttons = Array.from(document.querySelectorAll("#timeline button")).map((el) =>
+        el.textContent.trim(),
+      );
+      return { hash: location.hash, hasError: text.includes("模块加载失败"), buttons };
+    })()`);
+    check(
+      "项目不存在时是错误态（可重试）+ 能回到项目列表",
+      errorState.hasError && errorState.buttons.includes("重试") && errorState.buttons.includes("回到项目列表"),
+      JSON.stringify(errorState),
+    );
+    // 回到真实项目
+    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+    await sleep(1000);
 
     // 1c) 普通对话：真实会话（新建 → 发消息 → 拿到回答 → 进列表），且不渲染项目控件
     await cdp.evaluate(`location.hash = "#/chat"`);
@@ -923,14 +943,15 @@ async function main() {
         };
       };
       return {
-        market: hit('[data-entry="market"]'),
-        plugins: hit('[data-entry="plugins"]'),
+        capabilities: hit('[data-entry="capabilities"]'),
+        git: hit('[data-entry="git"]'),
         updates: hit('[data-entry="updates"]'),
         settings: hit('[data-seat="settings"]'),
         wide: document.getElementById("sidebar").dataset.wide,
       };
     })()`);
-    for (const key of ["market", "plugins", "updates", "settings"]) {
+    // 侧栏底部只剩「能力中心 / Git / 更新 / 设置」：插件市场与已装插件已并进能力中心
+    for (const key of ["capabilities", "git", "updates", "settings"]) {
       const info = slots[key];
       check(
         `侧栏槽位可点击：${key}`,
@@ -946,14 +967,14 @@ async function main() {
     const rail = await cdp.evaluate(`(() => {
       const sidebar = document.getElementById("sidebar");
       const label = document.querySelector(".foot-label");
-      const el = document.querySelector('[data-entry="market"]');
+      const el = document.querySelector('[data-entry="capabilities"]');
       const r = el ? el.getBoundingClientRect() : null;
       const top = r ? document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2) : null;
       return {
         wide: sidebar.dataset.wide,
         appCollapsed: document.querySelector(".app").classList.contains("collapsed"),
         labelHidden: label ? getComputedStyle(label).display === "none" : null,
-        marketHit: Boolean(el && (top === el || el.contains(top))),
+        entryHit: Boolean(el && (top === el || el.contains(top))),
         width: Math.round(sidebar.getBoundingClientRect().width),
       };
     })()`);
@@ -962,14 +983,26 @@ async function main() {
       rail.wide === "false" && rail.appCollapsed === true && rail.labelHidden === true,
       JSON.stringify(rail),
     );
-    check("折叠后槽位依然可点击", rail.marketHit === true, JSON.stringify(rail));
+    check("折叠后槽位依然可点击", rail.entryHit === true, JSON.stringify(rail));
     await cdp.clickSelector("#sidebar-toggle");
     await sleep(300);
     const restored = await cdp.evaluate(`document.getElementById("sidebar").dataset.wide`);
     check("再次点击恢复展开", restored === "true", String(restored));
 
-    // 3d) 插件市场：打开 → 列出内置插件 → 安装 → 侧栏出现入口 → 禁用后消失 → 卸载
-    const marketOpen = await cdp.clickSelector("#market-btn");
+    // 3d) 插件市场（已并进能力中心）：能力中心 → 插件分页 → 打开市场 → 列出内置插件
+    await cdp.clickSelector("#capabilities-btn");
+    await sleep(500);
+    const marketOpen = await cdp.evaluate(`(() => {
+      const tab = document.querySelector('#capability-kinds .tab[data-kind="plugin"]');
+      if (!tab) return { hit: false, reason: "缺少插件分页" };
+      tab.click();
+      const button = Array.from(document.querySelectorAll("#capabilities-body button")).find(
+        (el) => el.textContent.includes("打开插件市场"),
+      );
+      if (!button) return { hit: false, reason: "缺少市场入口" };
+      button.click();
+      return { hit: true };
+    })()`);
     await sleep(1500);
     const marketState = await cdp.evaluate(`(() => ({
       visible: !document.getElementById("market-modal").hidden,
@@ -977,7 +1010,7 @@ async function main() {
       sources: document.querySelectorAll(".source-row").length,
     }))()`);
     check(
-      "打开插件市场并列出内置插件",
+      "能力中心能打开插件市场并列出内置插件",
       marketOpen.hit && marketState.visible && marketState.cards >= 3,
       JSON.stringify(marketState),
     );
@@ -1146,7 +1179,7 @@ async function main() {
       };
     })()`);
     check(
-      "切到「命令与安全」只显示该区字段",
+      "切到「执行与验收」只显示该区字段",
       switchToCommand.hit &&
         JSON.stringify(commandSection.visible) === JSON.stringify(["command"]) &&
         commandSection.allowlistShown &&
@@ -1315,6 +1348,30 @@ async function main() {
     })()`);
     await cdp.clickSelector("#settings-save");
     await sleep(500);
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(250);
+
+    // 3f2) 设置四区收敛：预算 / 验收补轮字段可在界面上改（以前只能改 .env）
+    await cdp.clickSelector("#settings-btn");
+    await sleep(400);
+    const budgetUi = await cdp.evaluate(`(() => {
+      const ids = ["f-context-budget", "f-file-max", "f-completed-log", "f-fetch-rounds"];
+      const read = (id) => {
+        const el = document.getElementById(id);
+        return el ? Boolean(el.value) : null;
+      };
+      const nav = Array.from(document.querySelectorAll("#settings-nav .settings-nav-item")).map(
+        (el) => el.textContent.trim(),
+      );
+      return { nav, values: ids.map(read) };
+    })()`);
+    check(
+      "设置四区收敛且上下文预算可见可改",
+      JSON.stringify(budgetUi.nav) ===
+        JSON.stringify(["模型与路由", "执行与验收", "上下文与记忆", "能力与集成"]) &&
+        budgetUi.values.every((value) => value === true),
+      JSON.stringify(budgetUi),
+    );
     await cdp.clickSelector("#settings-cancel");
     await sleep(250);
 

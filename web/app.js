@@ -419,6 +419,10 @@ function bindEvents() {
     closeSettings();
     openMarket("market");
   });
+  on("settings-open-capabilities", "click", () => {
+    closeSettings();
+    openCapabilities();
+  });
   on("settings-open-git", "click", () => {
     closeSettings();
     openGitPanel();
@@ -462,13 +466,11 @@ function bindEvents() {
     localStorage.setItem(SIDEBAR_KEY, state.sidebarWide ? "1" : "0");
     applySidebarMode();
   });
-  on("market-btn", "click", () => openMarket("market"));
   on("capabilities-btn", "click", () => openCapabilities());
   on("capabilities-close", "click", closeCapabilities);
   on("capabilities-modal", "click", (event) => {
     if (event.target.id === "capabilities-modal") closeCapabilities();
   });
-  on("plugins-btn", "click", () => openMarket("installed"));
   on("git-btn", "click", openGitPanel);
   on("git-close", "click", closeGitPanel);
   on("git-modal", "click", (event) => {
@@ -1121,6 +1123,13 @@ function renderTimeline() {
   if (ProjectWorkspace.contextType === CONTEXT_CHAT) {
     lastTimelineSignature = "";
     renderChatThread();
+    return;
+  }
+  // 项目模块加载失败（例如项目不存在）：直接进错误态，不要落到"运行时间线"这种空视图
+  if (WorkspaceState.moduleError) {
+    lastTimelineSignature = "";
+    lastModuleSignature = "";
+    renderModuleView();
     return;
   }
   if (ProjectWorkspace.module !== "execution" || !ProjectWorkspace.projectId) {
@@ -2262,6 +2271,12 @@ function openSettings(section = "model") {
   document.getElementById("f-mcp-enabled").checked = settings.mcp_enabled !== false;
   document.getElementById("f-mcp-rounds").value = settings.mcp_call_rounds ?? 2;
   document.getElementById("f-mcp-max-calls").value = settings.mcp_max_calls_per_step ?? 3;
+  // 上下文预算与验收补轮
+  document.getElementById("f-verify-rounds").value = settings.step_verify_rounds ?? 2;
+  document.getElementById("f-context-budget").value = settings.context_budget_chars ?? 24000;
+  document.getElementById("f-file-max").value = settings.file_context_max_chars ?? 2400;
+  document.getElementById("f-completed-log").value = settings.completed_log_max_chars ?? 1200;
+  document.getElementById("f-fetch-rounds").value = settings.step_fetch_rounds ?? 3;
   document.getElementById("f-allow-cmd").checked = Boolean(settings.allow_command_execution);
   document.getElementById("f-command-allowlist").value = (
     settings.command_allowlist || []
@@ -2649,6 +2664,12 @@ async function saveProviderForm() {
     mcp_enabled: document.getElementById("f-mcp-enabled").checked,
     mcp_call_rounds: Number(document.getElementById("f-mcp-rounds").value) || 2,
     mcp_max_calls_per_step: Number(document.getElementById("f-mcp-max-calls").value) || 3,
+    // 上下文预算与验收补轮
+    step_verify_rounds: Number(document.getElementById("f-verify-rounds").value) || 0,
+    context_budget_chars: Number(document.getElementById("f-context-budget").value) || 24000,
+    file_context_max_chars: Number(document.getElementById("f-file-max").value) || 2400,
+    completed_log_max_chars: Number(document.getElementById("f-completed-log").value) || 1200,
+    step_fetch_rounds: Number(document.getElementById("f-fetch-rounds").value) || 0,
     allow_command_execution: document.getElementById("f-allow-cmd").checked,
     command_allowlist: String(document.getElementById("f-command-allowlist").value || "")
       .split("\n")
@@ -3716,6 +3737,40 @@ function renderCapabilities(payload) {
     // MCP 页顶部给"从预设添加服务器"的入口
     if (kind === "mcp") {
       listHost.replaceChildren(mcpAddForm());
+      if (filtered.length) listHost.append(...filtered.map(capabilityNode));
+      return;
+    }
+    // 插件页：市场入口收进能力中心（侧栏不再单独占两个按钮）
+    if (kind === "plugin") {
+      // 注意别把按钮变量叫 openMarket：那会遮蔽同名函数，点一下直接 TypeError
+      const marketBtn = h("button", {
+        class: "btn primary small",
+        type: "button",
+        text: "打开插件市场（legacy）",
+      });
+      marketBtn.addEventListener(
+        "click",
+        safe(() => {
+          closeCapabilities();
+          openMarket("market");
+        })
+      );
+      listHost.replaceChildren(
+        h(
+          "div",
+          { class: "card" },
+          h("div", { class: "card-head" }, h("strong", { text: "插件市场（历史形态）" })),
+          h(
+            "div",
+            { class: "card-body" },
+            h("p", {
+              class: "hint",
+              text: "插件是旧形态：只登记界面入口与能力声明，不下载、不执行第三方代码。新能力请优先用 skill 或 MCP；这里保留兼容。",
+            }),
+            h("div", { class: "approval-actions" }, marketBtn)
+          )
+        )
+      );
       if (filtered.length) listHost.append(...filtered.map(capabilityNode));
       return;
     }
@@ -4859,7 +4914,10 @@ const WorkspaceState = {
   projects: [],
   chats: [],
   modulePayload: null,
+  //: 模块加载失败的原因（四态里的"错误态"：可重试，而不是一直转圈）
+  moduleError: "",
   chatPayload: null,
+  chatError: "",
 };
 
 function safeReadStorage(key) {
@@ -5161,10 +5219,12 @@ async function loadChatDetail(chatId) {
   try {
     const payload = await api.chat(chatId);
     WorkspaceState.chatPayload = payload.chat;
+    WorkspaceState.chatError = "";
     connectStream(chatId, payload.event_seq || 0, { chat: true });
   } catch (error) {
     reportClientError("chat", error);
     WorkspaceState.chatPayload = null;
+    WorkspaceState.chatError = error.message;
     showToast(error.message);
   }
 }
@@ -5173,12 +5233,15 @@ async function loadModulePayload() {
   const projectId = ProjectWorkspace.projectId;
   if (!projectId) {
     WorkspaceState.modulePayload = null;
+    WorkspaceState.moduleError = "";
     return null;
   }
   try {
     WorkspaceState.modulePayload = await api.projectModule(projectId, ProjectWorkspace.module);
+    WorkspaceState.moduleError = "";
   } catch (error) {
     WorkspaceState.modulePayload = null;
+    WorkspaceState.moduleError = error.message;
     reportClientError("project-module", error);
     showToast(error.message);
   }
@@ -5587,6 +5650,31 @@ function chatMessageNode(message) {
 function renderChatThread() {
   const chat = WorkspaceState.chatPayload;
   if (!chat) {
+    // 错误态：会话加载失败时给出原因与重试，不装成"新对话"
+    if (WorkspaceState.chatError) {
+      const retry = h("button", { class: "btn primary small", type: "button", text: "重试" });
+      retry.addEventListener(
+        "click",
+        safe(async () => {
+          await loadChatDetail(ProjectWorkspace.chatId);
+          render();
+        })
+      );
+      dom.timeline.replaceChildren(
+        h(
+          "div",
+          { class: "card" },
+          h("div", { class: "card-head" }, h("strong", { text: "对话加载失败" })),
+          h(
+            "div",
+            { class: "card-body" },
+            h("div", { class: "error-box", text: WorkspaceState.chatError }),
+            h("div", { class: "approval-actions" }, retry)
+          )
+        )
+      );
+      return;
+    }
     lastChatSignature = "";
     dom.timeline.replaceChildren(
       cardBlock(
@@ -5960,10 +6048,18 @@ function verificationNodes(payload) {
       })
     );
     nodes.push(
-      cardBlock(
-        `第 ${step.id} 步 · ${step.title || ""}`,
-        items.length ? h("ul", { class: "verify-list" }, ...items) : h("p", { class: "muted", text: "没有可自动判定的检查项（未验证）" })
-      )
+      collapsibleCard(`verify:step:${step.id}`, `第 ${step.id} 步 · ${step.title || ""}`, {
+        subtitle: step.summary
+          ? `验收 ${step.summary.passed}/${step.summary.total}${
+              step.summary.failed ? "（有未通过项）" : " 全部通过"
+            }`
+          : "未验证（没有可自动判定的检查项）",
+        children: [
+          items.length
+            ? h("ul", { class: "verify-list" }, ...items)
+            : h("p", { class: "muted", text: "没有可自动判定的检查项（未验证）" }),
+        ],
+      })
     );
   }
   return nodes;
@@ -5985,15 +6081,19 @@ function logsNodes(payload) {
       })
     ),
   ];
-  const messages = (data.messages || []).map((item) =>
-    h(
-      "div",
-      { class: "log-row" },
-      h("div", { class: "run-meta", text: `${item.phase} · ${item.role}${item.model ? ` · ${item.model}` : ""} · ${item.created_at}` }),
-      h("pre", { class: "stream", text: item.content })
+  // 日志条目同样折叠：折叠行是"阶段 · 角色 · 时间"，展开才看正文（与其它模块一致）
+  const messages = (data.messages || []).map((item, index) =>
+    collapsibleCard(`log:${index}`, `${item.phase} · ${item.role}`, {
+      subtitle: `${item.model ? `${item.model} · ` : ""}${item.created_at}`,
+      children: [h("pre", { class: "stream", text: item.content })],
+    })
+  );
+  nodes.push(
+    cardBlock(
+      "事件与消息",
+      ...(messages.length ? messages : [h("p", { class: "muted", text: "暂无消息。" })])
     )
   );
-  nodes.push(cardBlock("事件与消息", ...(messages.length ? messages : [h("p", { class: "muted", text: "暂无消息。" })])));
   if (data.commands?.length) {
     nodes.push(
       cardBlock(
@@ -6095,6 +6195,37 @@ function renderModuleView() {
   }
   const payload = WorkspaceState.modulePayload;
   if (!payload) {
+    // 错误态：说清原因 + 可重试，而不是一直显示"正在加载"
+    if (WorkspaceState.moduleError) {
+      const retry = h("button", { class: "btn primary small", type: "button", text: "重试" });
+      retry.addEventListener(
+        "click",
+        safe(async () => {
+          await loadModulePayload();
+          render();
+        })
+      );
+      const back = h("button", {
+        class: "btn ghost small",
+        type: "button",
+        text: "回到项目列表",
+      });
+      back.addEventListener("click", safe(() => showProjects()));
+      dom.timeline.replaceChildren(
+        h(
+          "div",
+          { class: "card" },
+          h("div", { class: "card-head" }, h("strong", { text: "模块加载失败" })),
+          h(
+            "div",
+            { class: "card-body" },
+            h("div", { class: "error-box", text: WorkspaceState.moduleError }),
+            h("div", { class: "approval-actions" }, retry, back)
+          )
+        )
+      );
+      return;
+    }
     lastModuleSignature = "";
     dom.timeline.replaceChildren(
       h("div", { class: "empty", text: "正在加载项目模块…" })

@@ -173,6 +173,13 @@ class SettingsPatch(BaseModel):
     mcp_enabled: bool | None = None
     mcp_call_rounds: int | None = None
     mcp_max_calls_per_step: int | None = None
+    # 每步上下文预算（省 token 的基本盘）
+    context_budget_chars: int | None = None
+    file_context_max_chars: int | None = None
+    completed_log_max_chars: int | None = None
+    step_fetch_rounds: int | None = None
+    # 客观验收补轮
+    step_verify_rounds: int | None = None
     # 主备降级：主用失败（502/503/超时）时自动切到备用配置
     architect_backup_base_url: str | None = None
     architect_backup_api_key: str | None = None
@@ -294,6 +301,12 @@ def settings_payload(settings: Settings, store=None) -> dict[str, Any]:
         "mcp_enabled": settings.mcp_enabled,
         "mcp_call_rounds": settings.mcp_call_rounds,
         "mcp_max_calls_per_step": settings.mcp_max_calls_per_step,
+        # 每步上下文预算与验收补轮（界面上可调，省 token 的基本盘）
+        "context_budget_chars": settings.context_budget_chars,
+        "file_context_max_chars": settings.file_context_max_chars,
+        "completed_log_max_chars": settings.completed_log_max_chars,
+        "step_fetch_rounds": settings.step_fetch_rounds,
+        "step_verify_rounds": settings.step_verify_rounds,
         # 备用配置：Key 只回掩码，界面据此显示"已配置/留空不修改"
         "architect_backup": {
             "base_url": settings.architect_backup_base_url,

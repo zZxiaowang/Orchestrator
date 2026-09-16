@@ -170,10 +170,11 @@ CLICK_PROBE_JS = """
     return el ? el.hidden : null;
   };
 
-  click('market-btn');
-  results.marketOpened = hidden('market-modal') === false;
-  click('market-close');
-  results.marketClosed = hidden('market-modal') === true;
+  // 侧栏底部现在只有「能力中心 / Git / 更新 / 设置」：插件市场已并进能力中心
+  click('capabilities-btn');
+  results.capabilitiesOpened = hidden('capabilities-modal') === false;
+  click('capabilities-close');
+  results.capabilitiesClosed = hidden('capabilities-modal') === true;
 
   click('settings-btn');
   results.settingsOpened = hidden('settings-modal') === false;
@@ -404,8 +405,8 @@ def _schedule_selftest(window, url: str, *, seconds: float) -> None:
             for item in errors:
                 logger.error("[自检] 点击抛出异常：%s", item)
             clicks_ok = (
-                results.get("marketOpened") is True
-                and results.get("marketClosed") is True
+                results.get("capabilitiesOpened") is True
+                and results.get("capabilitiesClosed") is True
                 and results.get("settingsOpened") is True
                 and results.get("settingsClosed") is True
                 and results.get("sidebarCollapsed") is True

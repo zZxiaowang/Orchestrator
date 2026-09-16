@@ -96,14 +96,8 @@
           <!-- 槽位：插件可在 sidebar.footer.action 里追加入口 -->
           <div class="footer-actions">
             <div data-slot="sidebar.footer.action" style="display: contents">
-              <button class="foot-btn" id="market-btn" data-entry="market" type="button">
-                <span class="foot-icon">⌂</span><span class="foot-label">插件市场</span>
-              </button>
               <button class="foot-btn" id="capabilities-btn" data-entry="capabilities" type="button">
                 <span class="foot-icon">✦</span><span class="foot-label">能力中心</span>
-              </button>
-              <button class="foot-btn" id="plugins-btn" data-entry="plugins" type="button">
-                <span class="foot-icon">◫</span><span class="foot-label">已装插件</span>
               </button>
               <button class="foot-btn" id="git-btn" data-entry="git" type="button">
                 <span class="foot-icon">⑂</span><span class="foot-label">Git 提交</span>
@@ -191,9 +185,9 @@
         <div class="modal-body settings-body">
           <nav class="settings-nav" id="settings-nav">
             <button class="settings-nav-item active" data-section="model" type="button">模型与路由</button>
-            <button class="settings-nav-item" data-section="command" type="button">命令与安全</button>
-            <button class="settings-nav-item" data-section="behavior" type="button">行为与上下文</button>
-            <button class="settings-nav-item" data-section="integrations" type="button">插件与 Git</button>
+            <button class="settings-nav-item" data-section="command" type="button">执行与验收</button>
+            <button class="settings-nav-item" data-section="behavior" type="button">上下文与记忆</button>
+            <button class="settings-nav-item" data-section="integrations" type="button">能力与集成</button>
           </nav>
 
           <div class="settings-sections">
@@ -348,6 +342,20 @@
               执行段可以把验证命令写进产出里。默认<b>只展示不执行</b>；开启后，白名单内的命令会在
               <b>工作区内</b>真的跑，失败会把报错回灌给执行段，让它在同一步里继续修。
             </p>
+          <h3 class="settings-group-title">任务与验收</h3>
+          <div class="field-grid">
+            <label class="field">
+              <span>单个任务最多拆多少步（1–20）</span>
+              <input id="f-max-steps" type="number" min="1" max="20" />
+            </label>
+            <label class="field">
+              <span>客观验收未通过时，自动补几轮（0 = 不自动补）</span>
+              <input id="f-verify-rounds" type="number" min="0" max="5" />
+            </label>
+          </div>
+          <p class="hint">步骤越多纲领越细，但每一步都要单独过验收；建议 3–8 步。</p>
+          <hr class="settings-divider" />
+          <h3 class="settings-group-title">验证命令</h3>
           <label class="checkbox">
             <input type="checkbox" id="f-allow-cmd" />
             <span>允许执行验证命令（默认关闭，仅展示建议）</span>
@@ -374,14 +382,6 @@
           </section>
 
           <section class="settings-section" data-section="behavior" hidden>
-            <label class="field">
-              <span>单个任务最多拆多少步（1–20）</span>
-              <input id="f-max-steps" type="number" min="1" max="20" />
-            </label>
-            <p class="hint">
-              步骤越多，纲领越细，但每一步都要单独过验收。建议 3–8 步。
-            </p>
-
             <hr class="settings-divider" />
             <h3 class="settings-group-title">普通对话：长上下文自动拆分（省 token）</h3>
             <p class="hint">
@@ -418,6 +418,31 @@
             <p class="hint" id="chat-context-status"></p>
 
             <hr class="settings-divider" />
+            <h3 class="settings-group-title">每步上下文预算（省 token 的基本盘）</h3>
+            <p class="hint">
+              执行段每一步的新增上下文上限。超出后按"文件 → 工作区文件树"的顺序裁剪，
+              当前步骤与客观验收永不裁剪；预算不够时执行段会按需索取文件（need_files）。
+            </p>
+            <div class="field-grid">
+              <label class="field">
+                <span>单步上下文字符预算</span>
+                <input id="f-context-budget" type="number" min="4000" max="200000" />
+              </label>
+              <label class="field">
+                <span>单文件注入上限（超出取头尾）</span>
+                <input id="f-file-max" type="number" min="400" max="50000" />
+              </label>
+              <label class="field">
+                <span>已完成步骤交接日志上限</span>
+                <input id="f-completed-log" type="number" min="200" max="10000" />
+              </label>
+              <label class="field">
+                <span>执行段按需索取文件的最大轮数</span>
+                <input id="f-fetch-rounds" type="number" min="0" max="6" />
+              </label>
+            </div>
+
+            <hr class="settings-divider" />
             <h3 class="settings-group-title">MCP 工具调用</h3>
             <p class="hint">
               执行段可以在步骤里请求调用 MCP 工具（例如 filesystem / git / fetch），
@@ -441,8 +466,22 @@
           </section>
 
           <section class="settings-section" data-section="integrations" hidden>
+            <h3 class="settings-group-title">能力（skill / MCP）</h3>
+            <p class="hint">
+              安装与管理 skill、MCP 服务器都在<b>能力中心</b>：skill 是指令包（按需注入执行段），
+              MCP 是工具服务器（模型可请求调用）。会跑代码的能力默认关闭、需先确认信任。
+            </p>
             <div class="settings-actions">
-              <button class="btn ghost" id="settings-open-market" type="button">打开插件市场</button>
+              <button class="btn primary" id="settings-open-capabilities" type="button">
+                打开能力中心
+              </button>
+            </div>
+            <hr class="settings-divider" />
+            <h3 class="settings-group-title">插件（legacy）与 Git</h3>
+            <div class="settings-actions">
+              <button class="btn ghost" id="settings-open-market" type="button">
+                打开插件市场（legacy）
+              </button>
               <button class="btn ghost" id="settings-open-git" type="button">打开 Git 面板</button>
               <button class="btn ghost" id="settings-open-stats" type="button">查看运行统计</button>
             </div>
