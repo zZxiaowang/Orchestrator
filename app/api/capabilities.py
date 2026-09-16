@@ -6,13 +6,21 @@
 
 from __future__ import annotations
 
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from app.capabilities.registry import CapabilityRegistry
+from app.capabilities.skills import (
+    install_from_github,
+    install_from_zip_url,
+    install_local,
+    read_skill_body,
+)
 from app.core.errors import AppError
+from app.schemas.capability import CapabilityKind, CapabilityScope
 
 #: 挂到 ``app/api/routes.py`` 的主 router 上（那边已经有 ``/api/v1`` 前缀），
 #: 所以这里只写资源路径，避免出现 ``/api/v1/api/v1/...``
@@ -28,6 +36,21 @@ CAPABILITY_KINDS = (
 
 class CapabilityScopePatch(BaseModel):
     enabled: bool = Field(..., description="启用 / 停用")
+
+
+class InstallSkillRequest(BaseModel):
+    """装一个 skill：本地目录 / GitHub / zip 地址。"""
+
+    source: Literal["local", "github", "zip"] = "local"
+    location: str = Field(..., description="本地目录、owner/repo#ref[/子目录]，或 zip 地址")
+    scope: Literal["global", "project"] = "global"
+    project_id: str = ""
+    enabled: bool = True
+
+
+class SkillScopeRequest(BaseModel):
+    scope: Literal["global", "project"] = "global"
+    project_id: str = ""
 
 
 def _registry(request: Request) -> CapabilityRegistry:
@@ -83,6 +106,77 @@ async def list_capabilities(
 @router.get("/capabilities/audit")
 async def capability_audit(request: Request, limit: int = 100) -> dict[str, Any]:
     return {"events": _registry(request).read_audit(limit=max(1, min(limit, 500)))}
+
+
+def _download_transport(request: Request) -> Any:
+    """下载技能包用的 httpx transport：测试里注入假 transport，生产用默认。"""
+
+    return getattr(request.app.state, "capability_transport", None)
+
+
+@router.post("/capabilities/skills/install", status_code=201)
+async def install_skill(payload: InstallSkillRequest, request: Request) -> dict[str, Any]:
+    """安装 skill：本地目录 / GitHub（owner/repo#ref[/子目录]）/ zip 地址。
+
+    安装只做"复制 + 资格校验"，**不执行任何脚本**；带 ``scripts/`` 的技能会在
+    permissions 里登记，真正执行仍走命令白名单 + 每次确认。
+    """
+
+    registry = _registry(request)
+    scope = CapabilityScope(payload.scope)
+    common = {
+        "root": registry.root,
+        "scope": scope,
+        "project_id": payload.project_id,
+        "enabled": payload.enabled,
+    }
+    if payload.source == "local":
+        path = Path(payload.location).expanduser()
+        if not path.is_absolute():
+            # 相对路径按"技能来源目录"解析，避免受进程 cwd 影响产生歧义
+            path = (Path(registry.root).parent.parent / payload.location).resolve()
+        capability = install_local(path, **common)
+    elif payload.source == "github":
+        capability = await install_from_github(
+            payload.location, transport=_download_transport(request), **common
+        )
+    else:
+        capability = await install_from_zip_url(
+            payload.location, transport=_download_transport(request), **common
+        )
+    stored = registry.upsert(capability)
+    return {"capability": stored.describe(), "installed": True}
+
+
+@router.get("/capabilities/{capability_id}/body")
+async def capability_body(capability_id: str, request: Request) -> dict[str, Any]:
+    """读回 skill 正文（界面预览用；注入执行段走的是同一份内容）。"""
+
+    capability = _registry(request).require(capability_id)
+    if capability.kind is not CapabilityKind.SKILL:
+        raise AppError("只有 skill 有正文可以查看。", code="capability_has_no_body")
+    body = read_skill_body(Path(str(capability.meta.get("path") or "")))
+    return {"id": capability.id, "name": capability.name, "body": body}
+
+
+@router.post("/capabilities/{capability_id}/scope")
+async def set_capability_scope(
+    capability_id: str, payload: SkillScopeRequest, request: Request
+) -> dict[str, Any]:
+    """改能力作用域：全局启用，或只在某个项目里生效（项目之间互不影响）。"""
+
+    registry = _registry(request)
+    capability = registry.require(capability_id)
+    scope = CapabilityScope(payload.scope)
+    if scope is CapabilityScope.PROJECT and not payload.project_id.strip():
+        raise AppError("按项目生效时必须给出 project_id。", code="invalid_request")
+    updated = capability.model_copy(
+        update={
+            "scope": scope,
+            "project_id": payload.project_id.strip() if scope is CapabilityScope.PROJECT else "",
+        }
+    )
+    return {"capability": registry.upsert(updated, record="scope").describe()}
 
 
 @router.post("/capabilities/{capability_id}/enable")

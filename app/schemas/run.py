@@ -186,6 +186,8 @@ class RunStep(BaseModel):
     retries: int = 0
     #: 本步按需索取过的文件
     fetched_files: list[str] = Field(default_factory=list)
+    #: 本步注入过哪些 skill（按触发词挑中的；界面据此显示"这一步用了什么技能"）
+    skills_used: list[str] = Field(default_factory=list)
     #: 本步开始前的 git 锚点（用于"回滚这一步"；非 git 仓库时为空）
     git_snapshot: dict[str, Any] = Field(default_factory=dict)
     error: str = ""

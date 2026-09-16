@@ -282,6 +282,10 @@ const api = {
   uninstallCapability: (id) =>
     request("DELETE", `/api/v1/capabilities/${encodeURIComponent(id)}`),
   capabilityAudit: (limit = 30) => request("GET", `/api/v1/capabilities/audit?limit=${limit}`),
+  capabilityBody: (id) => request("GET", `/api/v1/capabilities/${encodeURIComponent(id)}/body`),
+  installSkill: (body) => request("POST", "/api/v1/capabilities/skills/install", body),
+  setCapabilityScope: (id, body) =>
+    request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/scope`, body),
   chat: (id) => request("GET", `/api/v1/chats/${encodeURIComponent(id)}`),
   createChat: (body) => request("POST", "/api/v1/chats", body),
   sendChat: (id, text) =>
@@ -1729,6 +1733,14 @@ function renderStepCard(step) {
       h("p", {
         class: "muted",
         text: `按需读取（未全量注入上下文）：${step.fetched_files.join("、")}`,
+      })
+    );
+  }
+  if (step.skills_used?.length) {
+    body.append(
+      h("p", {
+        class: "muted",
+        text: `本步注入的技能：${step.skills_used.join("、")}（按触发词匹配，来自「能力中心」）`,
       })
     );
   }
@@ -3644,6 +3656,12 @@ function renderCapabilities(payload) {
       tab.classList.toggle("active", kind ? tab.dataset.kind === kind : false);
     }
     const filtered = kind ? items.filter((item) => item.kind === kind) : items;
+    // skill 页顶部给安装入口（本地目录 / GitHub / zip 地址）
+    if (kind === "skill") {
+      listHost.replaceChildren(skillInstallForm());
+      if (filtered.length) listHost.append(...filtered.map(capabilityNode));
+      return;
+    }
     if (!filtered.length) {
       const hint = kinds.find((info) => info.id === kind);
       listHost.replaceChildren(
@@ -3656,12 +3674,98 @@ function renderCapabilities(payload) {
       );
       return;
     }
-    listHost.replaceChildren(
-      ...filtered.map((capability) =>
-        collapsibleCard(`capability:${capability.id}`, capability.name || capability.id, {
+    listHost.replaceChildren(...filtered.map(capabilityNode));
+  };
+
+  const capabilityNode = (capability) => {
+    const actions = h("div", { class: "approval-actions" });
+    const toggle = h("button", {
+      class: "btn ghost small",
+      type: "button",
+      text: capability.enabled ? "停用" : "启用",
+    });
+    toggle.addEventListener(
+      "click",
+      safe(async () => {
+        if (capability.enabled) await api.disableCapability(capability.id);
+        else await api.enableCapability(capability.id);
+        await openCapabilities();
+      })
+    );
+    actions.append(toggle);
+
+    if (capability.kind === "skill") {
+      // 预览 SKILL.md 正文：装进来的是一份副本，这里看到的就是注入执行段的内容
+      const peek = h("button", { class: "btn ghost small", type: "button", text: "查看 SKILL.md" });
+      const preview = h("pre", { class: "stream", hidden: true });
+      peek.addEventListener(
+        "click",
+        safe(async () => {
+          if (preview.hidden) {
+            const payload = await api.capabilityBody(capability.id);
+            preview.textContent = payload.body || "（没有正文）";
+            preview.hidden = false;
+            peek.textContent = "收起 SKILL.md";
+          } else {
+            preview.hidden = true;
+            peek.textContent = "查看 SKILL.md";
+          }
+        })
+      );
+      actions.append(peek);
+      actions.append(preview);
+      // 作用域：全局，或只在某个项目里生效
+      const scopeSelect = h("select", { class: "capability-scope" });
+      for (const [value, label] of [
+        ["global", "全局启用"],
+        ["project", "只在某个项目启用"],
+      ]) {
+        scopeSelect.append(h("option", { value, text: label, selected: capability.scope === value }));
+      }
+      scopeSelect.addEventListener(
+        "change",
+        safe(async () => {
+          try {
+            await api.setCapabilityScope(capability.id, {
+              scope: scopeSelect.value,
+              project_id: scopeSelect.value === "project" ? ProjectWorkspace.projectId || "" : "",
+            });
+            showToast(scopeSelect.value === "project" ? "已限定到当前项目" : "已改为全局启用");
+          } catch (error) {
+            showToast(error.message);
+          }
+          await openCapabilities();
+        })
+      );
+      actions.append(scopeSelect);
+    }
+
+    if (capability.kind === "plugin") {
+      actions.append(h("span", { class: "muted-small", text: "插件请到「插件市场」卸载" }));
+    } else {
+      const remove = h("button", { class: "btn ghost small", type: "button", text: "卸载" });
+      remove.addEventListener(
+        "click",
+        safe(async () => {
+          const ok = await appConfirm({
+            title: "卸载能力",
+            message: `确定卸载「${capability.name || capability.id}」？`,
+            confirmText: "卸载",
+            danger: true,
+          });
+          if (!ok) return;
+          await api.uninstallCapability(capability.id);
+          await openCapabilities();
+        })
+      );
+      actions.append(remove);
+    }
+
+    return collapsibleCard(`capability:${capability.id}`, capability.name || capability.id, {
           subtitle: [
             capability.kind,
             capability.enabled ? "已启用" : "已停用",
+            capability.scope === "project" ? `项目 ${capability.project_id || "（未指定）"}` : "",
             capability.version ? `v${capability.version}` : "",
             capability.permissions?.length ? capability.permissions.join("/") : "",
           ]
@@ -3675,52 +3779,66 @@ function renderCapabilities(payload) {
             capability.source?.location
               ? h("p", { class: "muted", text: `来源：${capability.source.kind} · ${capability.source.location}` })
               : null,
-            h(
-              "div",
-              { class: "approval-actions" },
-              (() => {
-                const toggle = h("button", {
-                  class: "btn ghost small",
-                  type: "button",
-                  text: capability.enabled ? "停用" : "启用",
-                });
-                toggle.addEventListener(
-                  "click",
-                  safe(async () => {
-                    if (capability.enabled) await api.disableCapability(capability.id);
-                    else await api.enableCapability(capability.id);
-                    await openCapabilities();
-                  })
-                );
-                return toggle;
-              })(),
-              capability.kind === "plugin"
-                ? h("span", { class: "muted-small", text: "插件请到「插件市场」卸载" })
-                : (() => {
-                    const remove = h("button", {
-                      class: "btn ghost small",
-                      type: "button",
-                      text: "卸载",
-                    });
-                    remove.addEventListener(
-                      "click",
-                      safe(async () => {
-                        const ok = await appConfirm({
-                          title: "卸载能力",
-                          message: `确定卸载「${capability.name || capability.id}」？`,
-                          confirmText: "卸载",
-                          danger: true,
-                        });
-                        if (!ok) return;
-                        await api.uninstallCapability(capability.id);
-                        await openCapabilities();
-                      })
-                    );
-                    return remove;
-                  })()
-            ),
+            capability.meta?.scripts?.length
+              ? h("p", {
+                  class: "muted",
+                  text: `自带脚本（默认不执行，要跑需开启命令白名单）：${capability.meta.scripts.join("、")}`,
+                })
+              : null,
+            actions,
           ],
-        })
+        });
+  };
+
+  const skillInstallForm = () => {
+    const source = h("select", { id: "skill-source" });
+    for (const [value, label] of [
+      ["local", "本地目录"],
+      ["github", "GitHub（owner/repo#ref/子目录）"],
+      ["zip", "zip 地址"],
+    ]) {
+      source.append(h("option", { value, text: label }));
+    }
+    const location = h("input", {
+      id: "skill-location",
+      placeholder: "D:\\skills\\my-skill 或 owner/repo#main/skills/my-skill 或 https://…/skill.zip",
+    });
+    const install = h("button", { class: "btn primary small", type: "button", text: "安装技能" });
+    install.addEventListener(
+      "click",
+      safe(async () => {
+        const value = location.value.trim();
+        if (!value) {
+          showToast("先填技能来源。");
+          return;
+        }
+        install.disabled = true;
+        try {
+          const payload = await api.installSkill({ source: source.value, location: value });
+          showToast(`已安装技能「${payload.capability.name}」`);
+          await openCapabilities();
+        } catch (error) {
+          showToast(error.message);
+        } finally {
+          install.disabled = false;
+        }
+      })
+    );
+    return h(
+      "div",
+      { class: "card" },
+      h("div", { class: "card-head" }, h("strong", { text: "安装技能（SKILL.md）" })),
+      h(
+        "div",
+        { class: "card-body" },
+        h(
+          "p",
+          {
+            class: "hint",
+            text: "兼容市面常见格式：目录里有 SKILL.md（frontmatter 写 name / description）即可；带 scripts/ 的会被登记但默认不执行。",
+          }
+        ),
+        h("div", { class: "skill-install-row" }, source, location, install)
       )
     );
   };

@@ -75,6 +75,7 @@
 | 55 | 长上下文自动拆分、切新对话以省 token | ✅ 普通对话：最近 12 轮 / 6000 字符保留原文，更早的**增量折进 ≤300 字承接摘要**；摘要超 2000 字**自动开新对话承接**（旧对话保留、双向可跳、事件提示）；摘要失败退化为原样折叠。开关与阈值全在「设置 → 行为与上下文」，设计见 `docs/chat-context-window.md` |
 | 56 | 概览/架构/计划/执行都改成 Codex 式原地折叠 | ✅ 概览里点运行记录**原地展开**（不跳模块，详情里给「去执行看时间线 →」按钮）；架构六张卡、计划每个步骤默认折叠，标题行即一句话摘要；执行里的架构段输出「生成中展开、出完纲领折叠并写已解析为纲领」，步骤卡沿用已完成折叠/运行中展开。展开状态按内容记在内存，刷新不会收起 |
 | 57 | 前瞻架构 + Skills/MCP + UI 收敛（P0 地基） | ✅ 统一能力层（`schemas/capability.py` + `capabilities/registry.py` + `api/capabilities.py` + 审计）、模块清单单一来源（后端注入页面，前端不再自己写）、删除三处历史死代码（约 1000 行 + 131 项只测死代码的用例）、侧栏「能力中心」入口、`docs/ARCHITECTURE.md` 架构基线。P1 Skills / P2 MCP / P3 UI 收敛待做 |
+| 58 | Skills：能装市面上大多数 skill | ✅ `SKILL.md`（frontmatter: name/description/version/triggers，可带 scripts/references/assets）解析与资格校验；三种来源：**本地目录 / GitHub（owner/repo#ref/子目录）/ zip 地址**；装成副本（`data/capabilities/skills/<id>/`）；启用 / 全局或按项目作用域；**按触发词按需注入执行段**（最多 2 个、≤2400 字符）并在步骤卡片显示「本步注入的技能」；能力中心可安装、预览 SKILL.md、启停、卸载；带示例技能 `skills/code-review/`。MCP 见下一步 |
 
 ## 三、数据与文件位置（重要）
 
@@ -156,7 +157,7 @@ data\settings.json（界面保存）  >  环境变量 / 项目根 .env  >  代�
 | 分支 / 远端 | `main` / `https://github.com/zZxiaowang/Orchestrator.git`（已同步） |
 | 你的配置 | 「默认配置」= 中转 `https://api.routescope.ai/v1`，`responses`，`gpt-5.6-sol` / `deepseek-v4-flash`；另有「deepseek」官方直连 |
 | 服务 | 源码实例 `http://127.0.0.1:8787`；演示实例 8788 + 假中转 8799（按需启动） |
-| 质量门 | pytest **364 项**通过（删掉只测死代码的 131 项后的一次性下调）；ruff check/format 全绿；界面自检 **88 项全通过**（`node scripts/ui_check.mjs --url http://127.0.0.1:8788`） |
+| 质量门 | pytest **378 项**通过；ruff check/format 全绿；界面自检 **92 项全通过**（`node scripts/ui_check.mjs --url http://127.0.0.1:8788`） |
 | 桌面自检 | 打包版 `--selftest` 5 项 PASS / 0 FAIL（渲染、点击链路、Git 面板等） |
 | 打包产物 | `dist\Orchestrator.exe` 约 20.9 MB（2026-09-16 20:20 构建；已确认包内含项目 / 普通对话 / 七个模块 / 长上下文设置组） |
 | 最近提交 | `08271bd`（长上下文自动拆分 + 设置分组）、`b8caea7`（项目与普通对话做成真功能）、`24c01d0`（已完成步骤折叠）、`d3aee81`（Enter 发送）、`3fe4370`（打包版导入解释器修正）、`436e014`（能编译/能导入验收）、`a556ac4`（`--server` 认 `--port`）—— 已推送 `origin/main` |

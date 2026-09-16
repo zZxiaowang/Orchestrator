@@ -52,6 +52,8 @@ class ContextPacket:
     brief: str
     current: str
     completed: str = ""
+    #: 按触发词挑出来的 skill 指令（项目内启用、按需注入）
+    skills: str = ""
     files: str = ""
     #: 文件树（每步都会变，放在最后）
     tree: str = ""
@@ -62,7 +64,7 @@ class ContextPacket:
     def user_content(self) -> str:
         # 顺序：稳定前缀 → 当前步骤 → 相关文件 → 已完成交接 → 文件树。
         # 后三项每一步都会变（工作区在改），放在最后，前面的稳定前缀才能命中缓存。
-        parts = [self.brief, self.current, self.files, self.completed, self.tree]
+        parts = [self.brief, self.current, self.skills, self.files, self.completed, self.tree]
         return "\n\n".join(part for part in parts if part)
 
     @property
@@ -151,6 +153,7 @@ class StepContextBuilder:
         user_notes: Sequence[str] = (),
         brief_text: str = "",
         tree_full: bool = True,
+        skills_section: str = "",
     ) -> ContextPacket:
         omitted: list[str] = []
         remaining = self.budget_chars - len(system)
@@ -174,6 +177,12 @@ class StepContextBuilder:
             else ""
         )
         remaining -= len(task_block) + len(brief_block) + len(plan_block) + len(notes_block)
+
+        # ── 能力段：按触发词挑出来的 skill 指令（项目内启用、按需注入，别白烧上下文）──
+        skills_block = ""
+        if skills_section.strip():
+            skills_block = clip(skills_section.strip(), min(2400, max(0, remaining)))
+            remaining -= len(skills_block)
 
         # ── 变量段：当前步骤（永不裁剪） ──
         current_block = self._current_step(step)
@@ -226,6 +235,7 @@ class StepContextBuilder:
             brief="\n\n".join(part for part in (task_block, brief_block, plan_block) if part),
             current="\n\n".join(part for part in (notes_block, current_block) if part),
             completed=log_block,
+            skills=skills_block,
             files=files_block,
             tree=tree_block,
             omitted=omitted,
@@ -236,6 +246,7 @@ class StepContextBuilder:
                 "plan": len(plan_block),
                 "tree": len(tree_block),
                 "completed": len(log_block),
+                "skills": len(skills_block),
                 "current": len(current_block),
                 "files": len(files_block),
             },

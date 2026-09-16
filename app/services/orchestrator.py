@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from app.capabilities.registry import CapabilityRegistry
+from app.capabilities.skills import build_skill_section, select_skills
 from app.core.config import Endpoint, Settings, get_settings
 from app.core.errors import AppError, ConfigurationError, NotFoundError, WorkspaceError
 from app.core.fallback import (
@@ -94,6 +96,7 @@ class Orchestrator:
         settings_provider: Callable[[], Settings] = get_settings,
         transport: httpx.AsyncBaseTransport | None = None,
         projects: ProjectStore | None = None,
+        capabilities: CapabilityRegistry | None = None,
     ) -> None:
         self.store = store
         self.bus = bus
@@ -101,6 +104,9 @@ class Orchestrator:
         self._transport = transport
         # 项目仓库与运行记录同级存放：data/projects.json + data/runs/<id>/
         self.projects = projects or ProjectStore(Path(store.runs_dir).parent / "projects.json")
+        self.capabilities = capabilities or CapabilityRegistry(
+            Path(store.runs_dir).parent / "capabilities"
+        )
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._cancelled: set[str] = set()
 
@@ -830,6 +836,7 @@ class Orchestrator:
             read_file=workspace.read,
             user_notes=run.user_notes,
             brief_text=run.brief,
+            skills_section=self._skills_section(run, step),
             # 文件树只在第一步给全量：后面每步都给全量，既贵又破坏前缀缓存
             tree_full=step.id == run.steps[0].id,
         )
@@ -1472,6 +1479,34 @@ class Orchestrator:
             for item in step.files
             if item.path and not item.error and item.action != "delete"
         ]
+
+    def _skills_section(self, run: Run, step: RunStep) -> str:
+        """按触发词挑出本步要用的 skill 指令（只算项目内启用的）。
+
+        挑不中就不注入——skill 是指令包，白带进去只会多花 token。
+        挑中的技能名记进 ``step.skills_used``，界面上能看到这一步用了什么。
+        """
+
+        try:
+            active = self.capabilities.active_for(run.project_id, kind="skill")
+        except Exception:  # noqa: BLE001 - 能力层异常不该挡住执行
+            return ""
+        if not active:
+            return ""
+        text = " ".join(
+            [
+                run.task,
+                step.title,
+                step.goal,
+                " ".join(step.deliverables),
+                " ".join(step.acceptance),
+            ]
+        )
+        picked = select_skills(active, text=text)
+        if not picked:
+            return ""
+        step.skills_used = [item.id for item in picked]
+        return build_skill_section(picked)
 
     async def _verify_with_repair(
         self,

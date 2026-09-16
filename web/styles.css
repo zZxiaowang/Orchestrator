@@ -2201,6 +2201,24 @@ textarea:focus {
   border-color: rgba(154, 103, 0, 0.3);
 }
 
+/* 能力中心：安装技能一行（来源类型 + 路径 + 安装） */
+.skill-install-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.skill-install-row select,
+.skill-install-row input {
+  flex: 1 1 220px;
+  min-width: 180px;
+}
+
+.capability-scope {
+  font-size: 12.5px;
+}
+
 .settings-divider {
   border: 0;
   border-top: 1px solid var(--border-soft);

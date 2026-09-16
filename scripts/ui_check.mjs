@@ -590,6 +590,101 @@ async function main() {
     await cdp.clickSelector("#capabilities-close");
     await sleep(250);
 
+    // 1e2) Skills：从「能力中心」装一个技能（仓库自带示例，不依赖网络）
+    await cdp.clickSelector("#capabilities-btn");
+    await sleep(600);
+    const skillInstall = await cdp.evaluate(`(async () => {
+      document.querySelector('#capability-kinds .tab[data-kind="skill"]').click();
+      await new Promise((done) => setTimeout(done, 300));
+      const source = document.getElementById("skill-source");
+      const location = document.getElementById("skill-location");
+      if (!source || !location) return { ok: false, reason: "安装表单缺失" };
+      source.value = "local";
+      location.value = ${JSON.stringify(resolve(here, "..", "skills", "code-review"))};
+      const button = Array.from(document.querySelectorAll("#capabilities-body button")).find(
+        (el) => el.textContent.trim() === "安装技能",
+      );
+      if (!button) return { ok: false, reason: "找不到安装按钮" };
+      button.click();
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        await new Promise((done) => setTimeout(done, 250));
+        const payload = await fetch("/api/v1/capabilities?kind=skill").then((r) => r.json());
+        if ((payload.capabilities || []).length) {
+          return { ok: true, ids: payload.capabilities.map((item) => item.id) };
+        }
+      }
+      return { ok: false, reason: "安装后没出现在列表里" };
+    })()`);
+    check(
+      "能力中心能安装 skill（本地目录来源）",
+      skillInstall.ok && skillInstall.ids.length >= 1,
+      JSON.stringify(skillInstall),
+    );
+    const skillBody = await cdp.evaluate(`(async () => {
+      const button = Array.from(document.querySelectorAll("#capabilities-body button")).find(
+        (el) => el.textContent.trim() === "查看 SKILL.md",
+      );
+      if (!button) return { ok: false, reason: "找不到预览按钮" };
+      button.click();
+      await new Promise((done) => setTimeout(done, 600));
+      const pre = document.querySelector("#capabilities-body pre.stream");
+      return { ok: Boolean(pre && !pre.hidden && (pre.textContent || "").length > 40), chars: pre ? (pre.textContent || "").length : 0 };
+    })()`);
+    check("技能正文预览可用（装进来的是副本）", skillBody.ok === true, JSON.stringify(skillBody));
+    await cdp.clickSelector("#capabilities-close");
+    await sleep(250);
+
+    // 1e3) 装了技能之后：任务文本命中触发词 → 步骤自动注入该技能（并在卡片上显示）
+    const skillInjection = await cdp.evaluate(`(async () => {
+      const call = (path, options) => fetch(path, options).then((response) => response.json());
+      const created = await call("/api/v1/runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          task: "实现一个示例模块，并修复其中的边界问题",
+          project_id: "default",
+        }),
+      });
+      const id = created.run.id;
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        const state = await call("/api/v1/runs/" + id);
+        if (state.run.status === "awaiting_approval") break;
+        await new Promise((done) => setTimeout(done, 300));
+      }
+      await call("/api/v1/runs/" + id + "/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback: "" }),
+      });
+      for (let attempt = 0; attempt < 80; attempt += 1) {
+        const state = await call("/api/v1/runs/" + id);
+        if (["done", "failed", "blocked"].includes(state.run.status)) {
+          return {
+            id,
+            status: state.run.status,
+            skills: state.run.steps.map((step) => step.skills_used || []),
+          };
+        }
+        await new Promise((done) => setTimeout(done, 300));
+      }
+      return { id, status: "timeout", skills: [] };
+    })()`);
+    check(
+      "步骤按触发词自动注入匹配到的 skill",
+      skillInjection.skills.some((list) => Array.isArray(list) && list.length > 0),
+      JSON.stringify(skillInjection),
+    );
+    // 打开这条运行，确认卡片上写清了"本步注入的技能"
+    await cdp.evaluate(`location.hash = "#/runs/${skillInjection.id}"`);
+    await sleep(1500);
+    const domSkill = await cdp.evaluate(`(() => {
+      const text = document.getElementById("timeline").textContent || "";
+      return { hasLine: text.includes("本步注入的技能") };
+    })()`);
+    check("步骤卡片显示本步注入的技能", domSkill.hasLine === true, JSON.stringify(domSkill));
+    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+    await sleep(800);
+
     // 1f) 旧链接重定向（前端路由层实现，替代原先的 navigation_migration 契约层）
     await cdp.evaluate(`location.hash = "#/runs/${seeded.id}"`);
     await sleep(1200);

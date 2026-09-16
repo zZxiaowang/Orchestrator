@@ -353,7 +353,7 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 364 passed（删掉历史死代码后的一次性下调，见 docs/ARCHITECTURE.md §9）
+python -m pytest -q             # 378 passed
 python -m ruff check .          # All checks passed
 python -m ruff format --check . # 95 files already formatted
 ```
@@ -407,6 +407,30 @@ python -m ruff format --check . # 95 files already formatted
 > P0 已落地统一能力层（`data/capabilities/`、`GET /api/v1/capabilities`、侧栏「能力中心」入口与审计），
 > 已装插件会以 `plugin` 形态镜像进来；skill 安装（P1）与 MCP 工具（P2）随后接上。
 > 架构与路线见 `docs/ARCHITECTURE.md`。
+
+## 能力中心（skill / MCP / 插件）
+
+侧栏底部「✦ 能力中心」统一管理三类能力：
+
+**Skills（已可用）**：兼容市面常见格式——目录里有 `SKILL.md` 即可，frontmatter 写 `name` 与
+`description`（可选 `version`、`triggers`），可带 `scripts/`（**只登记，默认不执行**）、
+`references/`、`assets/`。三种来源：
+
+```
+本地目录        D:\skills\my-skill
+GitHub          owner/repo#main/skills/my-skill     （不带 #ref 用默认分支）
+zip 地址        https://example.com/my-skill.zip
+```
+
+装进来的是一份**副本**（`data/capabilities/skills/<id>/`），源目录之后可以随便动。
+执行段每一步会按 `triggers` 匹配当前步骤文本，**命中才注入**（最多 2 个、总量 ≤2400 字符），
+步骤卡片上会写「本步注入的技能：xxx」；匹配不到就不带——不白烧上下文。
+技能可以设为**全局启用**或**只在某个项目启用**（项目之间互不影响）；所有安装 / 启用 / 卸载都有审计。
+
+仓库自带一个示例技能 `skills/code-review/`（含一个示例脚本，用来验证"脚本只登记不执行"）。
+
+**MCP（下一步 P2）**：MCP 客户端（stdio + Streamable HTTP）、server 管理与常用预设、
+模型通过应用层 `tool_calls` 请求工具调用（不依赖网关的 `tools` 字段）。
 
 左侧任务栏底部的 **插件市场** 入口（`market`）打开市场面板，分三页：
 

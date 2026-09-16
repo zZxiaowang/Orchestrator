@@ -110,6 +110,7 @@ def create_app(
             settings_provider=provider,
             transport=transport,
             projects=app.state.project_store,
+            capabilities=app.state.capability_registry,
         )
         # 上次进程被杀/重启时留下的"执行中"运行，启动时统一收敛为"已暂停"
         recovered = app.state.orchestrator.recover_interrupted()
