@@ -16,30 +16,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from app.schemas.navigation import PROJECT_MODULE_LABELS, PROJECT_MODULES
 from app.schemas.project import Project
 from app.schemas.run import PHASE_ARCHITECT, Run, RunStep, StepStatus
 from app.services.verify import summarize
 
-#: 二级模块顺序（与 docs/project-navigation-contract.md 一致）
-MODULES: tuple[str, ...] = (
-    "overview",
-    "architecture",
-    "plan",
-    "execution",
-    "verification",
-    "logs",
-    "settings",
-)
-
-MODULE_LABELS: dict[str, str] = {
-    "overview": "概览",
-    "architecture": "架构",
-    "plan": "计划",
-    "execution": "执行",
-    "verification": "验证",
-    "logs": "日志",
-    "settings": "设置",
-}
+#: 二级模块顺序与中文名都从契约派生（唯一权威见 app/schemas/navigation.py）
+MODULES: tuple[str, ...] = tuple(module.value for module in PROJECT_MODULES)
+MODULE_LABELS: dict[str, str] = dict(PROJECT_MODULE_LABELS)
 
 #: 旧模块名 → 契约模块名（旧链接与旧前端导航照常能用）
 MODULE_ALIASES: dict[str, str] = {

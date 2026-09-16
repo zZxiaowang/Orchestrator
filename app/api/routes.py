@@ -18,6 +18,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from app.api.capabilities import router as capabilities_router
 from app.core.catalog import CatalogStore, supported_capabilities
 from app.core.config import OVERRIDABLE_FIELDS, Settings, get_settings, settings_store
 from app.core.errors import AppError, NotFoundError
@@ -26,6 +27,7 @@ from app.core.providers import KIND_PRESETS
 from app.core.relay import RelayClient
 from app.schemas.navigation import (
     PROJECT_LIST_ROUTE,
+    PROJECT_MODULE_LABELS,
     PROJECT_MODULES,
     PROJECT_ONLY_ACTIONS,
     NavEntry,
@@ -44,6 +46,9 @@ from app.services.projects import ProjectStore
 from app.services.workspace import Workspace
 
 router = APIRouter(prefix="/api/v1")
+
+#: 能力接口（skill / MCP / 插件）单独一支 router：新形态只往那边加，不在这里堆
+router.include_router(capabilities_router)
 
 #: 客户端（界面/桌面窗口）上报的错误，最近若干条留在内存里供排查
 CLIENT_LOGS: deque[dict[str, Any]] = deque(maxlen=200)
@@ -1072,16 +1077,7 @@ PRIMARY_NAVIGATION_ROUTES: dict[str, str] = {
     NavEntry.PROJECTS.value: PROJECT_LIST_ROUTE,
 }
 
-#: 二级模块文案：只挂在「项目」下面。
-PROJECT_MODULE_LABELS: dict[str, str] = {
-    ProjectModule.OVERVIEW.value: "概览",
-    ProjectModule.ARCHITECTURE.value: "架构",
-    ProjectModule.PLAN.value: "计划",
-    ProjectModule.EXECUTION.value: "执行",
-    ProjectModule.VERIFICATION.value: "验证",
-    ProjectModule.LOGS.value: "日志",
-    ProjectModule.SETTINGS.value: "设置",
-}
+#: 二级模块文案：只挂在「项目」下面（唯一权威在 app/schemas/navigation.py）
 
 
 def primary_navigation_items() -> list[dict[str, str]]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -13,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app import __version__
 from app.api.routes import router
+from app.capabilities.registry import CapabilityRegistry
 from app.core.catalog import CatalogStore
 from app.core.config import (
     DATA_DIR,
@@ -32,6 +34,7 @@ from app.core.errors import (
 )
 from app.core.logging import configure_logging, get_logger
 from app.core.plugins import PluginStore
+from app.schemas.navigation import PROJECT_MODULE_LABELS, PROJECT_MODULES
 from app.services.events import EventBus
 from app.services.orchestrator import Orchestrator
 from app.services.projects import ProjectStore
@@ -92,6 +95,9 @@ def create_app(
         app.state.settings_store = settings_repo
         app.state.relay_transport = transport
         app.state.plugin_store = PluginStore(plugins_root)
+        # 能力层：skill / MCP / 插件统一注册表（插件在启动时镜像进来，见下）。
+        # 与运行记录同级推导，测试注入 runs_dir 时不会写进仓库真实数据目录。
+        app.state.capability_registry = CapabilityRegistry(Path(store_dir).parent / "capabilities")
         app.state.catalog_store = CatalogStore(plugins_root)
         app.state.asset_version = asset_version
         app.state.bus = EventBus()
@@ -109,6 +115,14 @@ def create_app(
         recovered = app.state.orchestrator.recover_interrupted()
         if recovered:
             logger.warning("已把 %d 个被中断的运行标记为暂停，可在界面点「继续执行」。", recovered)
+
+        # 历史插件镜像进能力层：能力中心一开始就能看到已有插件（插件仓库仍是权威存储）
+        try:
+            mirrored = app.state.capability_registry.sync_plugins(app.state.plugin_store.list())
+            if mirrored:
+                logger.info("已把 %d 个插件镜像到能力注册表。", mirrored)
+        except Exception as exc:  # noqa: BLE001 - 镜像失败不该挡住启动
+            logger.warning("插件镜像到能力注册表失败：%s", exc)
 
         missing = settings.missing_endpoints()
         problems = settings.config_problems()
@@ -151,6 +165,12 @@ def create_app(
         html = path.read_text(encoding="utf-8")
         html = html.replace("__APP_VERSION__", __version__)
         html = html.replace("__ASSET_VERSION__", asset_version)
+        # 二级模块清单由后端注入：前端不再自己写一份（唯一权威在 schemas/navigation.py）
+        modules = [
+            {"id": module.value, "label": PROJECT_MODULE_LABELS[module.value]}
+            for module in PROJECT_MODULES
+        ]
+        html = html.replace("__PROJECT_MODULES_JSON__", json.dumps(modules, ensure_ascii=False))
         return HTMLResponse(html)
 
     if static_dir.is_dir():

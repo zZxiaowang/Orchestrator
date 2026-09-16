@@ -9,6 +9,11 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b5cff'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white'%3E%E2%97%88%3C/text%3E%3C/svg%3E"
     />
     <link rel="stylesheet" href="/styles.css?v=__ASSET_VERSION__" />
+    <script>
+      // 项目二级模块清单由后端注入（唯一权威：app/schemas/navigation.py），
+      // 前端不再自己维护一份，避免"后端改名、前端还写旧名"。
+      window.__ORCHESTRATOR_PROJECT_MODULES__ = __PROJECT_MODULES_JSON__;
+    </script>
   </head>
   <body>
     <div class="app">
@@ -93,6 +98,9 @@
             <div data-slot="sidebar.footer.action" style="display: contents">
               <button class="foot-btn" id="market-btn" data-entry="market" type="button">
                 <span class="foot-icon">⌂</span><span class="foot-label">插件市场</span>
+              </button>
+              <button class="foot-btn" id="capabilities-btn" data-entry="capabilities" type="button">
+                <span class="foot-icon">✦</span><span class="foot-label">能力中心</span>
               </button>
               <button class="foot-btn" id="plugins-btn" data-entry="plugins" type="button">
                 <span class="foot-icon">◫</span><span class="foot-label">已装插件</span>
@@ -442,6 +450,18 @@
           <button class="icon-btn" id="market-close">✕</button>
         </div>
         <div class="modal-body" id="market-body"></div>
+      </div>
+    </div>
+
+    <!-- 能力中心：skill / MCP / 插件共用一个入口（P0 先做注册表视图，P1/P2 补安装与工具） -->
+    <div class="modal-backdrop" id="capabilities-modal" hidden>
+      <div class="modal market-modal">
+        <div class="modal-head">
+          <h2>能力中心</h2>
+          <span class="muted-small" id="capabilities-summary"></span>
+          <button class="icon-btn" id="capabilities-close">✕</button>
+        </div>
+        <div class="modal-body" id="capabilities-body"></div>
       </div>
     </div>
 

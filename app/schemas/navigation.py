@@ -51,6 +51,18 @@ PROJECT_MODULES: tuple[ProjectModule, ...] = tuple(ProjectModule)
 PROJECT_ONLY_ACTIONS: frozenset[str] = frozenset(module.value for module in ProjectModule)
 CHAT_FORBIDDEN_ACTIONS: frozenset[str] = PROJECT_ONLY_ACTIONS
 
+#: 二级模块的中文名：**唯一权威**。后端接口、桌面端探针与前端导航都由它派生，
+#: 免得再出现"后端叫 verification / 前端还写着 verify"这种改名漏网。
+PROJECT_MODULE_LABELS: dict[str, str] = {
+    ProjectModule.OVERVIEW.value: "概览",
+    ProjectModule.ARCHITECTURE.value: "架构",
+    ProjectModule.PLAN.value: "计划",
+    ProjectModule.EXECUTION.value: "执行",
+    ProjectModule.VERIFICATION.value: "验证",
+    ProjectModule.LOGS.value: "日志",
+    ProjectModule.SETTINGS.value: "设置",
+}
+
 PROJECT_LIST_ROUTE = "#/projects"
 CHAT_ROUTES: tuple[str, ...] = ("#/chat", "#/chat/{session_id}")
 DEFAULT_ROUTE = PROJECT_LIST_ROUTE

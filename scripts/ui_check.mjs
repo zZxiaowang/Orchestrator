@@ -566,6 +566,57 @@ async function main() {
     await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
     await sleep(1200);
 
+    // 1e) 能力中心：skill / MCP / 插件共用一个入口（P0 先看注册表视图）
+    await cdp.clickSelector("#capabilities-btn");
+    await sleep(700);
+    const capsShell = await cdp.evaluate(`(() => {
+      const modal = document.getElementById("capabilities-modal");
+      return {
+        open: !modal.hidden,
+        kinds: Array.from(document.querySelectorAll("#capability-kinds .tab")).map((el) =>
+          el.textContent.trim(),
+        ),
+        summary: (document.getElementById("capabilities-summary").textContent || "").trim(),
+      };
+    })()`);
+    check(
+      "能力中心能打开并列出三类能力（Skills / MCP / 插件）",
+      capsShell.open &&
+        capsShell.kinds.length === 3 &&
+        capsShell.kinds[0].includes("Skills") &&
+        capsShell.kinds[1].includes("MCP"),
+      JSON.stringify(capsShell),
+    );
+    await cdp.clickSelector("#capabilities-close");
+    await sleep(250);
+
+    // 1f) 旧链接重定向（前端路由层实现，替代原先的 navigation_migration 契约层）
+    await cdp.evaluate(`location.hash = "#/runs/${seeded.id}"`);
+    await sleep(1200);
+    const legacyRun = await cdp.evaluate(
+      `({ hash: location.hash, title: document.getElementById("run-title").textContent })`,
+    );
+    check(
+      "旧链接 #/runs/<id> 重定向进项目的执行模块",
+      legacyRun.hash.includes("/execution") && legacyRun.hash.includes("default"),
+      JSON.stringify(legacyRun),
+    );
+
+    await cdp.evaluate(`location.hash = "#/settings"`);
+    await sleep(1000);
+    const legacySettings = await cdp.evaluate(
+      `({ hash: location.hash, modalOpen: document.getElementById("settings-modal").hidden === false })`,
+    );
+    check(
+      "旧链接 #/settings 回到项目列表并打开设置",
+      legacySettings.hash.endsWith("#/projects") && legacySettings.modalOpen,
+      JSON.stringify(legacySettings),
+    );
+    await cdp.clickSelector("#settings-cancel");
+    await sleep(300);
+    await cdp.evaluate(`location.hash = ${JSON.stringify(projectRoute)}`);
+    await sleep(900);
+
     const modalHidden = await cdp.evaluate(
       `(() => { const m = document.getElementById("settings-modal");
         return { hidden: m.hidden, display: getComputedStyle(m).display }; })()`,
@@ -778,6 +829,22 @@ async function main() {
       JSON.stringify(installResult),
     );
 
+    // 插件装完应当**以 plugin 形态**出现在能力中心（镜像同步，不用重启）
+    await cdp.clickSelector("#capabilities-btn");
+    await sleep(700);
+    const mirrored = await cdp.evaluate(`(async () => {
+      const payload = await fetch("/api/v1/capabilities").then((r) => r.json());
+      const ids = (payload.capabilities || []).map((item) => item.id + ":" + item.kind);
+      return { ids, counts: payload.counts };
+    })()`);
+    check(
+      "已装插件以 plugin 形态出现在能力中心",
+      mirrored.ids.some((item) => item.startsWith("plugin.")) && mirrored.counts.plugin >= 1,
+      JSON.stringify(mirrored),
+    );
+    await cdp.clickSelector("#capabilities-close");
+    await sleep(250);
+
     const disableResult = await cdp.evaluate(`(async () => {
       document.querySelector('#market-tabs .tab[data-mtab="installed"]').click();
       await new Promise((done) => setTimeout(done, 400));
@@ -815,6 +882,15 @@ async function main() {
       "卸载插件后列表清空",
       uninstallResult.ok && uninstallResult.plugins.length === 0,
       JSON.stringify(uninstallResult),
+    );
+    // 卸载后镜像也要消失：能力中心不能留一条假记录
+    const afterUninstall = await cdp.evaluate(
+      `fetch("/api/v1/capabilities").then((r) => r.json()).then((p) => p.counts)`,
+    );
+    check(
+      "插件卸载后能力中心不再显示它（镜像同步）",
+      afterUninstall.plugin === 0,
+      JSON.stringify(afterUninstall),
     );
     await cdp.clickSelector("#market-close");
 

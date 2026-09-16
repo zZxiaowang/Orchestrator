@@ -17,17 +17,23 @@ const CONTEXT_TYPES = [CONTEXT_CHAT, CONTEXT_PROJECT];
 const DEFAULT_CONTEXT_TYPE = CONTEXT_PROJECT;
 
 //: 项目内的二级导航能力，普通对话下不渲染
-//: 项目内二级模块（与后端 ProjectModule 契约一致：overview / architecture / plan /
-//: execution / verification / logs / settings）。旧名 steps / verify / events 由后端别名兼容。
-const PROJECT_SECTIONS = [
-  "overview",
-  "architecture",
-  "plan",
-  "execution",
-  "verification",
-  "logs",
-  "settings",
-];
+//: 项目内二级模块的**唯一来源是后端**（index.html 里由 __PROJECT_MODULES_JSON__ 注入）。
+//: 这里只在注入缺失时（例如直接打开静态文件）用一份兜底清单，保证页面不空白。
+const PROJECT_MODULE_DEFS = (() => {
+  const injected = window.__ORCHESTRATOR_PROJECT_MODULES__;
+  if (Array.isArray(injected) && injected.length) return injected;
+  return [
+    { id: "overview", label: "概览" },
+    { id: "architecture", label: "架构" },
+    { id: "plan", label: "计划" },
+    { id: "execution", label: "执行" },
+    { id: "verification", label: "验证" },
+    { id: "logs", label: "日志" },
+    { id: "settings", label: "设置" },
+  ];
+})();
+
+const PROJECT_SECTIONS = PROJECT_MODULE_DEFS.map((item) => item.id);
 
 //: 上下文类型归一化：非法值 / 缺失值一律回落到默认归属
 function normalizeContextType(value) {
@@ -136,7 +142,9 @@ const state = {
   showArchived: false,
   palette: { items: [], active: 0, open: false },
   // 异步加载的请求序号：旧响应回来时直接丢弃，避免覆盖新状态（竞态会让界面"点了没反应"）
-  tokens: { runs: 0, plugins: 0, market: 0, providers: 0 },
+  tokens: { runs: 0, plugins: 0, market: 0, providers: 0, capabilities: 0 },
+  //: 能力中心（skill / MCP / 插件）的列表缓存
+  capabilities: [],
   market: { capabilities: null, sources: [], items: [], query: "", sourceId: "" },
   plugins: { plugins: [], footer_actions: [] },
 };
@@ -264,6 +272,16 @@ const api = {
     request("GET", `/api/v1/projects/${encodeURIComponent(id)}/modules/${module}`),
   // ── 普通对话（chat 会话）──
   chats: (params = {}) => request("GET", `/api/v1/chats?${new URLSearchParams(params)}`),
+  // ── 能力中心（skill / MCP / 插件）──
+  capabilities: (params = {}) =>
+    request("GET", `/api/v1/capabilities?${new URLSearchParams(params)}`),
+  enableCapability: (id) =>
+    request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/enable`, {}),
+  disableCapability: (id) =>
+    request("POST", `/api/v1/capabilities/${encodeURIComponent(id)}/disable`, {}),
+  uninstallCapability: (id) =>
+    request("DELETE", `/api/v1/capabilities/${encodeURIComponent(id)}`),
+  capabilityAudit: (limit = 30) => request("GET", `/api/v1/capabilities/audit?limit=${limit}`),
   chat: (id) => request("GET", `/api/v1/chats/${encodeURIComponent(id)}`),
   createChat: (body) => request("POST", "/api/v1/chats", body),
   sendChat: (id, text) =>
@@ -427,6 +445,11 @@ function bindEvents() {
     applySidebarMode();
   });
   on("market-btn", "click", () => openMarket("market"));
+  on("capabilities-btn", "click", () => openCapabilities());
+  on("capabilities-close", "click", closeCapabilities);
+  on("capabilities-modal", "click", (event) => {
+    if (event.target.id === "capabilities-modal") closeCapabilities();
+  });
   on("plugins-btn", "click", () => openMarket("installed"));
   on("git-btn", "click", openGitPanel);
   on("git-close", "click", closeGitPanel);
@@ -508,7 +531,13 @@ function handleGlobalKeydown(event) {
       closePalette();
       return;
     }
-    for (const id of ["settings-modal", "market-modal", "route-modal", "confirm-modal"]) {
+    for (const id of [
+      "settings-modal",
+      "market-modal",
+      "capabilities-modal",
+      "route-modal",
+      "confirm-modal",
+    ]) {
       const modal = document.getElementById(id);
       if (modal && !modal.hidden) {
         modal.hidden = true;
@@ -3552,6 +3581,189 @@ function closeMarket() {
   document.getElementById("market-modal").hidden = true;
 }
 
+/* ── 能力中心（P0：统一入口 + 注册表视图；P1 补 skill 安装、P2 补 MCP 工具）── */
+
+function closeCapabilities() {
+  const modal = document.getElementById("capabilities-modal");
+  if (modal) modal.hidden = true;
+}
+
+async function openCapabilities() {
+  const modal = document.getElementById("capabilities-modal");
+  if (!modal) return;
+  modal.hidden = false;
+  const token = ++state.tokens.capabilities;
+  const body = document.getElementById("capabilities-body");
+  body.replaceChildren(h("p", { class: "muted", text: "正在加载能力…" }));
+  try {
+    const payload = await api.capabilities();
+    if (token !== state.tokens.capabilities) return;
+    state.capabilities = payload.capabilities || [];
+    renderCapabilities(payload);
+  } catch (error) {
+    if (token !== state.tokens.capabilities) return;
+    body.replaceChildren(h("div", { class: "error-box", text: `能力列表加载失败：${error.message}` }));
+  }
+}
+
+function renderCapabilities(payload) {
+  const body = document.getElementById("capabilities-body");
+  const items = payload.capabilities || [];
+  const kinds = payload.kinds || [];
+  const counts = payload.counts || {};
+  const summary = document.getElementById("capabilities-summary");
+  if (summary) {
+    summary.textContent = kinds
+      .map((info) => `${info.label} ${counts[info.id] || 0}`)
+      .join(" · ");
+  }
+
+  const nodes = [
+    h("p", {
+      class: "hint",
+      text: "skill / MCP / 插件共用一套安装、启用与审计。skill 是指令包（按需注入执行段上下文）；MCP 是工具服务器（模型可请求调用，应用层执行后回灌）。",
+    }),
+  ];
+
+  const kindTabs = h("div", { class: "tabs tabs-inline", id: "capability-kinds" });
+  for (const info of kinds) {
+    const tab = h("button", {
+      class: "tab",
+      type: "button",
+      dataset: { kind: info.id },
+      title: info.hint || "",
+      text: `${info.label}（${counts[info.id] || 0}）`,
+    });
+    kindTabs.append(tab);
+  }
+  nodes.push(kindTabs);
+
+  const listHost = h("div", { class: "capability-list" });
+  const renderList = (kind) => {
+    for (const tab of kindTabs.querySelectorAll(".tab")) {
+      tab.classList.toggle("active", kind ? tab.dataset.kind === kind : false);
+    }
+    const filtered = kind ? items.filter((item) => item.kind === kind) : items;
+    if (!filtered.length) {
+      const hint = kinds.find((info) => info.id === kind);
+      listHost.replaceChildren(
+        h("p", {
+          class: "muted",
+          text: kind
+            ? `还没有 ${hint ? hint.label : kind} 能力：${hint ? hint.hint : ""}`
+            : "还没有任何能力。可以到「插件市场」装插件（会以 plugin 形态出现在这里）。",
+        })
+      );
+      return;
+    }
+    listHost.replaceChildren(
+      ...filtered.map((capability) =>
+        collapsibleCard(`capability:${capability.id}`, capability.name || capability.id, {
+          subtitle: [
+            capability.kind,
+            capability.enabled ? "已启用" : "已停用",
+            capability.version ? `v${capability.version}` : "",
+            capability.permissions?.length ? capability.permissions.join("/") : "",
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          children: [
+            capability.description
+              ? h("p", { text: capability.description })
+              : h("p", { class: "muted", text: "（没有填写说明）" }),
+            h("p", { class: "muted", text: `ID：${capability.id} · 范围：${capability.scope}` }),
+            capability.source?.location
+              ? h("p", { class: "muted", text: `来源：${capability.source.kind} · ${capability.source.location}` })
+              : null,
+            h(
+              "div",
+              { class: "approval-actions" },
+              (() => {
+                const toggle = h("button", {
+                  class: "btn ghost small",
+                  type: "button",
+                  text: capability.enabled ? "停用" : "启用",
+                });
+                toggle.addEventListener(
+                  "click",
+                  safe(async () => {
+                    if (capability.enabled) await api.disableCapability(capability.id);
+                    else await api.enableCapability(capability.id);
+                    await openCapabilities();
+                  })
+                );
+                return toggle;
+              })(),
+              capability.kind === "plugin"
+                ? h("span", { class: "muted-small", text: "插件请到「插件市场」卸载" })
+                : (() => {
+                    const remove = h("button", {
+                      class: "btn ghost small",
+                      type: "button",
+                      text: "卸载",
+                    });
+                    remove.addEventListener(
+                      "click",
+                      safe(async () => {
+                        const ok = await appConfirm({
+                          title: "卸载能力",
+                          message: `确定卸载「${capability.name || capability.id}」？`,
+                          confirmText: "卸载",
+                          danger: true,
+                        });
+                        if (!ok) return;
+                        await api.uninstallCapability(capability.id);
+                        await openCapabilities();
+                      })
+                    );
+                    return remove;
+                  })()
+            ),
+          ],
+        })
+      )
+    );
+  };
+  kindTabs.addEventListener("click", (event) => {
+    const tab = event.target.closest(".tab");
+    if (tab) renderList(tab.dataset.kind);
+  });
+  nodes.push(listHost);
+
+  // 审计：谁在什么时候装过 / 用过什么，面板里能看到最后几条
+  (async () => {
+    try {
+      const audit = await api.capabilityAudit(10);
+      const events = audit.events || [];
+      if (!events.length) return;
+      body.append(
+        collapsibleCard("capability:audit", "最近的能力操作", {
+          subtitle: `${events.length} 条`,
+          children: [
+            h(
+              "ul",
+              { class: "list" },
+              ...events
+                .slice()
+                .reverse()
+                .map((event) =>
+                  h("li", {
+                    text: `${event.at || ""} · ${event.event || ""} · ${event.id || ""}`,
+                  })
+                )
+            ),
+          ],
+        })
+      );
+    } catch (error) {
+      /* 审计读不到不影响主列表 */
+    }
+  })();
+
+  body.replaceChildren(...nodes);
+  renderList("");
+}
+
 async function refreshMarketSources() {
   const payload = await api.marketSources();
   state.market.sources = payload.sources || [];
@@ -4263,16 +4475,10 @@ const STORE_CONTEXT_KEY = "orchestrator.contextType";
 const STORE_PROJECT_KEY = "orchestrator.projectId";
 const STORE_SECTION_KEY = "orchestrator.projectSection";
 
-//: 二级功能中文名；缺项时用英文标识兜底，新增 section 不会让导航崩掉
-const PROJECT_SECTION_LABELS = {
-  overview: "概览",
-  architecture: "架构",
-  plan: "计划",
-  execution: "执行",
-  verification: "验证",
-  logs: "日志",
-  settings: "设置",
-};
+//: 二级功能中文名：同样来自后端注入（缺项时回落到英文标识，新增模块不会让导航崩掉）
+const PROJECT_SECTION_LABELS = Object.fromEntries(
+  PROJECT_MODULE_DEFS.map((item) => [item.id, item.label || item.id])
+);
 
 //: 概览里最多列多少次运行（一百条折叠卡片既慢又没人看）
 const OVERVIEW_RUN_LIMIT = 20;

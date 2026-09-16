@@ -27,6 +27,7 @@ from urllib.request import urlopen
 
 from app.core import config as config_module
 from app.core.config import get_settings
+from app.schemas.navigation import PROJECT_MODULE_LABELS, PROJECT_MODULES
 
 logger = logging.getLogger("app.desktop")
 
@@ -44,14 +45,9 @@ SIDEBAR_PRIMARY_ENTRIES: tuple[dict[str, str], ...] = (
 )
 
 #: 项目内部二级模块：只有选中项目之后才渲染，普通对话上下文里一律隐藏。
-PROJECT_SECONDARY_MODULES: tuple[dict[str, str], ...] = (
-    {"id": "overview", "label": "概览"},
-    {"id": "architecture", "label": "架构"},
-    {"id": "plan", "label": "计划"},
-    {"id": "execution", "label": "执行"},
-    {"id": "verification", "label": "验证"},
-    {"id": "logs", "label": "日志"},
-    {"id": "settings", "label": "设置"},
+#: 清单与中文名都从契约派生（唯一权威：app/schemas/navigation.py）。
+PROJECT_SECONDARY_MODULES: tuple[dict[str, str], ...] = tuple(
+    {"id": module.value, "label": PROJECT_MODULE_LABELS[module.value]} for module in PROJECT_MODULES
 )
 
 #: 普通对话上下文里必须藏起来的工程概念（与二级模块同名）。

@@ -353,7 +353,7 @@ orchestrator/
 
 ```powershell
 cd orchestrator
-python -m pytest -q             # 495 passed
+python -m pytest -q             # 364 passed（删掉历史死代码后的一次性下调，见 docs/ARCHITECTURE.md §9）
 python -m ruff check .          # All checks passed
 python -m ruff format --check . # 95 files already formatted
 ```
@@ -402,6 +402,11 @@ python -m ruff format --check . # 95 files already formatted
 任务涉及大量既有代码时，优先靠 `need_files` 取件，而不是把预算调大。
 
 ## 插件市场（参照 anywhere-labs/dsh-desktop 的目录契约）
+
+> **演进中**：插件市场是历史形态，新的方向是**能力中心**——skill / MCP / 插件统一管理。
+> P0 已落地统一能力层（`data/capabilities/`、`GET /api/v1/capabilities`、侧栏「能力中心」入口与审计），
+> 已装插件会以 `plugin` 形态镜像进来；skill 安装（P1）与 MCP 工具（P2）随后接上。
+> 架构与路线见 `docs/ARCHITECTURE.md`。
 
 左侧任务栏底部的 **插件市场** 入口（`market`）打开市场面板，分三页：
 
